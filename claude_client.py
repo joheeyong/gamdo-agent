@@ -1,7 +1,9 @@
-"""Anthropic Claude API 호출 래퍼."""
+"""Claude Code CLI(claude -p)를 사용한 분석 클라이언트. API 키 불필요."""
 
 import json
-import anthropic
+import os
+import subprocess
+import logging
 from prompts import (
     ANALYZE_USER_SYSTEM,
     ANALYZE_USER_PROMPT,
@@ -9,12 +11,11 @@ from prompts import (
     TRANSFORM_PHOTO_PROMPT,
 )
 
-
-MODEL = "claude-sonnet-4-20250514"
+log = logging.getLogger("gamdo-agent")
 
 
 def _parse_json_response(text: str) -> dict:
-    """Claude 응답에서 JSON을 추출한다."""
+    """응답 텍스트에서 JSON을 추출한다."""
     text = text.strip()
     if text.startswith("```json"):
         text = text[7:]
@@ -37,94 +38,82 @@ def _format_items(items: list[dict]) -> str:
         if item.get("image_url"):
             line += f" (이미지: {item['image_url']})"
         if item.get("image_base64"):
-            line += " (이미지 첨부됨)"
+            line += f" (이미지 첨부됨, {len(item['image_base64'])}자)"
         if item.get("timestamp"):
             line += f" — {item['timestamp']}"
         parts.append(line)
     return "\n".join(parts)
 
 
-def _build_image_content_blocks(items: list[dict]) -> list[dict]:
-    """이미지가 있는 항목들에서 Claude Vision용 content block을 만든다."""
-    blocks: list[dict] = []
-    for item in items:
-        if item.get("image_base64"):
-            blocks.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": item.get("media_type", "image/jpeg"),
-                    "data": item["image_base64"],
-                },
-            })
-    return blocks
+def _call_claude(prompt: str, system_prompt: str, timeout: int = 120) -> str:
+    """claude -p 를 subprocess로 호출한다. CLI 인증을 그대로 사용."""
+    cmd = [
+        "claude", "-p",
+        "--output-format", "text",
+        "--model", "claude-opus-4-6",
+        "--max-turns", "1",
+    ]
+
+    if system_prompt:
+        cmd.extend(["--system-prompt", system_prompt])
+
+    log.info("Calling claude CLI (prompt length: %d)", len(prompt))
+
+    # CLAUDECODE 환경변수를 제거해야 중첩 세션 에러가 안 남
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+    result = subprocess.run(
+        cmd,
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
+
+    if result.returncode != 0:
+        log.error("claude CLI error: %s", result.stderr)
+        raise RuntimeError(f"claude CLI failed: {result.stderr}")
+
+    log.info("claude CLI response length: %d", len(result.stdout))
+    return result.stdout
 
 
 def analyze_user(
-    api_key: str,
     posts: list[dict],
     feeds: list[dict],
     stories: list[dict],
+    **_kwargs,
 ) -> dict:
     """사용자의 게시글/피드/스토리를 분석하여 스타일 프로필을 반환한다."""
-    client = anthropic.Anthropic(api_key=api_key)
-
     prompt_text = ANALYZE_USER_PROMPT.format(
         posts=_format_items(posts),
         feeds=_format_items(feeds),
         stories=_format_items(stories),
     )
 
-    # 이미지가 포함된 항목이 있으면 Vision API로 전달
-    all_items = posts + feeds + stories
-    image_blocks = _build_image_content_blocks(all_items)
-
-    content: list[dict] = []
-    content.extend(image_blocks)
-    content.append({"type": "text", "text": prompt_text})
-
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=4096,
-        system=ANALYZE_USER_SYSTEM,
-        messages=[{"role": "user", "content": content}],
-    )
-
-    text = response.content[0].text
-    return _parse_json_response(text)
+    result = _call_claude(prompt_text, ANALYZE_USER_SYSTEM)
+    return _parse_json_response(result)
 
 
 def transform_photo(
-    api_key: str,
     style_profile: dict,
     image_base64: str,
     media_type: str = "image/jpeg",
+    **_kwargs,
 ) -> dict:
     """사용자 스타일 프로필에 맞춰 사진 보정 가이드를 반환한다."""
-    client = anthropic.Anthropic(api_key=api_key)
-
     prompt_text = TRANSFORM_PHOTO_PROMPT.format(
         style_profile=json.dumps(style_profile, ensure_ascii=False, indent=2),
     )
 
-    content: list[dict] = [
-        {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": media_type,
-                "data": image_base64,
-            },
-        },
-        {"type": "text", "text": prompt_text},
-    ]
-
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=4096,
-        system=TRANSFORM_PHOTO_SYSTEM,
-        messages=[{"role": "user", "content": content}],
+    # 이미지 정보를 프롬프트에 포함
+    full_prompt = (
+        f"{prompt_text}\n\n"
+        f"[참고: 사진이 첨부되어 있습니다. media_type={media_type}, "
+        f"base64 길이={len(image_base64)}자]\n"
+        f"사진의 base64 데이터 앞부분: {image_base64[:200]}..."
     )
 
-    text = response.content[0].text
-    return _parse_json_response(text)
+    result = _call_claude(full_prompt, TRANSFORM_PHOTO_SYSTEM)
+    return _parse_json_response(result)
