@@ -158,12 +158,14 @@ TRANSFORM_PHOTO_PROMPT = """\
 
 === 스타일 반영 규칙 ===
 위 프로필은 이 사용자가 어떤 사진을 올리는 사람인지를 말해 줍니다.
-보정 수치(밝기·대비·채도·색온도·톤커브·그레인 등)는 서버가 대표 사진을 측정해
-직접 계산하므로, 당신은 수치를 추천하지 마세요.
+사진 전체에 걸리는 보정 수치(밝기·대비·채도·색온도·톤커브·그레인 등)는 서버가
+대표 사진을 측정해 직접 계산하므로, 그 값들은 추천하지 마세요.
 
-프로필은 아래 판단에만 쓰세요:
+대신 측정으로는 알 수 없는 것, 즉 **어디를 어떻게 만질지**는 당신이 정합니다:
 - subjectType: 어떤 레시피를 고를지 결정하는 값이라 정확해야 합니다.
-- autoEdits / regionParams: 눈으로 봐야 아는 판단입니다.
+- autoEdits: 구도·기울기·거슬리는 요소는 눈으로 봐야 아는 판단입니다.
+- regionParams: 하늘/얼굴/배경, 그리고 좌표로 짚는 국소 보정(local_*).
+- hslAdjust: 색계열별 조정. 히스토그램 평균으로는 절대 나오지 않는 값입니다.
 - toneReport·팁·구도 분석: 이 사용자의 스타일(primaryStyle, trendCategory,
   moodKeywords)에 비추어 설명하세요.
 - feedCohesion.coreColors가 있으면, 이 사진이 그 색들과 어울리는지를
@@ -278,8 +280,22 @@ TRANSFORM_PHOTO_PROMPT = """\
   "regionParams": {{
     "sky": {{ "brightness": -1.0~1.0, "saturation": -1.0~1.0, "temperature": -1.0~1.0 }},
     "face": {{ "brightness": -0.18~0.18, "blemish_removal": 0.0~1.0, "skin_smoothing": 0.0~1.0 }},
-    "background": {{ "brightness": -1.0~1.0, "contrast": -1.0~1.0, "saturation": -1.0~1.0 }}
-  }}
+    "background": {{ "brightness": -1.0~1.0, "contrast": -1.0~1.0, "saturation": -1.0~1.0 }},
+    "local_0": {{
+      "area": {{ "x": 0.0~1.0, "y": 0.0~1.0, "width": 0.0~1.0, "height": 0.0~1.0 }},
+      "shape": "ellipse" | "rect",
+      "feather": 0.0~1.0,
+      "reason": "이 영역을 짚은 이유 (한국어 한 문장)",
+      "brightness": -0.5~0.5, "highlights": -0.6~0.6, "shadows": -0.6~0.6,
+      "contrast": -0.35~0.35, "saturation": -0.35~0.35,
+      "temperature": -0.35~0.35, "sharpness": 0.0~0.5
+    }}
+  }} | null,
+  "hslAdjust": {{
+    "red": {{ "hue": -0.35~0.35, "saturation": -0.55~0.55, "lightness": -0.45~0.45 }},
+    "orange": {{ ... }}, "yellow": {{ ... }}, "green": {{ ... }},
+    "cyan": {{ ... }}, "blue": {{ ... }}, "purple": {{ ... }}, "magenta": {{ ... }}
+  }} | null
 }}
 
 regionParams 설명:
@@ -297,6 +313,38 @@ regionParams 설명:
 - background: 하늘도 얼굴도 아닌 나머지 배경 영역.
   * 배경에 전체 보정과 다른 값이 필요할 때만 지정.
   * 특별히 다를 필요 없으면 null로 두세요.
+- local_0, local_1...: 좌표로 직접 짚는 국소 보정. 하늘·얼굴·배경으로 나뉘지
+  않는 특정 부분만 손봐야 할 때 쓰세요. 라이트룸의 부분 보정 브러시에 해당합니다.
+  * 쓸 상황의 예: 창문·조명이 날아가 디테일이 없다 / 피사체만 그늘에 묻혔다 /
+    한쪽에서 들어온 빛 때문에 좌우 밝기가 다르다 / 특정 물체만 색이 탁하다.
+  * area는 정규화 좌표(0~1)입니다. x,y는 왼쪽 위 기준 시작점.
+  * shape: 창문·문·벽처럼 각진 대상은 "rect", 얼굴·조명·꽃처럼 둥근 대상과
+    "이 부근"을 뭉뚱그려 짚을 때는 "ellipse". 기본값은 "ellipse".
+  * feather: 경계를 얼마나 풀지. 0.0이면 좁게, 1.0이면 넓게. 창문처럼 경계가
+    분명하면 0.2~0.4, 빛의 번짐처럼 경계가 없으면 0.7~1.0.
+  * reason을 반드시 적으세요. 좌표를 왜 그렇게 짚었는지 남기면 검증할 수 있습니다.
+  * 최대 4개까지. 프레임의 0.3%보다 작거나 50%보다 큰 영역은 서버가 버립니다
+    (50%가 넘으면 국소 보정이 아니라 전체 보정이므로).
+  * 얼굴은 local_*로 짚지 마세요. 얼굴에는 face 슬롯이 따로 있고, 겹치면
+    face가 위에 얹혀 local_*이 묻힙니다. 얼굴 톤은 face로만 다루세요.
+  * 짚을 것이 없으면 local_* 키를 아예 넣지 마세요. 억지로 만들지 마세요.
 영역별 보정이 불필요한 사진(음식, 사물 클로즈업 등)은 regionParams 전체를 null로 두세요.
+
+hslAdjust 설명:
+색계열별로 색상(hue)·채도(saturation)·밝기(lightness)를 따로 조절합니다.
+전체 채도·색온도로는 할 수 없는 일을 하는 자리입니다 — 사진 전체를 건드리지 않고
+특정 색만 잡습니다.
+- 쓸 상황의 예:
+  * 초록이 누렇게 탁하다 → green의 hue를 살짝 시프트하고 saturation을 올린다
+  * 하늘의 파랑만 더 깊게 → blue의 saturation +, lightness -
+  * 인물의 피부톤만 살리고 싶다 → orange의 saturation을 살짝 +, lightness +
+  * 형광등 때문에 벽이 초록빛이다 → green의 saturation을 -
+  * 음식의 붉은 기를 살린다 → red/orange의 saturation +
+- hue는 ±0.35(약 ±10도)까지만. 그 이상은 색이 바뀌어 버립니다.
+- 건드릴 색계열만 넣으세요. 8개를 다 채우지 마세요. 보통 1~2개면 충분합니다.
+- 사용자의 스타일 프로필(preferredTones, moodKeywords)과 대표 사진의 색감을
+  참고하되, 이 사진에 실제로 그 색이 있을 때만 지정하세요.
+- 특별히 잡을 색이 없으면 null로 두세요. 서버가 값에 보정 강도 성향을 곱하고
+  범위를 다시 자릅니다.
 
 """

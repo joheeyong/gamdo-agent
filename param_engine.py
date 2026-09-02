@@ -24,7 +24,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from image_processor import estimate_noise_sigma
+from image_processor import _HSL_CHANNELS, estimate_noise_sigma
 
 log = logging.getLogger("gamdo-agent")
 
@@ -54,6 +54,7 @@ def measure_image_stats(img: Image.Image) -> dict[str, float]:
     - warmth: R-B 균형. 양수면 웜톤
     - highlight_clip / shadow_crush: 날아간·뭉갠 픽셀 비율
     - highlight_p95: 밝은 끝(95백분위)의 위치. 하이라이트를 누를 여지가 있는지
+    - shadow_p05: 어두운 끝(5백분위)의 위치. 쉐도우를 들어올릴 여지가 있는지
     - haze: Dark Channel Prior 평균. 높을수록 뿌옇다
     - sharpness: 라플라시안 분산을 0~1로 정규화
     """
@@ -98,6 +99,7 @@ def measure_image_stats(img: Image.Image) -> dict[str, float]:
         "saturation": saturation,
         "warmth": float(r.mean() - b.mean()) / 128.0,
         "highlight_p95": float(p95) / 255.0,
+        "shadow_p05": float(p5) / 255.0,
         "highlight_clip": float((luma > 250).mean()),
         "shadow_crush": float((luma < 6).mean()),
         "haze": haze,
@@ -204,37 +206,37 @@ def _level_index(value: str | None, default: int = 2) -> int:
 
 _TREND_RECIPES: dict[str, dict[str, Any]] = {
     "warm_film": {
-        "temperature": 0.18, "shadows": 0.28, "highlights": -0.25, "saturation": -0.08,
+        "temperature": 0.18, "shadow_floor": 0.11, "highlights": -0.25, "saturation": -0.08,
         "tone_curve": ("film", 0.60), "grain": 0.20,
         "split": {"shadow": (255, 0.15), "highlight": (30, 0.15)},
     },
     "korean_gamsung": {
-        "temperature": 0.10, "shadows": 0.30, "highlights": -0.28, "saturation": -0.12,
+        "temperature": 0.10, "shadow_floor": 0.13, "highlights": -0.28, "saturation": -0.12,
         "clarity": -0.08, "tone_curve": ("fade", 0.40), "grain": 0.08,
     },
     "cinematic_moody": {
-        "temperature": 0.05, "shadows": 0.15, "highlights": -0.30, "saturation": -0.10,
+        "temperature": 0.05, "shadow_floor": 0.04, "highlights": -0.30, "saturation": -0.10,
         "clarity": 0.20, "vignette": 0.22, "tone_curve": ("high_contrast", 0.50), "grain": 0.28,
         "split": {"shadow": (210, 0.30), "highlight": (30, 0.22)},
     },
     "bright_airy": {
-        "temperature": 0.08, "shadows": 0.35, "highlights": -0.30, "saturation": -0.05,
+        "temperature": 0.08, "shadow_floor": 0.15, "highlights": -0.30, "saturation": -0.05,
         "clarity": 0.05, "vignette": 0.0, "tone_curve": ("bright", 0.40), "grain": 0.05,
     },
     "golden_hour": {
-        "temperature": 0.22, "shadows": 0.25, "highlights": -0.28, "saturation": 0.0,
+        "temperature": 0.22, "shadow_floor": 0.09, "highlights": -0.28, "saturation": 0.0,
         "tone_curve": ("film", 0.45), "grain": 0.12,
         "split": {"shadow": (270, 0.12), "highlight": (40, 0.15)},
     },
     "clean_minimal": {
-        "temperature": 0.05, "shadows": 0.20, "highlights": -0.20, "saturation": -0.05,
+        "temperature": 0.05, "shadow_floor": 0.03, "highlights": -0.20, "saturation": -0.05,
         "clarity": 0.05, "vignette": 0.0, "tone_curve": ("linear", 0.0), "grain": 0.0,
     },
 }
 
 # 트렌드를 모를 때 쓰는 2025-2026 공통 베이스라인
 _DEFAULT_RECIPE: dict[str, Any] = {
-    "temperature": 0.10, "shadows": 0.25, "highlights": -0.25, "saturation": -0.08,
+    "temperature": 0.10, "shadow_floor": 0.08, "highlights": -0.25, "saturation": -0.08,
     "tone_curve": ("s_curve", 0.25), "grain": 0.05,
 }
 
@@ -258,6 +260,9 @@ _SUBJECT_RECIPES: dict[str, dict[str, Any]] = {
 
 # 측정에서 나온 교정 성분 하나가 낼 수 있는 최대치
 _CORRECTION_BAND = 0.35
+
+# 쉐도우 바닥 차이(0~1)를 슬라이더 값으로 옮기는 배율. 실측으로 맞췄다.
+_SHADOW_LIFT_GAIN = 4.2
 
 # 노출은 다른 축보다 좁게 잡는다. 평균 휘도는 장면마다 정당하게 다르다 —
 # 설경·흰 벽 카페·역광은 원래 높고 야경은 원래 낮다. 목표 평균에 억지로
@@ -387,7 +392,15 @@ def build_params_with_comment(
     temperature += float(recipe.get("temperature", 0.0)) + float(subject_recipe.get("temperature", 0.0))
     contrast += float(subject_recipe.get("contrast", 0.0))
 
-    shadows = float(recipe.get("shadows", 0.0))
+    # 쉐도우는 "무조건 들어올린다"가 아니라 "바닥이 목표보다 낮으면 올린다"다.
+    # 트렌드 상수(+0.15~0.35)를 모든 사진에 붙이면, 이미 어두운 끝이 열려 있는
+    # 사진까지 들려서 다이내믹 레인지가 눌리고 입체감이 사라진다.
+    # 레퍼런스가 있으면 그 사람 사진의 실제 바닥을, 없으면 트렌드의 목표를 쓴다.
+    if reference and reference.get("luma_percentiles"):
+        target_floor = float(reference["luma_percentiles"][1])   # p5
+    else:
+        target_floor = float(recipe.get("shadow_floor", 0.08))
+    shadows = _band((target_floor - stats["shadow_p05"]) * _SHADOW_LIFT_GAIN)
     # 레시피의 하이라이트 억제는 누를 밝은 부분이 있을 때만 뜻이 있다.
     # 밝은 끝이 낮은 사진에 그대로 걸면 하이라이트가 아니라 중간톤이 눌려
     # 사진 전체가 어두워진다. p95가 올라온 만큼만 비례해 적용한다.
@@ -407,8 +420,7 @@ def build_params_with_comment(
     # 날아간 하이라이트·뭉갠 쉐도우가 많으면 그만큼 더 되살린다
     if stats["highlight_clip"] > 0.02:
         highlights -= min(0.25, stats["highlight_clip"] * 4.0)
-    if stats["shadow_crush"] > 0.02:
-        shadows += min(0.25, stats["shadow_crush"] * 4.0)
+
 
     clarity = pick("clarity")
     sharpness = pick("sharpness")
@@ -518,6 +530,13 @@ def build_params_with_comment(
         },
     }
 
+    # 색계열별 조정은 측정으로 나오지 않는 판단이라 모델 값을 그대로 쓴다.
+    # 없으면 키를 넣지 않는다 — analysis_to_transform_params가 None으로 본다.
+    hsl = _clamp_hsl(analysis.get("hslAdjust"), gain)
+    if hsl:
+        params["hslAdjust"] = hsl
+        log.info("param_engine: hslAdjust from model — %s", list(hsl.keys()))
+
     # 얼굴/체형은 눈이 필요한 판단이라 모델이 인물 사진에서만 제안한다.
     # 스키마상 최상위에 오지만, 옛 응답 형식(recommendedParams 안)도 받아준다.
     reshape = analysis.get("reshapeParams")
@@ -537,6 +556,38 @@ def build_params_with_comment(
         stats["warmth"], stats["haze"], stats["sharpness"],
     )
     return params, describe_params(stats, trend, subject, params, gain)
+
+
+# HSL 한 채널이 낼 수 있는 최대치. apply_hsl_adjust에서 1.0은 색상 ±30°,
+# 채도·밝기는 ±80(255 기준)이라 그대로 태우면 색이 튄다.
+_HSL_LIMITS = {"hue": 0.35, "saturation": 0.55, "lightness": 0.45}
+
+
+def _clamp_hsl(raw: Any, gain: float) -> dict[str, dict[str, float]] | None:
+    """모델이 준 hslAdjust를 안전 범위로 자르고 보정 강도를 곱한다.
+
+    색계열 단위 판단("이 초록이 탁하다", "하늘의 파랑만 채도를")은 히스토그램
+    측정으로 나오지 않는다. 그래서 이 값만은 모델이 정하고, 여기서는 범위와
+    세기만 관리한다. 알 수 없는 색 이름과 0에 가까운 값은 버린다.
+    """
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, dict[str, float]] = {}
+    for channel, adj in raw.items():
+        if channel not in _HSL_CHANNELS or not isinstance(adj, dict):
+            continue
+        vals: dict[str, float] = {}
+        for key, limit in _HSL_LIMITS.items():
+            try:
+                value = float(adj.get(key, 0.0))
+            except (TypeError, ValueError):
+                continue
+            value = _clamp(value * gain, -limit, limit)
+            if abs(value) >= 0.01:
+                vals[key] = value
+        if vals:
+            out[channel] = vals
+    return out or None
 
 
 # 워프 계수가 커진 만큼 모델이 범위를 벗어난 값을 주면 얼굴이 뭉개진다.
@@ -607,8 +658,11 @@ def describe_params(
 
     if stats["highlight_clip"] > 0.03 and params["highlights"] < -0.1:
         reasons.append("날아간 밝은 부분을 눌러 주고")
-    elif stats["shadow_crush"] > 0.03 and params["shadows"] > 0.1:
+    elif params["shadows"] >= 0.10:
         reasons.append("뭉친 어두운 부분을 살리고")
+    elif params["shadows"] <= -0.10:
+        # 바닥이 떠 있는 사진 — 검정을 되찾아 주면 깊이가 산다
+        reasons.append("떠 있는 검정을 눌러 깊이를 주고")
     elif params["dehaze"] >= 0.10:
         reasons.append("뿌연 기운을 걷어내고")
     elif params["contrast"] >= 0.15:

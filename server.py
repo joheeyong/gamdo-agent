@@ -49,6 +49,7 @@ from image_processor import (
     apply_all_transforms,
     apply_auto_edits,
     apply_regional_transforms,
+    build_local_regions,
     decode_base64_image,
     detect_regions,
     encode_image_base64,
@@ -257,6 +258,9 @@ def api_analyze_and_transform(
                 if valid_region_params:
                     try:
                         regions = detect_regions(img, cache=mp_cache)
+                        # 모델이 좌표로 짚은 국소 보정 영역(local_*)은 감지가 아니라
+                        # 기하 정보로 만든다. detect_regions의 하늘/얼굴/배경 위에 얹힌다.
+                        regions.update(build_local_regions(img.size, valid_region_params))
                         img = apply_regional_transforms(img, regions, valid_region_params, cache=mp_cache)
                         log.info("analyze-and-transform: applied regional transforms for regions=%s",
                                  list(valid_region_params.keys()))
@@ -395,11 +399,14 @@ def api_apply_transform(
                 k: v for k, v in (req.region_params or {}).items()
                 if isinstance(v, dict)
             }
-            if valid_regions and not req.preview:
+            # 미리보기에서도 영역 보정을 적용한다. 건너뛰면 미리보기와 저장본의
+            # 색이 갈린다 — 비싼 것은 잡티·스무딩뿐이고 그건 preview가 걸러낸다.
+            if valid_regions:
                 try:
                     regions = detect_regions(img, cache=mp_cache)
+                    regions.update(build_local_regions(img.size, valid_regions))
                     img = apply_regional_transforms(
-                        img, regions, valid_regions, cache=mp_cache
+                        img, regions, valid_regions, cache=mp_cache, preview=req.preview
                     )
                 except Exception as exc:
                     log.warning("apply-transform: regional transforms failed: %s", exc)
