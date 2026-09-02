@@ -206,37 +206,37 @@ def _level_index(value: str | None, default: int = 2) -> int:
 
 _TREND_RECIPES: dict[str, dict[str, Any]] = {
     "warm_film": {
-        "temperature": 0.18, "shadow_floor": 0.11, "highlights": -0.25, "saturation": -0.08,
+        "temperature": 0.18, "shadow_floor": 0.11, "highlight_ceiling": 0.91, "saturation": -0.08,
         "tone_curve": ("film", 0.60), "grain": 0.20,
         "split": {"shadow": (255, 0.15), "highlight": (30, 0.15)},
     },
     "korean_gamsung": {
-        "temperature": 0.10, "shadow_floor": 0.13, "highlights": -0.28, "saturation": -0.12,
+        "temperature": 0.10, "shadow_floor": 0.13, "highlight_ceiling": 0.89, "saturation": -0.12,
         "clarity": -0.08, "tone_curve": ("fade", 0.40), "grain": 0.08,
     },
     "cinematic_moody": {
-        "temperature": 0.05, "shadow_floor": 0.04, "highlights": -0.30, "saturation": -0.10,
+        "temperature": 0.05, "shadow_floor": 0.04, "highlight_ceiling": 0.93, "saturation": -0.10,
         "clarity": 0.20, "vignette": 0.22, "tone_curve": ("high_contrast", 0.50), "grain": 0.28,
         "split": {"shadow": (210, 0.30), "highlight": (30, 0.22)},
     },
     "bright_airy": {
-        "temperature": 0.08, "shadow_floor": 0.15, "highlights": -0.30, "saturation": -0.05,
+        "temperature": 0.08, "shadow_floor": 0.15, "highlight_ceiling": 0.96, "saturation": -0.05,
         "clarity": 0.05, "vignette": 0.0, "tone_curve": ("bright", 0.40), "grain": 0.05,
     },
     "golden_hour": {
-        "temperature": 0.22, "shadow_floor": 0.09, "highlights": -0.28, "saturation": 0.0,
+        "temperature": 0.22, "shadow_floor": 0.09, "highlight_ceiling": 0.93, "saturation": 0.0,
         "tone_curve": ("film", 0.45), "grain": 0.12,
         "split": {"shadow": (270, 0.12), "highlight": (40, 0.15)},
     },
     "clean_minimal": {
-        "temperature": 0.05, "shadow_floor": 0.03, "highlights": -0.20, "saturation": -0.05,
+        "temperature": 0.05, "shadow_floor": 0.03, "highlight_ceiling": 0.97, "saturation": -0.05,
         "clarity": 0.05, "vignette": 0.0, "tone_curve": ("linear", 0.0), "grain": 0.0,
     },
 }
 
 # 트렌드를 모를 때 쓰는 2025-2026 공통 베이스라인
 _DEFAULT_RECIPE: dict[str, Any] = {
-    "temperature": 0.10, "shadow_floor": 0.08, "highlights": -0.25, "saturation": -0.08,
+    "temperature": 0.10, "shadow_floor": 0.08, "highlight_ceiling": 0.94, "saturation": -0.08,
     "tone_curve": ("s_curve", 0.25), "grain": 0.05,
 }
 
@@ -263,6 +263,9 @@ _CORRECTION_BAND = 0.35
 
 # 쉐도우 바닥 차이(0~1)를 슬라이더 값으로 옮기는 배율. 실측으로 맞췄다.
 _SHADOW_LIFT_GAIN = 4.2
+
+# 하이라이트 천장 차이(0~1)를 슬라이더 값으로 옮기는 배율
+_HIGHLIGHT_GAIN = 4.2
 
 # 노출은 다른 축보다 좁게 잡는다. 평균 휘도는 장면마다 정당하게 다르다 —
 # 설경·흰 벽 카페·역광은 원래 높고 야경은 원래 낮다. 목표 평균에 억지로
@@ -401,11 +404,15 @@ def build_params_with_comment(
     else:
         target_floor = float(recipe.get("shadow_floor", 0.08))
     shadows = _band((target_floor - stats["shadow_p05"]) * _SHADOW_LIFT_GAIN)
-    # 레시피의 하이라이트 억제는 누를 밝은 부분이 있을 때만 뜻이 있다.
-    # 밝은 끝이 낮은 사진에 그대로 걸면 하이라이트가 아니라 중간톤이 눌려
-    # 사진 전체가 어두워진다. p95가 올라온 만큼만 비례해 적용한다.
-    highlights = float(recipe.get("highlights", 0.0)) * _ramp(
-        stats["highlight_p95"], 0.80, 0.95
+    # 하이라이트도 쉐도우와 대칭으로 다룬다. 예전에는 "억제만" 했는데,
+    # 밝은 끝이 낮아 흐릿한 사진은 눌러서 더 평평해질 뿐이다. 그런 사진은
+    # 오히려 올려야 밝은 액센트가 생겨 입체감이 산다.
+    if reference and reference.get("luma_percentiles"):
+        target_ceiling = float(reference["luma_percentiles"][7])  # p95
+    else:
+        target_ceiling = float(recipe.get("highlight_ceiling", 0.94))
+    highlights = _band(
+        (target_ceiling - stats["highlight_p95"]) * _HIGHLIGHT_GAIN
     )
 
     if scene["backlit"]:
@@ -418,8 +425,9 @@ def build_params_with_comment(
         contrast *= 0.6
 
     # 날아간 하이라이트·뭉갠 쉐도우가 많으면 그만큼 더 되살린다
-    if stats["highlight_clip"] > 0.02:
-        highlights -= min(0.25, stats["highlight_clip"] * 4.0)
+    # 클리핑 보너스는 제거했다. 천장 목표가 이미 "너무 밝다"를 다루는데
+    # 밴드(±0.35) 밖에서 또 빼면 총 -0.43까지 가서 하이라이트가 회색으로
+    # 뭉개졌다. 완전히 날아간(=255) 화소는 눌러도 디테일이 돌아오지 않는다.
 
 
     clarity = pick("clarity")

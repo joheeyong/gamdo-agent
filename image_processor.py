@@ -484,14 +484,42 @@ def estimate_keystone(img: Image.Image, max_correction: float = 0.35) -> float:
     return round(float(np.clip(amount, -max_correction, max_correction)), 3)
 
 
+def _translation(dx: float, dy: float) -> np.ndarray:
+    """평행이동 3x3 행렬. 크롭을 좌표 변환으로 표현할 때 쓴다."""
+    return np.array(
+        [[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def _compose_geometry(
+    base: np.ndarray | None, added: np.ndarray | None
+) -> np.ndarray | None:
+    """기하 변환을 순서대로 합성한다. None은 "손대지 않음"이다."""
+    if added is None:
+        return base
+    return added if base is None else added @ base
+
+
 def apply_keystone(img: Image.Image, amount: float) -> Image.Image:
-    """수직 원근을 편다. amount는 [estimate_keystone]의 반환값.
+    """수직 원근을 편다. amount는 [estimate_keystone]의 반환값."""
+    return _keystone_with_matrix(img, amount)[0]
+
+
+def _keystone_with_matrix(
+    img: Image.Image, amount: float
+) -> tuple[Image.Image, np.ndarray | None]:
+    """[apply_keystone]과 같지만 원본→결과 좌표 변환 행렬도 돌려준다.
 
     위쪽(또는 아래쪽) 변을 늘려 좌우 수직선을 평행하게 만든 뒤,
     회전 보정과 같이 검은 여백 없이 내접 영역만 남긴다.
+
+    행렬이 필요한 이유: 모델이 준 좌표(제거 영역·크롭)는 원본 프레임 기준인데
+    이 보정이 프레임을 바꿔 놓는다. 행렬로 좌표를 같이 옮겨야 짚은 곳에 맞는다.
+    손대지 않았으면 None을 돌려준다.
     """
     if abs(amount) < 0.02:
-        return img
+        return img, None
 
     amount = float(np.clip(amount, -0.35, 0.35))
     arr = np.asarray(img.convert("RGB"))
@@ -517,12 +545,12 @@ def apply_keystone(img: Image.Image, amount: float) -> Image.Image:
     # 넓힌 만큼 가장자리는 늘어난 화소라 잘라낸다
     crop = int(shift)
     if out_w - 2 * crop < 50:
-        return img
+        return img, None
     result = warped[:, crop:out_w - crop]
 
     log.info("keystone: amount=%.3f, %dx%d → %dx%d", amount, w, h,
              result.shape[1], result.shape[0])
-    return Image.fromarray(result)
+    return Image.fromarray(result), _translation(-crop, 0) @ matrix
 
 
 def apply_background_blur(
@@ -1545,10 +1573,26 @@ def apply_instagram_ratio(
         return img
 
 
+# 인페인팅으로 메울 수 있는 최대 크기 (프레임 면적 대비).
+#
+# cv2.inpaint(TELEA)는 경계에서 안쪽으로 값을 밀어 넣는 방식이라 구멍이 깊어질수록
+# 근거 없이 지어낸 픽셀이 된다. 합성 텍스처로 실측한 복원 오차(RMSE):
+#   0.3% → 10,  1% → 12,  2% → 17,  3% → 21,  10% → 28,  30% → 37
+# 예전 상한은 30%였다. 그 크기를 메우면 사진 한복판에 문질러 놓은 얼룩이 남아,
+# 거슬리는 요소를 지우려다 사진을 더 망친다. 못 지우고 남는 편이 낫다.
+_INPAINT_MAX_AREA = 0.02        # 영역 하나
+_INPAINT_MAX_TOTAL_AREA = 0.05  # 전체 합 — 작은 영역 여러 개로 우회하지 못하게
+
+# 인페인팅 이웃 반경. 실측상 3~20 사이에서 오차 차이가 1레벨 미만인데
+# 시간은 20배 벌어진다 (2% 영역에서 12ms vs 235ms). 작게 고정한다.
+_INPAINT_RADIUS = 5
+
+
 def apply_object_removal(img: Image.Image, areas: list[dict]) -> Image.Image:
     """AI가 지정한 영역의 불필요한 요소를 인페인팅으로 제거한다.
 
     areas: [{"x": 0~1, "y": 0~1, "width": 0~1, "height": 0~1}, ...]
+    좌표는 원본 프레임 기준이다 — [apply_auto_edits]가 기하 보정보다 먼저 부른다.
     """
     if not areas:
         return img
@@ -1557,6 +1601,7 @@ def apply_object_removal(img: Image.Image, areas: list[dict]) -> Image.Image:
         arr_rgb = np.array(img)
         arr_bgr = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2BGR)
         h, w = arr_bgr.shape[:2]
+        frame_area = float(h * w)
 
         mask = np.zeros((h, w), dtype=np.uint8)
         for area in areas:
@@ -1573,20 +1618,25 @@ def apply_object_removal(img: Image.Image, areas: list[dict]) -> Image.Image:
             if right - left < 2 or bottom - top < 2:
                 continue
 
-            # 영역이 이미지의 30% 이상이면 무시 (안전장치)
-            if (right - left) * (bottom - top) > w * h * 0.3:
+            box_area = (right - left) * (bottom - top)
+            if box_area > frame_area * _INPAINT_MAX_AREA:
+                log.info("object_removal: 영역 %.1f%%가 상한 %.0f%% 초과 — 건너뜀",
+                         box_area / frame_area * 100, _INPAINT_MAX_AREA * 100)
                 continue
+            if (cv2.countNonZero(mask) + box_area) > frame_area * _INPAINT_MAX_TOTAL_AREA:
+                log.info("object_removal: 누적 면적이 상한 %.0f%% 초과 — 나머지 건너뜀",
+                         _INPAINT_MAX_TOTAL_AREA * 100)
+                break
 
             mask[top:bottom, left:right] = 255
 
         if cv2.countNonZero(mask) == 0:
             return img
 
-        # 인페인팅 반경을 영역 크기에 비례하게 설정
-        short_side = min(h, w)
-        inpaint_radius = max(5, int(short_side * 0.01))
-        inpainted = cv2.inpaint(arr_bgr, mask, inpaint_radius, cv2.INPAINT_TELEA)
+        inpainted = cv2.inpaint(arr_bgr, mask, _INPAINT_RADIUS, cv2.INPAINT_TELEA)
 
+        log.info("object_removal: %d개 영역, 총 %.2f%% 메움",
+                 len(areas), cv2.countNonZero(mask) / frame_area * 100)
         result_rgb = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
         return Image.fromarray(result_rgb)
     except Exception:
@@ -1594,18 +1644,26 @@ def apply_object_removal(img: Image.Image, areas: list[dict]) -> Image.Image:
 
 
 def apply_straighten(img: Image.Image, angle: float) -> Image.Image:
-    """이미지 수평 보정. angle: 회전 각도 (도 단위, 시계방향 양수).
+    """이미지 수평 보정. angle: 회전 각도 (도 단위, 시계방향 양수)."""
+    return _straighten_with_matrix(img, angle)[0]
+
+
+def _straighten_with_matrix(
+    img: Image.Image, angle: float
+) -> tuple[Image.Image, np.ndarray | None]:
+    """[apply_straighten]과 같지만 원본→결과 좌표 변환 행렬도 돌려준다.
 
     회전 후 생기는 검은 여백을 자동으로 크롭하여 깔끔한 결과를 반환한다.
     안전장치: ±15도 초과 시 의도적 기울기로 판단하여 무시.
+    손대지 않았으면 행렬은 None이다.
     """
     if abs(angle) < 0.1:
-        return img
+        return img, None
 
     # 안전장치: 극단적 각도는 의도적 구도로 판단
     if abs(angle) > 15.0:
         log.warning("straighten: angle %.1f° exceeds ±15° limit, skipping", angle)
-        return img
+        return img, None
 
     try:
         w, h = img.size
@@ -1653,18 +1711,66 @@ def apply_straighten(img: Image.Image, angle: float) -> Image.Image:
         bottom = min(new_h, top + crop_h)
 
         if right - left < 50 or bottom - top < 50:
-            return img
+            return img, None
 
         cropped = rotated[top:bottom, left:right]
         result_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
 
         log.info("straighten: rotated %.1f°, size %dx%d → %dx%d",
                  angle, w, h, right - left, bottom - top)
-        return Image.fromarray(result_rgb)
+        rotation = np.vstack([rot_mat, [0.0, 0.0, 1.0]])
+        return Image.fromarray(result_rgb), _translation(-left, -top) @ rotation
 
     except Exception as exc:
         log.warning("straighten failed: %s", exc)
-        return img
+        return img, None
+
+
+def _map_normalized_box(
+    box: dict,
+    matrix: np.ndarray | None,
+    src_size: tuple[int, int],
+    dst_size: tuple[int, int],
+) -> dict | None:
+    """정규화 좌표 박스를 기하 보정 뒤의 프레임 좌표로 옮긴다.
+
+    모델은 원본 사진을 보고 0~1 좌표를 짚는다. 그 사이에 키스톤·수평 보정이
+    프레임을 회전시키고 잘라내므로, 같은 0~1 값이 다른 곳을 가리키게 된다.
+    박스의 네 꼭짓점을 변환 행렬로 옮긴 뒤 축에 평행한 외접 사각형을 취한다.
+
+    matrix가 None이면 프레임이 그대로라 박스도 그대로다.
+    보정으로 프레임 밖으로 밀려나 남는 영역이 거의 없으면 None.
+    """
+    try:
+        x = float(box.get("x", 0.0))
+        y = float(box.get("y", 0.0))
+        bw = float(box.get("width", 0.0))
+        bh = float(box.get("height", 0.0))
+    except (TypeError, ValueError):
+        return None
+
+    if matrix is None:
+        return {"x": x, "y": y, "width": bw, "height": bh}
+
+    sw, sh = src_size
+    dw, dh = dst_size
+    corners = np.array([[
+        [x * sw, y * sh],
+        [(x + bw) * sw, y * sh],
+        [(x + bw) * sw, (y + bh) * sh],
+        [x * sw, (y + bh) * sh],
+    ]], dtype=np.float32)
+    moved = cv2.perspectiveTransform(corners, matrix.astype(np.float64))[0]
+
+    x0 = float(np.clip(moved[:, 0].min(), 0, dw))
+    x1 = float(np.clip(moved[:, 0].max(), 0, dw))
+    y0 = float(np.clip(moved[:, 1].min(), 0, dh))
+    y1 = float(np.clip(moved[:, 1].max(), 0, dh))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+
+    return {"x": x0 / dw, "y": y0 / dh,
+            "width": (x1 - x0) / dw, "height": (y1 - y0) / dh}
 
 
 def apply_auto_edits(
@@ -1672,37 +1778,53 @@ def apply_auto_edits(
 ) -> Image.Image:
     """AI autoEdits를 순서대로 적용한다.
 
-    순서: 원근 보정 → 수평 보정 → 불필요 요소 제거 → 스마트 크롭 → 인스타 비율
-    (기하 보정을 먼저 해야 이후 크롭이 정확함)
+    순서: 불필요 요소 제거 → 원근 보정 → 수평 보정 → 스마트 크롭 → 인스타 비율
+
+    요소 제거가 맨 앞인 이유: 모델은 원본 사진을 보고 좌표를 짚는데, 기하 보정이
+    프레임을 회전시키고 잘라내 그 좌표를 밀어 놓는다 (수평 3° + 키스톤 0.15에서
+    x=0.10이 0.12로 이동 — 작은 박스는 대상 자체를 벗어난다). 인페인팅은 프레임과
+    무관한 픽셀 편집이라 앞으로 옮기면 짚은 곳에 정확히 걸린다.
+
+    크롭은 기하 보정 뒤에 남는다. 먼저 자르면 회전 보정이 그 프레임을 다시 잘라
+    의도한 구도가 틀어진다. 대신 좌표를 변환 행렬로 함께 옮겨, 원본 기준으로
+    짚은 박스가 새 프레임에서도 같은 곳을 가리키게 한다.
     """
-    # 0-a. 수직 원근 보정 (키스톤)
-    keystone = auto_edits.get("keystone")
-    if keystone is not None:
-        try:
-            img = apply_keystone(img, float(keystone))
-        except (TypeError, ValueError):
-            pass
+    src_size = img.size
 
-    # 0-b. 수평 보정 (기울기 교정)
-    straighten = auto_edits.get("straighten")
-    if straighten is not None:
-        try:
-            angle = float(straighten)
-            img = apply_straighten(img, angle)
-        except (TypeError, ValueError):
-            pass
-
-    # 1. 불필요한 요소 제거
+    # 1. 불필요한 요소 제거 — 원본 좌표계에서 (기하 보정 전에)
     remove_areas = auto_edits.get("remove_areas")
     if remove_areas and isinstance(remove_areas, list):
         img = apply_object_removal(img, remove_areas)
 
-    # 2. 스마트 크롭 (줌/리프레임)
+    # 2-a. 수직 원근 보정 (키스톤)
+    geometry: np.ndarray | None = None
+    keystone = auto_edits.get("keystone")
+    if keystone is not None:
+        try:
+            img, matrix = _keystone_with_matrix(img, float(keystone))
+            geometry = _compose_geometry(geometry, matrix)
+        except (TypeError, ValueError):
+            pass
+
+    # 2-b. 수평 보정 (기울기 교정)
+    straighten = auto_edits.get("straighten")
+    if straighten is not None:
+        try:
+            img, matrix = _straighten_with_matrix(img, float(straighten))
+            geometry = _compose_geometry(geometry, matrix)
+        except (TypeError, ValueError):
+            pass
+
+    # 3. 스마트 크롭 (줌/리프레임) — 원본 좌표를 새 프레임으로 옮겨서
     crop = auto_edits.get("crop")
     if crop and isinstance(crop, dict):
-        img = apply_smart_crop(img, crop)
+        mapped = _map_normalized_box(crop, geometry, src_size, img.size)
+        if mapped is None:
+            log.info("smart_crop: 기하 보정 후 크롭 영역이 남지 않음 — 건너뜀")
+        else:
+            img = apply_smart_crop(img, mapped)
 
-    # 3. 인스타그램 비율 크롭
+    # 4. 인스타그램 비율 크롭
     ig_ratio = auto_edits.get("instagram_ratio")
     if ig_ratio and isinstance(ig_ratio, str):
         img = apply_instagram_ratio(img, ig_ratio, allow_vertical_crop)
@@ -1711,6 +1833,33 @@ def apply_auto_edits(
 
 
 # ── 영역별 스마트 보정 ──
+
+
+# 하늘로 인정할 덩어리의 조건.
+# top: 덩어리의 윗변이 프레임 위쪽 이 비율 안에서 시작해야 한다
+#      (0이 아니라 여유를 두는 이유 — 처마·나뭇가지가 맨 위를 가릴 수 있다)
+# width: 옆으로 이만큼 넓어야 한다. 위쪽에 걸린 파란 간판·표지판을 걸러낸다
+_SKY_MAX_TOP = 0.15
+_SKY_MIN_WIDTH = 0.15
+
+
+def _keep_sky_like_components(mask: np.ndarray) -> np.ndarray:
+    """마스크에서 하늘처럼 생긴 덩어리만 남긴다.
+
+    조건: 프레임 위쪽에서 시작하고(윗변이 상단 15% 안), 옆으로 넓다(폭 15% 이상).
+    """
+    if cv2.countNonZero(mask) == 0:
+        return mask
+
+    h, w = mask.shape[:2]
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    kept = np.zeros((h, w), dtype=np.uint8)
+    for idx in range(1, count):
+        top = stats[idx, cv2.CC_STAT_TOP]
+        width = stats[idx, cv2.CC_STAT_WIDTH]
+        if top <= h * _SKY_MAX_TOP and width >= w * _SKY_MIN_WIDTH:
+            kept[labels == idx] = 255
+    return kept
 
 
 def detect_regions(
@@ -1729,29 +1878,31 @@ def detect_regions(
     arr_bgr = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2BGR)
     hsv = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2HSV)
 
-    # ── 하늘 감지: HSV 범위 + 이미지 상단 가중치 ──
+    # ── 하늘 감지 ──
     # H: 90~130 (파란~시안), S: 30+, V: 100+
     lower_sky = np.array([90, 30, 100], dtype=np.uint8)
     upper_sky = np.array([130, 255, 255], dtype=np.uint8)
-    sky_color_mask = cv2.inRange(hsv, lower_sky, upper_sky)
-
-    # 이미지 상단 50%에 가중치 부여 (하늘은 대부분 위쪽)
-    top_weight = np.zeros((h, w), dtype=np.float32)
-    for row in range(h):
-        weight = max(0.0, 1.0 - (row / (h * 0.5)))
-        top_weight[row, :] = weight
-    # 상단 가중치를 적용한 하늘 마스크
-    sky_weighted = (sky_color_mask.astype(np.float32) / 255.0) * (0.4 + 0.6 * top_weight)
-    sky_mask = (sky_weighted > 0.3).astype(np.uint8) * 255
+    sky_mask = cv2.inRange(hsv, lower_sky, upper_sky)
 
     # 모폴로지로 노이즈 제거 및 영역 연결
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     sky_mask = cv2.morphologyEx(sky_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     sky_mask = cv2.morphologyEx(sky_mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
+    # 위치·모양으로 걸러낸다. 색만 보면 파란 셔츠·물·파란 벽·유리창이 다 하늘로
+    # 잡히고, 거기에 하늘용 보정(밝기↓ 채도↑)이 걸린다.
+    #
+    # 예전에는 상단 가중치로 걸러 보려 했지만 실제로는 아무것도 못 걸렀다.
+    # 가중치의 하한이 0.4인데 통과 문턱이 0.3이라, 프레임 어디에 있든 색만
+    # 맞으면 통과했다.
+    #
+    # 하늘은 (1) 프레임 위쪽에서 시작하고 (2) 옆으로 넓다. 두 조건을 다 만족하는
+    # 덩어리만 남긴다. 창문 너머로만 보이는 하늘은 놓치지만, 옷을 하늘로
+    # 착각해 색을 틀어 놓는 것보다 낫다.
+    sky_mask = _keep_sky_like_components(sky_mask)
+
     # 하늘 영역이 이미지의 5% 미만이면 하늘 없음으로 처리
-    sky_ratio = cv2.countNonZero(sky_mask) / (h * w)
-    if sky_ratio < 0.05:
+    if cv2.countNonZero(sky_mask) / (h * w) < 0.05:
         sky_mask = np.zeros((h, w), dtype=np.uint8)
 
     # ── 얼굴 감지 ──
