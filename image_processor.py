@@ -1161,15 +1161,23 @@ def apply_skin_smoothing(
     if skin_mask is None or cv2.countNonZero(skin_mask) == 0:
         return img
 
-    # intensity에 비례하여 필터 강도 조절 (과도한 스무딩 방지를 위해 상한 제한)
-    d = int(5 + intensity * 4)            # diameter: 5 ~ 9 (최대 18px 커널)
-    sigma_color = 20 + intensity * 30     # 20 ~ 50 (색상 병합 범위 제한)
-    sigma_space = 20 + intensity * 30     # 20 ~ 50 (공간 병합 범위 제한)
+    # 커널 크기는 얼굴 크기에 맞춘다. 픽셀 고정값을 쓰면 클로즈업에서는
+    # 효과가 거의 없고 얼굴이 작게 찍힌 사진에서는 뭉개진다 — 같은 설정인데
+    # 결과가 달라 보이는 원인이었다.
+    xs, ys = np.where(skin_mask > 0)[1], np.where(skin_mask > 0)[0]
+    face_w = max(1, int(xs.max() - xs.min()))
+    face_h = max(1, int(ys.max() - ys.min()))
+    face_size = max(face_w, face_h)
+
+    d = int(np.clip(face_size * 0.020 * (0.6 + intensity), 3, 15))
+    sigma_color = 18 + intensity * 26     # 색상 병합 범위 — 얼굴 크기와 무관
+    sigma_space = float(np.clip(face_size * 0.035, 8, 60))
 
     smoothed = cv2.bilateralFilter(arr_bgr, d, sigma_color, sigma_space)
 
-    # 피부 안에서만, 마스크 경계는 부드럽게 — 얼굴 윤곽에 선이 생기지 않게
-    feather = max(9, int(min(arr_bgr.shape[:2]) * 0.01)) | 1
+    # 피부 안에서만, 마스크 경계는 부드럽게 — 얼굴 윤곽에 선이 생기지 않게.
+    # 페더 폭도 얼굴 기준이라야 경계가 늘 비슷하게 자연스럽다.
+    feather = max(5, int(face_size * 0.03)) | 1
     alpha = cv2.GaussianBlur(skin_mask, (feather, feather), 0)
     alpha = (alpha.astype(np.float32) / 255.0 * intensity)[:, :, np.newaxis]
 
@@ -1206,6 +1214,8 @@ _RIGHT_EYEBROW = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276]
 def _get_skin_mask(
     img_rgb: np.ndarray,
     cache: MediaPipeCache | None = None,
+    for_blemish: bool = False,
+    mode: str = "texture",
 ) -> np.ndarray | None:
     """MediaPipe FaceLandmarker로 피부 영역 마스크를 생성한다.
 
@@ -1248,34 +1258,79 @@ def _get_skin_mask(
             lm = face_lms[idx]
             return int(lm.x * w), int(lm.y * h)
 
-        # 얼굴 윤곽 마스크
-        oval_pts = np.array([_idx_to_pt(i) for i in _SKIN_FACE_OVAL], dtype=np.int32)
-        face_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(face_mask, [oval_pts], 255)
-
-        # 제외 영역 (눈, 입, 눈썹) — 넉넉하게 확장하여 제외
-        for region in (_LEFT_EYE, _RIGHT_EYE, _LIPS, _LEFT_EYEBROW, _RIGHT_EYEBROW):
-            pts = np.array([_idx_to_pt(i) for i in region], dtype=np.int32)
-            cv2.fillConvexPoly(face_mask, pts, 0)
-
-        # 코 영역 일부 제외 (콧구멍·코 다리 — 자연스러운 음영이 잡티로 오감지됨)
-        nose_bridge = [6, 197, 195, 5, 4]
-        nose_tip = [1, 2, 98, 327, 168]
-        for region in (nose_bridge, nose_tip):
-            pts = np.array([_idx_to_pt(i) for i in region], dtype=np.int32)
-            cv2.fillConvexPoly(face_mask, pts, 0)
-
-        # ★ 핵심: 경계에서 충분히 안쪽으로 침식 — 턱선·이마선 근처 오감지 방지
-        short_side = min(h, w)
-        erode_px = max(8, int(short_side * 0.025))
-        erode_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (erode_px, erode_px)
+        mask = cv2.bitwise_or(
+            mask,
+            build_face_skin_mask(_idx_to_pt, h, w, for_blemish=for_blemish, mode=mode),
         )
-        face_mask = cv2.erode(face_mask, erode_kernel, iterations=1)
-
-        mask = cv2.bitwise_or(mask, face_mask)
 
     return mask
+
+
+def build_face_skin_mask(
+    pt,
+    h: int,
+    w: int,
+    for_blemish: bool = False,
+    mode: str = "texture",
+) -> np.ndarray:
+    """랜드마크 좌표에서 얼굴 마스크 하나를 만든다. MediaPipe와 분리해 테스트 가능.
+
+    [pt]는 랜드마크 인덱스를 (x, y) 픽셀 좌표로 바꾸는 함수다.
+
+    mode에 따라 두 가지 마스크를 만든다:
+    - "texture" — 질감을 건드리는 보정(피부 스무딩, 잡티 제거)용.
+      눈·눈썹·입술을 뚫어 둔다. 그것까지 뭉개면 안 되니까.
+    - "tone" — 밝기·색온도처럼 톤을 바꾸는 보정용. 얼굴 전체를 덮는다.
+      볼만 밝히고 눈두덩과 입술은 그대로 두면 얼굴이 얼룩덜룩해진다.
+
+    바깥 윤곽 축소와 이목구비 구멍 확장은 서로 다른 값이어야 한다.
+    예전에는 침식 한 번으로 둘을 함께 처리한 데다 그 크기가 이미지 기준
+    (짧은 변의 2.5%)이라, 얼굴이 작게 찍힌 사진에서는 남는 영역이
+    얼굴 한가운데 조각들뿐이었다. 이제 둘 다 얼굴 크기에 비례한다.
+    """
+    oval_pts = np.array([pt(i) for i in _SKIN_FACE_OVAL], dtype=np.int32)
+    face_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(face_mask, [oval_pts], 255)
+
+    # 얼굴 너비 — 광대 양끝(234, 454) 사이 거리
+    lx, _ = pt(234)
+    rx, _ = pt(454)
+    face_w = max(1.0, abs(rx - lx))
+
+    if mode == "tone":
+        # 톤 보정은 얼굴 전체에 고르게 — 윤곽만 아주 살짝 줄여
+        # 머리카락·배경이 물리지 않게 한다. 블렌딩 시 경계는 어차피 부드러워진다.
+        oval_shrink = max(1, int(face_w * 0.015))
+        return cv2.erode(
+            face_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (oval_shrink * 2 + 1,) * 2),
+        )
+
+    # 이목구비 구멍: 볼록 껍질로 채운다.
+    # fillConvexPoly는 입술처럼 오목한 윤곽에서 결과가 어긋난다.
+    features = np.zeros((h, w), dtype=np.uint8)
+    regions = [_LEFT_EYE, _RIGHT_EYE, _LIPS, _LEFT_EYEBROW, _RIGHT_EYEBROW]
+    if for_blemish:
+        # 잡티 탐지에서만 콧구멍 주변을 뺀다 — 자연스러운 음영이 잡티로 오감지된다.
+        # 피부 보정에서는 코도 피부이므로 남긴다.
+        regions.append([1, 2, 98, 327])
+    for region in regions:
+        pts = cv2.convexHull(np.array([pt(i) for i in region], dtype=np.int32))
+        cv2.fillPoly(features, [pts], 255)
+
+    feature_pad = max(2, int(face_w * 0.02))
+    features = cv2.dilate(
+        features,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (feature_pad * 2 + 1,) * 2),
+    )
+
+    oval_shrink = max(2, int(face_w * 0.03))
+    face_mask = cv2.erode(
+        face_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (oval_shrink * 2 + 1,) * 2),
+    )
+
+    return cv2.bitwise_and(face_mask, cv2.bitwise_not(features))
 
 
 def _detect_blemishes(
@@ -1378,7 +1433,7 @@ def apply_blemish_removal(
     arr_bgr = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2BGR)
 
     # 1. 피부 마스크 (얼굴 미감지 → 원본 반환)
-    skin_mask = _get_skin_mask(arr_rgb, cache=cache)
+    skin_mask = _get_skin_mask(arr_rgb, cache=cache, for_blemish=True)
     if skin_mask is None:
         return img
 
@@ -1675,8 +1730,10 @@ def detect_regions(
     if sky_ratio < 0.05:
         sky_mask = np.zeros((h, w), dtype=np.uint8)
 
-    # ── 얼굴/피부 감지: 기존 _get_skin_mask() 재사용 ──
-    face_mask = _get_skin_mask(arr_rgb, cache=cache)
+    # ── 얼굴 감지 ──
+    # 영역별 보정의 face는 밝기·색온도 같은 톤 조절이 주 용도라 얼굴 전체를 덮는
+    # 마스크를 쓴다. 눈·입술을 뚫어 둔 질감용 마스크로 톤을 바꾸면 얼룩이 진다.
+    face_mask = _get_skin_mask(arr_rgb, cache=cache, mode="tone")
     if face_mask is None:
         face_mask = np.zeros((h, w), dtype=np.uint8)
 
