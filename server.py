@@ -246,18 +246,6 @@ def api_analyze_and_transform(
             analysis["autoEdits"] = auto_edits
             params_comment = prefix_tilt_comment(params_comment, measured_tilt)
 
-            # 6. AI autoEdits 적용 (수평 보정, 크롭, 요소 제거, 인스타 비율)
-            if auto_edits:
-                # 인물은 위아래를 자르지 않는다 (머리·발이 잘려 다리가 짧아 보인다).
-                # 판단을 autoEdits에 적어 둔다 — 앱이 저장·미리보기에서 이 딕셔너리를
-                # 그대로 되돌려 보내므로, 그 경로에서도 같은 결정이 적용된다.
-                # (예전에는 이 플래그가 이 엔드포인트의 인자로만 있어서, 저장할 때
-                #  인물 사진의 세로 크롭이 다시 걸려 머리·발이 잘렸다.)
-                auto_edits["allow_vertical_crop"] = subject != "인물"
-                analysis["autoEdits"] = auto_edits
-                log.info("analyze-and-transform: applying autoEdits=%s", auto_edits)
-                img = apply_auto_edits(img, auto_edits)
-
             # MediaPipe 캐시를 요청 스코프로 공유 — detect_regions / apply_regional_transforms / apply_all_transforms 간 중복 호출 제거
             with MediaPipeCache() as mp_cache:
                 # 7. 영역별 스마트 보정 (regionParams가 있으면)
@@ -279,6 +267,22 @@ def api_analyze_and_transform(
                                      list(valid_region_params.keys()))
                         except Exception as e:
                             log.warning("analyze-and-transform: regional transforms failed, falling back: %s", e)
+
+                # 7. AI autoEdits 적용 (요소 제거 → 수평·원근 보정 → 크롭 → 비율)
+                #
+                # 영역 보정 다음에 온다. local_* 좌표는 모델이 원본 프레임을 보고
+                # 짚은 것인데, 기하 보정이 먼저 돌면 프레임이 회전·크롭되어 그
+                # 좌표가 엉뚱한 곳을 가리킨다 (실측: 날아간 창문 대신 평평한 벽에
+                # 어두운 사각형이 찍혔다). 픽셀 편집을 원본 프레임에서 끝내고
+                # 그 다음에 프레임을 다시 잡는다.
+                if auto_edits:
+                    # 인물은 위아래를 자르지 않는다 (머리·발이 잘려 다리가 짧아 보인다).
+                    # 판단을 autoEdits에 적어 둔다 — 앱이 저장·미리보기에서 이
+                    # 딕셔너리를 되돌려 보내므로 그 경로에도 같은 결정이 적용된다.
+                    auto_edits["allow_vertical_crop"] = subject != "인물"
+                    analysis["autoEdits"] = auto_edits
+                    log.info("analyze-and-transform: applying autoEdits=%s", auto_edits)
+                    img = apply_auto_edits(img, auto_edits)
 
                 # 8. 슬라이더 변형 적용
                 transformed = apply_all_transforms(img, cache=mp_cache, **params)
@@ -409,11 +413,6 @@ def api_apply_transform(
         with _heavy_semaphore:
             img = decode_base64_image(req.image_base64)
 
-            # analyze-and-transform과 같은 순서로 재현한다.
-            # 슬라이더만 적용하면 저장본에서 수평·크롭·영역 보정이 사라진다.
-            if req.auto_edits:
-                img = apply_auto_edits(img, req.auto_edits)
-
             with MediaPipeCache() as mp_cache:
                 valid_regions = {
                     k: v for k, v in (req.region_params or {}).items()
@@ -430,6 +429,12 @@ def api_apply_transform(
                         )
                     except Exception as exc:
                         log.warning("apply-transform: regional transforms failed: %s", exc)
+
+                # 기하 보정은 영역 보정 뒤에 — analyze-and-transform과 같은 순서다.
+                # local_* 좌표가 원본 프레임 기준이므로 먼저 프레임을 바꾸면 안 된다.
+                # 슬라이더만 적용하면 저장본에서 수평·크롭·영역 보정이 사라진다.
+                if req.auto_edits:
+                    img = apply_auto_edits(img, req.auto_edits)
                 transformed = apply_all_transforms(
                     img, preview=req.preview, cache=mp_cache, **params
                 )

@@ -265,6 +265,11 @@ _CORRECTION_BAND = 0.35
 # 측정분에 레시피 상수를 더한 뒤의 상한. 게인을 곱하기 전에 한 번 더 묶는다.
 _STYLE_BAND = 0.45
 
+# 흰 화소(휘도 250 초과)가 이 비율이면 색온도를 바닥까지 줄인다.
+_WHITE_TEMPERATURE_TOLERANCE = 0.25
+# 그래도 남기는 최소 비율 — 취향을 완전히 버리지는 않는다.
+_WHITE_TEMPERATURE_FLOOR = 0.35
+
 # 쉐도우 바닥 / 하이라이트 천장 차이(0~1)를 슬라이더 값으로 옮기는 배율.
 #
 # 4.2였을 때는 차이가 0.083만 넘으면 밴드(±0.35)에 박혔다. 실제 사진의 차이는
@@ -463,6 +468,18 @@ def build_params_with_comment(
         temperature + float(recipe.get("temperature", 0.0))
         + float(subject_recipe.get("temperature", 0.0)), _STYLE_BAND)
     contrast = _band(contrast + float(subject_recipe.get("contrast", 0.0)), _STYLE_BAND)
+
+    # 흰 영역이 넓은 사진에서는 색온도를 덜 얹는다.
+    #
+    # 흰 배경 스튜디오 사진·흰 벽·흰 옷은 그 자체가 기준 백색이다. 그 위에 취향의
+    # 웜톤을 그대로 올리면 색이 물들 것이 없는 영역이라 시프트가 100% 드러나,
+    # 보정이 아니라 얼룩처럼 보인다. 실측: 흰 배경 인물 사진에 temperature
+    # +0.47이 걸려 배경이 베이지가 됐다. 색이 있는 사진에서는 같은 값이
+    # 자연스럽게 묻힌다 — 그래서 흰 화소 비율에 따라서만 줄인다.
+    if stats["highlight_clip"] > 0:
+        keep = max(_WHITE_TEMPERATURE_FLOOR,
+                   1.0 - stats["highlight_clip"] / _WHITE_TEMPERATURE_TOLERANCE)
+        temperature = round(temperature * keep, 3)
 
     # 쉐도우는 "무조건 들어올린다"가 아니라 "바닥이 목표보다 낮으면 올린다"다.
     # 트렌드 상수(+0.15~0.35)를 모든 사진에 붙이면, 이미 어두운 끝이 열려 있는

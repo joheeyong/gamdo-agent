@@ -647,7 +647,12 @@ def _keystone_with_matrix(
 # 분할 모델은 사람이 없는 사진에도 빈 마스크가 아니라 0에 가까운 확률장을 낸다.
 # 실측: 인물 사진 0.43~0.55, 사람 없는 사진 0.00008 — 최댓값으로 판단하면
 # (사람 없는 사진에서도 0.58까지 튄다) 오탐이 나므로 면적으로 판단한다.
-_BLUR_MIN_SUBJECT = 0.005
+# 배경 흐림을 걸 만한 최소 인물 비중(화면 면적 대비).
+# 0.5%였을 때는 풍경 속 작은 사람 하나로 사진 전체가 흐려졌다.
+# 가짜 보케는 인물이 주인공일 때만 자연스럽다.
+_BLUR_MIN_SUBJECT = 0.08
+# 이 비중 이상이면 온전한 세기로 건다. 사이 구간은 선형으로 올린다.
+_BLUR_FULL_SUBJECT = 0.18
 
 # strength 1.0에서의 흐림 반경(sigma)을 짧은 변 대비로. 실측 sigma:
 #   0.19(기본) → 2.5,  0.5 → 6.5,  1.0 → 13.0
@@ -678,6 +683,23 @@ def _blur_background(
     a = alpha[:, :, np.newaxis]
     out = arr.astype(np.float32) * a + blurred.astype(np.float32) * (1.0 - a)
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def background_blur_scale(coverage: float) -> float:
+    """인물 비중에 따른 배경 흐림 세기 배율 (0~1).
+
+    실제 아웃포커스는 피사체가 화면을 채울 때 생긴다. 대략적인 구도별 비중:
+      얼굴 클로즈업 30~60% / 상반신 20~35% / 전신 10~20% / 풍경 속 사람 1~5%
+
+    풍경 속 사람에게 걸면 사진의 거의 전부가 흐려진다. 그래서 비중이
+    낮으면 아예 걸지 않고, 사이 구간은 갑자기 튀지 않게 선형으로 올린다.
+    """
+    if coverage < _BLUR_MIN_SUBJECT:
+        return 0.0
+    if coverage >= _BLUR_FULL_SUBJECT:
+        return 1.0
+    span = _BLUR_FULL_SUBJECT - _BLUR_MIN_SUBJECT
+    return float((coverage - _BLUR_MIN_SUBJECT) / span)
 
 
 def apply_background_blur(
@@ -714,10 +736,14 @@ def apply_background_blur(
         return img
 
     coverage = float((mask > 0.5).mean())
-    if coverage < _BLUR_MIN_SUBJECT:
-        log.info("background_blur: 인물 면적 %.3f%% — 사람 없음으로 보고 건너뜀",
-                 coverage * 100)
+    scale = background_blur_scale(coverage)
+    if scale <= 0.0:
+        log.info(
+            "background_blur: 인물 면적 %.1f%% — 근접샷이 아니라 건너뜀 "
+            "(최소 %.0f%%)", coverage * 100, _BLUR_MIN_SUBJECT * 100,
+        )
         return img
+    strength *= scale
 
     # 확률 마스크는 이미 경계가 부드럽다(내부 해상도 256px에서 업샘플된다).
     # 애매한 영역의 잔점만 가볍게 눌러 준다.
@@ -725,8 +751,8 @@ def apply_background_blur(
     alpha = cv2.GaussianBlur(mask, (0, 0), smooth)
 
     out = _blur_background(arr, alpha, strength)
-    log.info("background_blur: strength=%.2f 인물 %.1f%% sigma=%.1f",
-             strength, coverage * 100,
+    log.info("background_blur: strength=%.2f(x%.2f) 인물 %.1f%% sigma=%.1f",
+             strength, scale, coverage * 100,
              max(1.0, min(arr.shape[:2]) * _BLUR_SIGMA_RATIO * strength))
     return Image.fromarray(out)
 
@@ -3019,6 +3045,33 @@ def apply_body_reshape(
 # ── LAB 일괄 보정 헬퍼 (색 공간 변환 1회) ──
 
 
+# 계조를 접어 넣는 무릎의 폭 (0~255 기준).
+#
+# 하드 클립은 범위를 넘친 값을 전부 한 값에 붙여 버린다. L 채널에서는 밝은
+# 부분이 평평한 회색 판이 되고, a/b 채널에서는 한 채널만 붙어 색상이 돌아간다.
+# 실측: contrast +0.15만으로도 사진에 따라 화소의 10~37%가 새로 클립됐고,
+# 채도가 최대에 붙은 화소가 10%p 늘어난 경우가 있었다.
+_SOFT_KNEE = 24.0
+
+
+def _soft_limit(x: np.ndarray, knee: float = _SOFT_KNEE) -> np.ndarray:
+    """0~255 밖으로 나가려는 값을 끝에서 접어 넣는다 (하드 클립 대신).
+
+    tanh로 접으므로 순서가 뒤바뀌지 않고(단조), 넘친 만큼 점점 눌린다.
+    필름의 숄더·토우와 같은 역할이다.
+    """
+    y = np.array(x, dtype=np.float32, copy=True)
+    hi_edge = 255.0 - knee
+    up = y > hi_edge
+    if up.any():
+        y[up] = hi_edge + knee * np.tanh((y[up] - hi_edge) / knee)
+    lo_edge = knee
+    dn = y < lo_edge
+    if dn.any():
+        y[dn] = lo_edge - knee * np.tanh((lo_edge - y[dn]) / knee)
+    return y
+
+
 def _apply_lab_adjustments(
     img: Image.Image,
     highlights: float = 0.0,
@@ -3169,9 +3222,10 @@ def _apply_lab_adjustments(
         b_ch = 128.0 + (b_ch - 128.0) * (1.0 + saturation)
 
     # ── LAB → BGR → RGB 1회 역변환 ──
-    lab[:, :, 0] = np.clip(l_ch, 0, 255)
-    lab[:, :, 1] = np.clip(a_ch, 0, 255)
-    lab[:, :, 2] = np.clip(b_ch, 0, 255)
+    # 하드 클립 대신 끝을 접는다 ([_soft_limit] 참고).
+    lab[:, :, 0] = _soft_limit(l_ch)
+    lab[:, :, 1] = _soft_limit(a_ch)
+    lab[:, :, 2] = _soft_limit(b_ch)
 
     bgr_out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
     rgb_out = cv2.cvtColor(bgr_out, cv2.COLOR_BGR2RGB)
