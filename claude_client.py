@@ -6,6 +6,7 @@ import os
 import subprocess
 import tempfile
 import logging
+from typing import Any
 
 from PIL import Image
 
@@ -52,6 +53,80 @@ def _parse_json_response(text: str) -> dict:
         if start != -1 and end != -1 and end > start:
             return json.loads(text[start : end + 1])
         raise
+
+
+# Flutter의 PhotoAnalysisResponse가 파싱에 반드시 필요로 하는 필드.
+# 하나라도 빠지면 앱이 "이전 형식의 분석 데이터입니다"를 띄운다.
+_REQUIRED_SHAPE: dict[str, tuple[type, ...] | dict[str, tuple[type, ...]]] = {
+    "colorAnalysis": {
+        "colorHarmony": (str,),
+        "paletteDescription": (str,),
+    },
+    "compositionAnalysis": {
+        "primaryTechnique": (str,),
+        "balanceScore": (int, float),
+        "strengths": (list,),
+        "improvements": (list,),
+    },
+    "toneReport": {
+        "overallMood": (str,),
+        "styleCategory": (str,),
+        "narrative": (str,),
+    },
+    "shootingTips": (list,),
+    "editingTips": (list,),
+    "overallScore": (int, float),
+}
+
+# 복구도 실패했을 때 채워 넣는 값. 사진 변형은 서버가 계산하므로 영향이 없고,
+# 분석 화면만 비어 보인다 — 응답의 warnings로 그 사실을 알린다.
+_ANALYSIS_FALLBACKS: dict[str, Any] = {
+    "colorAnalysis": {"colorHarmony": "분석 불가", "paletteDescription": ""},
+    "compositionAnalysis": {
+        "primaryTechnique": "분석 불가", "balanceScore": 0.5,
+        "strengths": [], "improvements": [],
+    },
+    "toneReport": {"overallMood": "", "styleCategory": "", "narrative": ""},
+    "shootingTips": [],
+    "editingTips": [],
+    "overallScore": 0,
+}
+
+
+def _validate_analysis(parsed: dict) -> list[str]:
+    """앱이 요구하는 필드가 갖춰졌는지 검사하고, 어긋난 경로 목록을 반환한다."""
+    problems: list[str] = []
+    for key, spec in _REQUIRED_SHAPE.items():
+        value = parsed.get(key)
+        if isinstance(spec, dict):
+            if not isinstance(value, dict):
+                problems.append(f"{key} (객체가 아님)")
+                continue
+            for sub, types in spec.items():
+                if not isinstance(value.get(sub), types):
+                    problems.append(f"{key}.{sub}")
+        elif not isinstance(value, spec):
+            problems.append(key)
+    return problems
+
+
+def _apply_analysis_fallbacks(parsed: dict, problems: list[str]) -> None:
+    """검증에 실패한 필드만 기본값으로 메운다 (제자리 수정)."""
+    for path in problems:
+        key = path.split(" ")[0].split(".")[0]
+        fallback = _ANALYSIS_FALLBACKS.get(key)
+        if fallback is None:
+            continue
+        if isinstance(fallback, dict):
+            target = parsed.get(key)
+            if not isinstance(target, dict):
+                parsed[key] = dict(fallback)
+            else:
+                for sub, default in fallback.items():
+                    if sub not in target:
+                        target[sub] = default
+        else:
+            parsed[key] = fallback
 
 
 def _format_items(items: list[dict]) -> str:
@@ -498,6 +573,38 @@ def transform_photo(
             image_paths=[composite_path],
             tools="Read",
         )
-        return _parse_json_response(result)
+        parsed = _parse_json_response(result)
+
+        # 스키마 검증 — 어긋나면 부족한 필드만 짚어 한 번 다시 받는다.
+        # 이미지를 다시 읽을 필요가 없어 복구 호출은 빠르고 저렴하다.
+        problems = _validate_analysis(parsed)
+        if problems:
+            log.warning("analysis schema invalid: %s — retrying", problems)
+            repair_prompt = (
+                "직전 응답의 JSON에서 아래 필드가 빠졌거나 타입이 잘못됐습니다:\n"
+                + "\n".join(f"- {p}" for p in problems)
+                + "\n\n직전 응답 JSON:\n"
+                + json.dumps(parsed, ensure_ascii=False)
+                + "\n\n같은 분석 내용을 유지한 채 위 필드를 채워 완전한 JSON "
+                "하나만 출력하세요. 설명이나 코드블록 없이 JSON만."
+            )
+            try:
+                repaired = _parse_json_response(
+                    _call_claude(repair_prompt, TRANSFORM_PHOTO_SYSTEM, tools="")
+                )
+                remaining = _validate_analysis(repaired)
+                if len(remaining) < len(problems):
+                    parsed, problems = repaired, remaining
+            except Exception as exc:
+                log.warning("analysis repair call failed: %s", exc)
+
+        if problems:
+            # 여기까지 왔으면 분석 화면 일부가 비지만, 사진 변형은 서버가
+            # 측정으로 계산하므로 정상 동작한다. 조용히 넘기지 않고 표시한다.
+            log.error("analysis still invalid after repair: %s", problems)
+            _apply_analysis_fallbacks(parsed, problems)
+            parsed["warnings"] = [f"분석 필드 누락: {', '.join(problems)}"]
+
+        return parsed
     finally:
         _cleanup_files(temp_files)
