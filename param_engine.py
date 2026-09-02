@@ -392,7 +392,7 @@ def build_params_with_comment(
         if isinstance(legacy, dict):
             reshape = legacy.get("reshapeParams")
     if isinstance(reshape, dict) and is_portrait:
-        params["reshapeParams"] = reshape
+        params["reshapeParams"] = _clamp_reshape(reshape)
 
     log.info(
         "param_engine: subject=%s trend=%s gain=%.2f | measured b=%.2f c=%.2f s=%.2f w=%.2f haze=%.2f sharp=%.2f",
@@ -401,6 +401,27 @@ def build_params_with_comment(
         stats["warmth"], stats["haze"], stats["sharpness"],
     )
     return params, describe_params(stats, trend, subject, params, gain)
+
+
+# 워프 계수가 커진 만큼 모델이 범위를 벗어난 값을 주면 얼굴이 뭉개진다.
+# 프롬프트 권장 상한(0.5)에서 한 번 더 자른다.
+_RESHAPE_MAX = 0.5
+_RESHAPE_KEYS = (
+    "face_slim", "jaw_sharpen", "eye_enlarge",
+    "leg_stretch", "shoulder_width", "waist_slim",
+)
+
+
+def _clamp_reshape(reshape: dict[str, Any]) -> dict[str, float]:
+    """얼굴/체형 값을 안전 범위로 자른다. shoulder_width만 음수를 허용한다."""
+    out: dict[str, float] = {}
+    for key in _RESHAPE_KEYS:
+        raw = reshape.get(key)
+        if not isinstance(raw, (int, float)):
+            continue
+        lo = -_RESHAPE_MAX if key == "shoulder_width" else 0.0
+        out[key] = _clamp(float(raw), lo, _RESHAPE_MAX)
+    return out
 
 
 # ── 적용된 변형 코멘트 ──
@@ -505,3 +526,99 @@ def describe_params(
     if not reasons:
         return tail
     return ", ".join(reasons) + " " + tail
+
+
+# ── 기울기 측정 ──
+
+# 이 각도를 넘어서면 의도한 구도(네덜란드 앵글 등)로 보고 건드리지 않는다.
+_MAX_TILT = 8.0
+# 이보다 작으면 회전으로 잃는 해상도가 이득보다 크다.
+_MIN_TILT = 0.4
+
+
+def detect_tilt_angle(img: Image.Image, max_angle: float = _MAX_TILT) -> float | None:
+    """사진의 기울기를 재서 교정 각도(도)를 반환한다. 확신이 없으면 None.
+
+    수평선(지평선·수면·테이블 모서리)과 수직선(건물·기둥·문틀)은
+    실제로 수평·수직이라는 전제로, 검출된 직선들이 그 축에서 얼마나
+    벗어났는지를 길이로 가중한 중앙값으로 추정한다.
+
+    모델에게 눈대중시키는 것보다 정확하고, 근거(선의 개수·일관성)로
+    확신 여부를 판단할 수 있다.
+    """
+    small = img.convert("L")
+    w, h = small.size
+    if max(w, h) > 900:
+        ratio = 900 / max(w, h)
+        w, h = max(1, int(w * ratio)), max(1, int(h * ratio))
+        small = small.resize((w, h), Image.BILINEAR)
+
+    gray = np.asarray(small, dtype=np.uint8)
+    edges = cv2.Canny(gray, 60, 180, apertureSize=3)
+
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 720,          # 0.25도 해상도
+        threshold=60,
+        minLineLength=int(min(w, h) * 0.25),
+        maxLineGap=int(min(w, h) * 0.02) + 2,
+    )
+    if lines is None:
+        return None
+
+    deviations: list[float] = []
+    weights: list[float] = []
+
+    # OpenCV 버전에 따라 (N,1,4) 또는 (N,4)로 온다
+    for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
+        dx, dy = float(x2 - x1), float(y2 - y1)
+        length = float(np.hypot(dx, dy))
+        if length < 1.0:
+            continue
+
+        # -90 ~ +90도로 정규화 (선은 방향이 없다)
+        angle = (np.degrees(np.arctan2(dy, dx)) + 90.0) % 180.0 - 90.0
+
+        if abs(angle) <= max_angle:
+            deviation = angle                      # 수평선의 어긋남
+        elif abs(abs(angle) - 90.0) <= max_angle:
+            deviation = angle - 90.0 if angle > 0 else angle + 90.0  # 수직선의 어긋남
+        else:
+            continue                               # 대각선은 기준이 되지 못한다
+
+        deviations.append(deviation)
+        weights.append(length)
+
+    if len(deviations) < 3:
+        return None
+
+    dev = np.array(deviations)
+    wgt = np.array(weights)
+
+    # 길이 가중 중앙값 — 긴 선(지평선·건물 모서리)이 짧은 잡선보다 신뢰도가 높다
+    order = np.argsort(dev)
+    dev, wgt = dev[order], wgt[order]
+    cumulative = np.cumsum(wgt)
+    median = float(dev[int(np.searchsorted(cumulative, cumulative[-1] / 2.0))])
+
+    if abs(median) < _MIN_TILT:
+        return None
+
+    # 확신 판정: 추정치 근처(±1도)에 모인 선이 전체 길이의 절반은 되어야 한다.
+    # 그렇지 않으면 선들이 제각각이라는 뜻이고, 그때 회전하면 오히려 망친다.
+    agreeing = wgt[np.abs(dev - median) <= 1.0].sum()
+    if agreeing < wgt.sum() * 0.5:
+        log.info("tilt: 선들이 일관되지 않아 보정하지 않음 (median=%.2f°)", median)
+        return None
+
+    # apply_straighten(θ)를 적용하면 측정 편차가 θ만큼 줄어든다.
+    # 따라서 편차를 0으로 만들려면 편차값을 그대로 넘기면 된다. (실측으로 확인)
+    return round(median, 2)
+
+
+def prefix_tilt_comment(comment: str, tilt: float | None) -> str:
+    """보정 코멘트 앞에 수평 보정 사실을 덧붙인다."""
+    if tilt is None or abs(tilt) < _MIN_TILT:
+        return comment
+    return f"{abs(tilt):.1f}° 기울어 있어 수평을 맞추고, {comment}"

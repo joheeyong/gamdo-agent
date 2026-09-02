@@ -32,7 +32,12 @@ from models import (
     TransformPhotoResponse,
 )
 from claude_client import analyze_user, get_reference_image_paths, transform_photo
-from param_engine import build_params_with_comment, measure_color_analysis
+from param_engine import (
+    build_params_with_comment,
+    detect_tilt_angle,
+    measure_color_analysis,
+    prefix_tilt_comment,
+)
 from image_processor import (
     MediaPipeCache,
     analysis_to_transform_params,
@@ -179,15 +184,36 @@ def api_analyze_and_transform(
         log.info("analyze-and-transform: params=%s", params)
         log.info("analyze-and-transform: comment=%s", params_comment)
 
-        # 5. AI autoEdits 적용 (크롭, 요소 제거, 인스타 비율)
-        auto_edits = analysis.get("autoEdits", {})
-        if auto_edits and isinstance(auto_edits, dict):
+        # 5. 수평 보정 각도는 Hough 직선 검출로 잰다.
+        #    지평선·건물 모서리가 기준이 있으면 눈대중보다 정확하고,
+        #    기준선이 없거나 선들이 제각각이면 None을 돌려 손대지 않는다.
+        auto_edits = analysis.get("autoEdits")
+        if not isinstance(auto_edits, dict):
+            auto_edits = {}
+        measured_tilt = detect_tilt_angle(img)
+        if measured_tilt is not None:
+            auto_edits["straighten"] = measured_tilt
+            log.info("analyze-and-transform: measured tilt %.2f°", measured_tilt)
+        elif auto_edits.get("straighten") is not None:
+            # 측정이 확신하지 못하면 모델의 판단을 쓰되 안전 범위로 묶는다
+            try:
+                llm_tilt = max(-8.0, min(8.0, float(auto_edits["straighten"])))
+                auto_edits["straighten"] = llm_tilt
+                measured_tilt = llm_tilt
+                log.info("analyze-and-transform: using model tilt %.2f°", llm_tilt)
+            except (TypeError, ValueError):
+                auto_edits["straighten"] = None
+        analysis["autoEdits"] = auto_edits
+        params_comment = prefix_tilt_comment(params_comment, measured_tilt)
+
+        # 6. AI autoEdits 적용 (수평 보정, 크롭, 요소 제거, 인스타 비율)
+        if auto_edits:
             log.info("analyze-and-transform: applying autoEdits=%s", auto_edits)
             img = apply_auto_edits(img, auto_edits)
 
         # MediaPipe 캐시를 요청 스코프로 공유 — detect_regions / apply_regional_transforms / apply_all_transforms 간 중복 호출 제거
         with MediaPipeCache() as mp_cache:
-            # 6. 영역별 스마트 보정 (regionParams가 있으면)
+            # 7. 영역별 스마트 보정 (regionParams가 있으면)
             region_params_raw = analysis.get("regionParams")
             if region_params_raw and isinstance(region_params_raw, dict):
                 # null이 아닌 영역만 필터링
@@ -204,7 +230,7 @@ def api_analyze_and_transform(
                     except Exception as e:
                         log.warning("analyze-and-transform: regional transforms failed, falling back: %s", e)
 
-            # 7. 슬라이더 변형 적용
+            # 8. 슬라이더 변형 적용
             transformed = apply_all_transforms(img, cache=mp_cache, **params)
         result_b64 = encode_image_base64(transformed)
 
