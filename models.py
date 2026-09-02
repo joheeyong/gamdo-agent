@@ -116,6 +116,10 @@ class AutoTransformResponse(BaseModel):
 class ApplyTransformRequest(BaseModel):
     """슬라이더 값으로 수동 변형 요청."""
     image_base64: str = Field(..., description="원본 이미지 (base64)")
+    # 기하 보정과 영역별 보정은 슬라이더가 아니지만, 여기서 다시 적용하지 않으면
+    # 저장본이 미리보기와 달라진다 (수평·크롭·영역 보정이 빠진 사진이 저장된다).
+    auto_edits: dict | None = Field(None, description="수평 보정/크롭/요소 제거/비율")
+    region_params: dict | None = Field(None, description="하늘/얼굴/배경 영역별 보정")
     preview: bool = Field(False, description="True이면 미리보기 모드 (색감 보정만, reshape/blemish 스킵)")
     brightness: float = Field(0.0, ge=-1.0, le=1.0)
     contrast: float = Field(0.0, ge=-1.0, le=1.0)
@@ -130,6 +134,8 @@ class ApplyTransformRequest(BaseModel):
     vignette: float = Field(0.0, ge=-1.0, le=1.0)
     sharpness: float = Field(0.0, ge=-1.0, le=1.0)
     grain: float = Field(0.0, ge=0.0, le=1.0)
+    auto_wb: float = Field(0.0, ge=0.0, le=1.0, description="자동 화이트밸런스 강도")
+    denoise: float = Field(0.0, ge=0.0, le=1.0, description="노이즈 제거 강도")
     tone_curve_preset: str = Field("linear", description="톤 커브 프리셋 (linear|s_curve|film|fade|high_contrast|bright)")
     tone_curve_strength: float = Field(0.0, ge=0.0, le=1.0, description="톤 커브 강도")
     split_shadow_hue: float = Field(0.0, ge=0.0, le=360.0, description="스플릿 토닝 쉐도우 색상 (0~360)")

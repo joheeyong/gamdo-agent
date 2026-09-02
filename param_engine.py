@@ -23,6 +23,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from image_processor import estimate_noise_sigma
+
 log = logging.getLogger("gamdo-agent")
 
 # 측정 시 이미지를 이 크기로 줄인다 — 통계값은 해상도에 거의 무관하다.
@@ -30,6 +32,16 @@ _MEASURE_MAX_PX = 512
 
 
 # ── 이미지 측정 ──
+
+
+def _center_crop(img: Image.Image, size: int) -> Image.Image:
+    """원본 해상도를 유지한 채 가운데 정사각 영역을 잘라낸다."""
+    w, h = img.size
+    if w <= size and h <= size:
+        return img
+    side = min(size, w, h)
+    left, top = (w - side) // 2, (h - side) // 2
+    return img.crop((left, top, left + side, top + side))
 
 
 def measure_image_stats(img: Image.Image) -> dict[str, float]:
@@ -65,6 +77,19 @@ def measure_image_stats(img: Image.Image) -> dict[str, float]:
     dark_channel = cv2.erode(arr.min(axis=2).astype(np.uint8), np.ones((9, 9), np.uint8))
     haze = float(dark_channel.mean()) / 255.0
 
+    # 색 틀어짐이 사진 전체에 고른지 — 조명 탓인지 장면 탓인지 가른다.
+    # 백열등 실내는 밝은 곳도 어두운 곳도 다 누렇지만(고름 → 교정 대상),
+    # 노을은 하늘만 붉고 그늘은 그렇지 않다(고르지 않음 → 장면의 색).
+    lo, hi = np.percentile(luma, [33, 67])
+    dark_px, bright_px = luma <= lo, luma >= hi
+    warm_dark = float((r[dark_px] - b[dark_px]).mean()) / 128.0 if dark_px.any() else 0.0
+    warm_bright = float((r[bright_px] - b[bright_px]).mean()) / 128.0 if bright_px.any() else 0.0
+    if warm_dark * warm_bright <= 0:
+        cast_uniformity = 0.0          # 부호가 다르면 조명 탓이 아니다
+    else:
+        lo_mag, hi_mag = sorted((abs(warm_dark), abs(warm_bright)))
+        cast_uniformity = lo_mag / hi_mag if hi_mag > 1e-6 else 0.0
+
     return {
         "brightness": float(luma.mean()) / 255.0,
         "contrast": float(p95 - p5) / 255.0,
@@ -75,6 +100,10 @@ def measure_image_stats(img: Image.Image) -> dict[str, float]:
         "haze": haze,
         # 라플라시안 분산 500 정도면 충분히 선명한 사진으로 본다
         "sharpness": min(1.0, lap_var / 500.0),
+        # 노이즈는 반드시 원본 해상도에서 잰다 — 축소하면 이웃 화소가 평균되어
+        # 노이즈가 사라져 버린다. 비용을 아끼려 가운데 일부만 잘라 본다.
+        "noise": estimate_noise_sigma(_center_crop(img, 512)),
+        "cast_uniformity": round(cast_uniformity, 3),
     }
 
 
@@ -227,6 +256,9 @@ _SUBJECT_RECIPES: dict[str, dict[str, Any]] = {
 # 측정에서 나온 교정 성분 하나가 낼 수 있는 최대치
 _CORRECTION_BAND = 0.35
 
+# 화이트밸런스 강도 1.0이 실제로 중화하는 비율 (채널 게인 상한 때문에 1은 아니다)
+_AWB_NEUTRALIZE = 0.8
+
 
 def _clamp(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return round(max(lo, min(hi, v)), 3)
@@ -276,6 +308,9 @@ def build_params_with_comment(
     # 게인: 보정 강도 성향이 전체 세기를 정한다
     gain = _FILTER_GAIN.get(editing.get("filterTendency") or "auto", 0.8)
 
+    # 화이트밸런스 세기는 색온도 계산보다 먼저 정해져야 한다 (아래에서 참조)
+    auto_wb_strength = round(0.65 * stats["cast_uniformity"], 3)
+
     # ── 측정값 ↔ 목표값 차이로 노출계 3형제를 정한다 ──
     target_brightness = _BRIGHTNESS_TARGETS[_level_index(color_pref.get("brightnessTendency"))]
     target_contrast = _CONTRAST_TARGETS[_level_index(color_pref.get("contrast"))]
@@ -291,7 +326,10 @@ def build_params_with_comment(
     brightness = _band((target_brightness - stats["brightness"]) * 2.2)
     contrast = _band((target_contrast - stats["contrast"]) * 1.6)
     saturation = _band((target_saturation - stats["saturation"]) * 1.8)
-    temperature = _band((target_warmth - stats["warmth"]) * 1.2)
+    # 화이트밸런스가 먼저 중립으로 당기므로, 그 뒤에 남는 웜니스를 기준으로 잡는다.
+    # 원본 warmth를 그대로 쓰면 같은 편차를 두 번 보정하게 된다.
+    warmth_after_wb = stats["warmth"] * (1.0 - _AWB_NEUTRALIZE * auto_wb_strength)
+    temperature = _band((target_warmth - warmth_after_wb) * 1.2)
 
     # 레시피의 방향성을 더한다 (트렌드 → 피사체 순으로 덮어씀)
     def pick(key: str, default: float = 0.0) -> float:
@@ -321,6 +359,15 @@ def build_params_with_comment(
         sharpness += 0.15
     elif stats["sharpness"] > 0.75:
         sharpness = min(sharpness, 0.05)
+
+    # 노이즈 제거: 실제 측정된 노이즈량에 비례하되, 쉐도우를 많이 들어올릴수록
+    # 어두운 곳 노이즈가 더 드러나므로 그만큼 세게 잡는다.
+    noise = stats["noise"]
+    if noise < 2.5:
+        denoise_strength = 0.0
+    else:
+        denoise_strength = min(1.0, (noise - 2.5) / 12.0)
+        denoise_strength = min(1.0, denoise_strength + max(0.0, shadows) * 0.4)
 
     # 안개 제거는 풍경에서 실제로 뿌옇게 측정될 때만
     dehaze = 0.0
@@ -371,6 +418,9 @@ def build_params_with_comment(
         "sharpness": _clamp(sharpness * gain),
         "vignette": _clamp(vignette * gain),
         "grain": _clamp(grain * gain, 0.0, 1.0),
+        # 촬영 결함 교정은 취향(보정 강도)과 무관하므로 게인을 곱하지 않는다
+        "auto_wb": _clamp(auto_wb_strength, 0.0, 1.0),
+        "denoise": _clamp(denoise_strength, 0.0, 1.0),
         # 피부 보정은 사용자가 고른 강도 그대로 — 필터 게인을 곱하지 않는다
         "blemish_removal": _clamp(blemish, 0.0, 1.0),
         "skin_smoothing": _clamp(skin_smoothing, 0.0, 1.0),

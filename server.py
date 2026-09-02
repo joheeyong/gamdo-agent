@@ -322,6 +322,8 @@ def api_apply_transform(
             "vignette": req.vignette,
             "sharpness": req.sharpness,
             "grain": req.grain,
+            "auto_wb": req.auto_wb,
+            "denoise": req.denoise,
             "tone_curve_preset": req.tone_curve_preset,
             "tone_curve_strength": req.tone_curve_strength,
             "split_shadow_hue": req.split_shadow_hue,
@@ -339,7 +341,28 @@ def api_apply_transform(
         log.info("apply-transform: params=%s, preview=%s", params, req.preview)
 
         img = decode_base64_image(req.image_base64)
-        transformed = apply_all_transforms(img, preview=req.preview, **params)
+
+        # analyze-and-transform과 같은 순서로 재현한다.
+        # 슬라이더만 적용하면 저장본에서 수평·크롭·영역 보정이 사라진다.
+        if req.auto_edits:
+            img = apply_auto_edits(img, req.auto_edits)
+
+        with MediaPipeCache() as mp_cache:
+            valid_regions = {
+                k: v for k, v in (req.region_params or {}).items()
+                if isinstance(v, dict)
+            }
+            if valid_regions and not req.preview:
+                try:
+                    regions = detect_regions(img, cache=mp_cache)
+                    img = apply_regional_transforms(
+                        img, regions, valid_regions, cache=mp_cache
+                    )
+                except Exception as exc:
+                    log.warning("apply-transform: regional transforms failed: %s", exc)
+            transformed = apply_all_transforms(
+                img, preview=req.preview, cache=mp_cache, **params
+            )
         result_b64 = encode_image_base64(transformed)
 
         log.info("apply-transform: success")

@@ -297,6 +297,124 @@ def encode_image_base64(img: Image.Image, fmt: str = "JPEG", quality: int = 90) 
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+# ── 촬영 결함 교정 (색 보정 이전 단계) ──
+
+
+def estimate_noise_sigma(img: Image.Image) -> float:
+    """이미지의 노이즈 표준편차를 추정한다 (0~255 스케일).
+
+    Immerkær(1996)의 라플라시안 기반 추정 — 평탄한 영역의 고주파 성분만
+    남기는 3x3 커널로 합성곱한 뒤 평균 절대값을 취한다. 사진 내용(엣지)에
+    거의 영향을 받지 않아 별도 마스킹 없이 쓸 수 있다.
+    """
+    gray = np.asarray(img.convert("L"), dtype=np.float32)
+    h, w = gray.shape
+    if h < 8 or w < 8:
+        return 0.0
+
+    kernel = np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], dtype=np.float32)
+    conv = cv2.filter2D(gray, cv2.CV_32F, kernel)
+    sigma = float(np.abs(conv).mean()) * np.sqrt(np.pi / 2.0) / 6.0
+    return round(sigma, 3)
+
+
+def apply_denoise(img: Image.Image, strength: float) -> Image.Image:
+    """노이즈를 줄인다. strength 0.0~1.0.
+
+    휘도(Y)는 약하게, 색차(CrCb)는 강하게 지운다. 색 얼룩이 먼저 눈에 띄고,
+    색차는 세게 뭉개도 디테일 손실이 거의 보이지 않기 때문이다.
+    쉐도우 리프팅 전에 적용해야 어두운 곳 노이즈가 증폭되지 않는다.
+    """
+    if strength < 0.01:
+        return img
+
+    strength = max(0.0, min(1.0, strength))
+    arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+
+    try:
+        ycrcb = cv2.cvtColor(arr, cv2.COLOR_RGB2YCrCb)
+        y, cr, cb = cv2.split(ycrcb)
+
+        # 휘도: NLM의 h는 노이즈 표준편차와 같은 눈금이라, 실제 측정치에
+        # 비례해 잡아야 한다. 고정값을 쓰면 노이즈가 큰 사진에서 아무 효과가
+        # 없고(h가 너무 작음) 깨끗한 사진에서는 디테일만 뭉갠다.
+        sigma = estimate_noise_sigma(img)
+        h_luma = float(np.clip(sigma * (0.5 + 1.0 * strength), 1.0, 15.0))
+        y = cv2.fastNlMeansDenoising(y, None, h=h_luma, templateWindowSize=7,
+                                     searchWindowSize=15)
+
+        # 색차: 절반 해상도에서 강하게 뭉갠 뒤 되돌린다 (빠르고 티가 안 난다)
+        ch, cw = cr.shape
+        small = (max(1, cw // 2), max(1, ch // 2))
+        blur_px = int(3 + 6 * strength) | 1
+        cr = cv2.resize(cv2.medianBlur(cv2.resize(cr, small, interpolation=cv2.INTER_AREA), blur_px),
+                        (cw, ch), interpolation=cv2.INTER_LINEAR)
+        cb = cv2.resize(cv2.medianBlur(cv2.resize(cb, small, interpolation=cv2.INTER_AREA), blur_px),
+                        (cw, ch), interpolation=cv2.INTER_LINEAR)
+
+        result = cv2.cvtColor(cv2.merge([y, cr, cb]), cv2.COLOR_YCrCb2RGB)
+        log.info("denoise: sigma=%.1f strength=%.2f (luma h=%.1f, chroma blur=%dpx)",
+                 sigma, strength, h_luma, blur_px)
+        return Image.fromarray(result)
+    except Exception as exc:
+        log.warning("denoise failed: %s", exc)
+        return img
+
+
+def estimate_illuminant(img: Image.Image) -> tuple[float, float, float]:
+    """장면의 조명 색을 추정해 중립으로 만드는 RGB 게인을 반환한다.
+
+    Shades-of-Gray (Minkowski p=6) — 순수 Gray World는 한 색이 넓게 깔린
+    사진(잔디밭, 파란 하늘)에서 그 색을 회색으로 만들어 버리는데,
+    p-노름을 쓰면 밝은 픽셀에 가중이 실려 그 실패가 완화된다.
+    """
+    small = img.convert("RGB")
+    w, h = small.size
+    if max(w, h) > 256:
+        ratio = 256 / max(w, h)
+        small = small.resize((max(1, int(w * ratio)), max(1, int(h * ratio))), Image.BILINEAR)
+
+    arr = np.asarray(small, dtype=np.float32) / 255.0
+    p = 6.0
+    norms = np.array([
+        (np.power(arr[..., c], p).mean()) ** (1.0 / p) for c in range(3)
+    ])
+    norms[norms < 1e-6] = 1e-6
+
+    gains = norms.mean() / norms
+    return float(gains[0]), float(gains[1]), float(gains[2])
+
+
+def apply_auto_white_balance(img: Image.Image, strength: float) -> Image.Image:
+    """색이 틀어진 사진을 중립 쪽으로 당긴다. strength 0.0~1.0.
+
+    전부 보정하지 않는다 — 노을이나 골든아워의 따뜻함까지 지워 버리기
+    때문이다. strength로 부분 보정하고, 채널당 게인도 ±25%로 묶는다.
+    프로필이 원하는 색온도는 이 위에 temperature로 다시 얹힌다.
+    """
+    if strength < 0.01:
+        return img
+
+    strength = max(0.0, min(1.0, strength))
+    gr, gg, gb = estimate_illuminant(img)
+
+    # 부분 적용 + 채널당 상한
+    gains = []
+    for g in (gr, gg, gb):
+        g = 1.0 + (g - 1.0) * strength
+        gains.append(max(0.75, min(1.25, g)))
+
+    if all(abs(g - 1.0) < 0.01 for g in gains):
+        return img
+
+    arr = np.asarray(img.convert("RGB"), dtype=np.float32)
+    for c, g in enumerate(gains):
+        arr[..., c] *= g
+
+    log.info("auto_wb: strength=%.2f gains=(%.3f, %.3f, %.3f)", strength, *gains)
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
 # ── 개별 변형 함수 ──
 
 
@@ -850,13 +968,28 @@ def apply_grain(img: Image.Image, intensity: float) -> Image.Image:
     return Image.fromarray(adjusted.astype(np.uint8))
 
 
-def apply_skin_smoothing(img: Image.Image, intensity: float) -> Image.Image:
-    """피부 보정 (bilateral filter). intensity: 0.0 ~ 1.0."""
+def apply_skin_smoothing(
+    img: Image.Image,
+    intensity: float,
+    cache: MediaPipeCache | None = None,
+) -> Image.Image:
+    """피부 보정 (bilateral filter). intensity: 0.0 ~ 1.0.
+
+    피부 마스크 안에서만 섞는다 — 예전에는 이미지 전체에 블렌딩해서
+    머리카락·눈동자·배경 디테일까지 같이 뭉개졌다.
+    얼굴 미감지 시에는 뭉갤 피부가 없으므로 원본을 그대로 반환한다.
+
+    cache가 제공되면 MediaPipe 모델/결과 캐시를 재사용한다.
+    """
     if intensity < 0.01:
         return img
 
     arr = np.array(img)
     arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+    skin_mask = _get_skin_mask(arr, cache=cache)
+    if skin_mask is None or cv2.countNonZero(skin_mask) == 0:
+        return img
 
     # intensity에 비례하여 필터 강도 조절 (과도한 스무딩 방지를 위해 상한 제한)
     d = int(5 + intensity * 4)            # diameter: 5 ~ 9 (최대 18px 커널)
@@ -865,9 +998,13 @@ def apply_skin_smoothing(img: Image.Image, intensity: float) -> Image.Image:
 
     smoothed = cv2.bilateralFilter(arr_bgr, d, sigma_color, sigma_space)
 
-    # 원본과 블렌딩하여 자연스럽게
-    blended = cv2.addWeighted(arr_bgr, 1.0 - intensity, smoothed, intensity, 0)
-    result_rgb = cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
+    # 피부 안에서만, 마스크 경계는 부드럽게 — 얼굴 윤곽에 선이 생기지 않게
+    feather = max(9, int(min(arr_bgr.shape[:2]) * 0.01)) | 1
+    alpha = cv2.GaussianBlur(skin_mask, (feather, feather), 0)
+    alpha = (alpha.astype(np.float32) / 255.0 * intensity)[:, :, np.newaxis]
+
+    blended = arr_bgr.astype(np.float32) * (1.0 - alpha) + smoothed.astype(np.float32) * alpha
+    result_rgb = cv2.cvtColor(np.clip(blended, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
 
     return Image.fromarray(result_rgb)
 
@@ -976,10 +1113,16 @@ def _detect_blemishes(
     skin_mask: np.ndarray,
     intensity: float,
 ) -> np.ndarray:
-    """LAB A·B 채널(색상 이상치)로 잡티를 탐지한다.
+    """LAB A·B 채널 밴드패스로 잡티를 탐지한다.
 
     밝기(L) 편차는 음영·조명이므로 무시하고,
     A·B 채널(빨강-녹색, 노랑-파랑)만으로 색상 이상 점을 탐지한다.
+
+    잡티 크기의 성분만 남기려면 고주파(피부 노이즈)와 저주파(조명 그라데이션)를
+    함께 걷어내야 한다. 예전에는 잡티와 비슷한 크기(짧은 변 2%)의 로컬 평균만
+    빼서, 평균이 잡티를 같이 포함해 편차가 스스로 상쇄되고 픽셀 노이즈는 그대로
+    통과했다 — 합성 피부 테스트에서 검출이 0이던 원인이다.
+
     반환: 잡티 영역이 255인 단채널 마스크.
     """
     h, w = img_bgr.shape[:2]
@@ -990,17 +1133,22 @@ def _detect_blemishes(
     a_ch = lab[:, :, 1].astype(np.float32)
     b_ch = lab[:, :, 2].astype(np.float32)
 
-    # 해상도 적응형 커널 — 잡티(10~20px) 감지에 적합한 스케일의 로컬 평균
-    ksize = max(15, int(short_side * 0.02)) | 1
-    a_mean = cv2.GaussianBlur(a_ch, (ksize, ksize), 0)
-    b_mean = cv2.GaussianBlur(b_ch, (ksize, ksize), 0)
+    # 신호: 잡티 크기 정도로만 살짝 평활 → 픽셀 노이즈·필름 그레인을 걷어낸다
+    sig_sigma = max(1.0, short_side * 0.004)
+    a_sig = cv2.GaussianBlur(a_ch, (0, 0), sig_sigma)
+    b_sig = cv2.GaussianBlur(b_ch, (0, 0), sig_sigma)
 
-    # 색상 편차 (A·B만)
-    diff = np.sqrt((a_ch - a_mean) ** 2 + (b_ch - b_mean) ** 2)
+    # 배경: 잡티보다 훨씬 넓은 창 → 얼굴 전체의 색조·조명 그라데이션
+    bg_ksize = max(31, int(short_side * 0.08)) | 1
+    a_bg = cv2.GaussianBlur(a_ch, (bg_ksize, bg_ksize), 0)
+    b_bg = cv2.GaussianBlur(b_ch, (bg_ksize, bg_ksize), 0)
 
-    # 높은 임계값: intensity 0.3 → 27, 1.0 → 20 (정상 피부 질감 오탐 방지)
-    threshold = 30.0 - intensity * 10.0
-    threshold = max(threshold, 8.0)
+    # 색상 편차 (A·B 밴드패스)
+    diff = np.sqrt((a_sig - a_bg) ** 2 + (b_sig - b_bg) ** 2)
+
+    # 밴드패스 후 스케일: 정상 피부는 1 이하, 눈에 보이는 잡티가 3~7이다.
+    # intensity 0.35(자동 기본) → 3.95(뚜렷한 것만), 1.0 → 2.0(옅은 것까지)
+    threshold = max(2.0, 5.0 - intensity * 3.0)
 
     blemish_mask = (diff > threshold).astype(np.uint8) * 255
     blemish_mask = cv2.bitwise_and(blemish_mask, skin_mask)
@@ -1011,7 +1159,7 @@ def _detect_blemishes(
 
     # 개별 잡티 크기 필터 — 작은 점만 (점·여드름 크기)
     min_area = max(4, int((short_side * 0.002) ** 2))
-    max_area = int((short_side * 0.02) ** 2)  # 2% 이하 — 아주 작은 점만
+    max_area = int((short_side * 0.035) ** 2)  # 점·여드름 크기 상한
     contours, _ = cv2.findContours(blemish_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filtered_mask = np.zeros_like(blemish_mask)
     for cnt in contours:
@@ -1019,12 +1167,23 @@ def _detect_blemishes(
         if min_area <= area <= max_area:
             cv2.drawContours(filtered_mask, [cnt], -1, 255, cv2.FILLED)
 
-    return filtered_mask
+    # 임계값을 넘는 건 잡티의 코어뿐이고 번진 테두리는 남는다. 그대로 인페인팅하면
+    # 그 테두리 색을 다시 안쪽으로 끌어와 잡티가 옅게 남는다 — 코어를 넓혀
+    # 잡티 전체를 덮는다. (크기 필터 뒤에 해야 max_area에 걸리지 않는다.)
+    dilate_px = max(3, int(short_side * 0.01)) | 1
+    filtered_mask = cv2.dilate(
+        filtered_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px, dilate_px)),
+    )
+    # 확장분이 입술·눈 경계로 새지 않도록 피부 영역으로 다시 자른다
+    return cv2.bitwise_and(filtered_mask, skin_mask)
 
 
 def _inpaint_blemishes(img_bgr: np.ndarray, blemish_mask: np.ndarray) -> np.ndarray:
     """OpenCV INPAINT_NS(Navier-Stokes)로 잡티 영역을 복원한다."""
-    return cv2.inpaint(img_bgr, blemish_mask, inpaintRadius=3, flags=cv2.INPAINT_NS)
+    # 반경이 잡티보다 작으면 가운데가 덜 채워진다 — 해상도에 맞춰 키운다
+    radius = max(3, int(min(img_bgr.shape[:2]) * 0.004))
+    return cv2.inpaint(img_bgr, blemish_mask, inpaintRadius=radius, flags=cv2.INPAINT_NS)
 
 
 def apply_blemish_removal(
@@ -1064,8 +1223,13 @@ def apply_blemish_removal(
     inpainted = _inpaint_blemishes(arr_bgr, blemish_mask)
 
     # 4. 잡티 픽셀만 교체 (마스크 경계를 살짝 블러하여 자연스럽게)
-    blend_mask = cv2.GaussianBlur(blemish_mask, (5, 5), 0)
-    alpha = (blend_mask.astype(np.float32) / 255.0 * intensity)[:, :, np.newaxis]
+    #    intensity는 "무엇을 잡티로 볼지"의 감도다. 잡티라고 판정한 뒤에
+    #    절반만 지울 이유는 없으므로 채움 강도는 따로 둔다.
+    short_side = min(arr_bgr.shape[:2])
+    feather = max(5, int(short_side * 0.004)) | 1
+    blend_mask = cv2.GaussianBlur(blemish_mask, (feather, feather), 0)
+    fill = min(1.0, 0.6 + intensity * 0.4)
+    alpha = (blend_mask.astype(np.float32) / 255.0 * fill)[:, :, np.newaxis]
 
     result_bgr = arr_bgr.astype(np.float32) * (1.0 - alpha) + inpainted.astype(np.float32) * alpha
     result_bgr = np.clip(result_bgr, 0, 255).astype(np.uint8)
@@ -1381,7 +1545,7 @@ def apply_regional_transforms(
         "highlights": adjust_highlights,
         "shadows": adjust_shadows,
         "blemish_removal": lambda img_, val: apply_blemish_removal(img_, val, cache=cache),
-        "skin_smoothing": apply_skin_smoothing,
+        "skin_smoothing": lambda img_, val: apply_skin_smoothing(img_, val, cache=cache),
         "sharpness": apply_sharpness,
     }
 
@@ -1613,7 +1777,7 @@ def apply_face_reshape(
 
         # ── face_slim: 볼 양쪽을 중심 방향으로 ──
         if face_slim >= 0.01:
-            strength = face_slim * 0.08  # 최대 8% 이동
+            strength = face_slim * 0.14  # 최대 14% 이동
             for idx in _FACE_CONTOUR_LEFT:
                 px, py = _pt(idx)
                 dx = (cx - px) * strength
@@ -1629,8 +1793,8 @@ def apply_face_reshape(
 
         # ── jaw_sharpen: 턱선을 V자로 ──
         if jaw_sharpen >= 0.01:
-            strength_x = jaw_sharpen * 0.06
-            strength_y = jaw_sharpen * 0.03
+            strength_x = jaw_sharpen * 0.10
+            strength_y = jaw_sharpen * 0.05
             jaw_tip_x, jaw_tip_y = _pt(152)
             for idx in _JAW_LEFT:
                 px, py = _pt(idx)
@@ -1647,7 +1811,7 @@ def apply_face_reshape(
 
         # ── eye_enlarge: 눈 윤곽 방사형 확대 ──
         if eye_enlarge >= 0.01:
-            strength = eye_enlarge * 0.12  # 최대 12% 확대
+            strength = eye_enlarge * 0.18  # 최대 18% 확대
             # 왼쪽 눈
             if len(face_lms) > _LEFT_EYE_CENTER:
                 ecx, ecy = _pt(_LEFT_EYE_CENTER)
@@ -1784,7 +1948,7 @@ def apply_body_reshape(
             hip_y = (lhip[1] + rhip[1]) / 2.0
 
             # 힙 아래 영역을 수직 스케일링 (단순 remap)
-            stretch_factor = 1.0 + leg_stretch * 0.15  # 최대 15% 늘리기
+            stretch_factor = 1.0 + leg_stretch * 0.25  # 최대 25% 늘리기
 
             # remap: hip_y 위는 그대로, 아래는 스트레칭
             map_y = np.zeros((h, w), dtype=np.float32)
@@ -1821,7 +1985,7 @@ def apply_body_reshape(
         rs = _pt(12)
         mid_x = (ls[0] + rs[0]) / 2.0
         mid_y = (ls[1] + rs[1]) / 2.0
-        strength = shoulder_width * 0.06  # 최대 6%
+        strength = shoulder_width * 0.10  # 최대 10%
 
         # 어깨 위 1/3 지점과 어깨 사이 보간점 추가 → 자연스러운 워프
         neck_y = mid_y - abs(rs[0] - ls[0]) * 0.25  # 어깨 위 목 부근
@@ -1873,7 +2037,7 @@ def apply_body_reshape(
         waist_left_x = min(ls[0], lhip[0])
         waist_right_x = max(rs[0], rhip[0])
 
-        strength = waist_slim * 0.06  # 최대 6%
+        strength = waist_slim * 0.11  # 최대 11%
 
         # 허리 위/아래 보간점 + 고정 앵커 추가 → 자연스러운 수직 그라데이션
         above_y = (ls[1] + waist_y) / 2.0   # 어깨-허리 중간
@@ -2118,6 +2282,8 @@ def apply_all_transforms(
     leg_stretch: float = 0.0,
     shoulder_width: float = 0.0,
     waist_slim: float = 0.0,
+    auto_wb: float = 0.0,
+    denoise: float = 0.0,
     preview: bool = False,
     cache: MediaPipeCache | None = None,
 ) -> Image.Image:
@@ -2142,6 +2308,14 @@ def apply_all_transforms(
     cache가 제공되면 MediaPipe 모델/결과를 재사용한다.
     제공되지 않으면 내부에서 자동 생성하여 요청 내 중복 호출을 제거한다.
     """
+    # ── 촬영 결함 교정: 색 보정보다 먼저 ──
+    # 화이트밸런스를 먼저 잡아야 프로필의 색온도가 "중립 위에 얹는 취향"이 되고,
+    # 노이즈를 먼저 지워야 뒤따르는 쉐도우 리프팅이 그것을 증폭시키지 않는다.
+    if auto_wb >= 0.01:
+        img = apply_auto_white_balance(img, auto_wb)
+    if denoise >= 0.01:
+        img = apply_denoise(img, denoise)
+
     # MediaPipe가 필요한 변형이 있는지 판단
     # reshape은 preview 모드에서도 적용하므로 preview 조건 제거
     # blemish_removal만 preview 시 스킵 (비용이 높으므로)
@@ -2153,6 +2327,9 @@ def apply_all_transforms(
         or abs(shoulder_width) >= 0.01
         or waist_slim >= 0.01
         or (not preview and blemish_removal >= 0.01)
+        # 스무딩도 피부 마스크가 필요하다. preview에서도 켜 두어야
+        # 미리보기와 최종 결과가 갈리지 않는다 (얼굴 감지는 캐시로 1회).
+        or skin_smoothing >= 0.01
     )
 
     if needs_mp and cache is None:
@@ -2262,7 +2439,7 @@ def _apply_all_transforms_impl(
         # 잡티 제거는 MediaPipe 재호출이 필요하므로 미리보기에서 스킵
         result = apply_blemish_removal(result, blemish_removal, cache=cache)
 
-    result = apply_skin_smoothing(result, skin_smoothing)
+    result = apply_skin_smoothing(result, skin_smoothing, cache=cache)
     result = apply_vignette(result, vignette)
     result = apply_sharpness(result, sharpness)
     result = apply_grain(result, grain)
@@ -2292,6 +2469,8 @@ def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
         "vignette": 0.0,
         "sharpness": 0.0,
         "grain": 0.0,
+        "auto_wb": 0.0,
+        "denoise": 0.0,
     }
 
     _split_defaults = {
@@ -2318,7 +2497,7 @@ def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
         except (TypeError, ValueError):
             val = default
         # 범위 클램핑
-        if key in ("blemish_removal", "skin_smoothing"):
+        if key in ("blemish_removal", "skin_smoothing", "auto_wb", "denoise"):
             val = max(0.0, min(1.0, val))
         else:
             val = max(-1.0, min(1.0, val))
