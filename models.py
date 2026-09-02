@@ -139,6 +139,9 @@ class ApplyTransformRequest(BaseModel):
     background_blur: float = Field(0.0, ge=0.0, le=1.0, description="배경 흐림 강도")
     tone_curve_preset: str = Field("linear", description="톤 커브 프리셋 (linear|s_curve|film|fade|high_contrast|bright)")
     tone_curve_strength: float = Field(0.0, ge=0.0, le=1.0, description="톤 커브 강도")
+    # 레퍼런스 사진에서 뽑은 곡선. 프리셋 이름으로는 표현되지 않으므로
+    # 저장 시에도 함께 보내야 미리보기와 같은 결과가 나온다.
+    tone_curve_points: list | None = Field(None, description="톤 커브 제어점 [[x, y], ...]")
     split_shadow_hue: float = Field(0.0, ge=0.0, le=360.0, description="스플릿 토닝 쉐도우 색상 (0~360)")
     split_shadow_strength: float = Field(0.0, ge=0.0, le=1.0, description="스플릿 토닝 쉐도우 강도")
     split_highlight_hue: float = Field(0.0, ge=0.0, le=360.0, description="스플릿 토닝 하이라이트 색상 (0~360)")

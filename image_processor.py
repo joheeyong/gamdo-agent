@@ -2338,6 +2338,7 @@ def _apply_lab_adjustments(
     shadows: float = 0.0,
     tone_curve_preset: str = "linear",
     tone_curve_strength: float = 0.0,
+    tone_curve_points: list | None = None,
     brightness: float = 0.0,
     contrast: float = 0.0,
     clarity: float = 0.0,
@@ -2364,8 +2365,10 @@ def _apply_lab_adjustments(
     """
     # 모든 조정이 불필요하면 즉시 반환
     if (abs(highlights) < 0.01 and abs(shadows) < 0.01
-            and (tone_curve_strength < 0.01 or tone_curve_preset == "linear"
-                 or tone_curve_preset not in TONE_CURVE_PRESETS)
+            and (tone_curve_strength < 0.01
+                 or (tone_curve_points is None
+                     and (tone_curve_preset == "linear"
+                          or tone_curve_preset not in TONE_CURVE_PRESETS)))
             and abs(brightness) < 0.01 and abs(contrast) < 0.01
             and abs(clarity) < 0.01 and abs(dehaze) < 0.01
             and abs(temperature) < 0.01 and abs(saturation) < 0.01):
@@ -2422,8 +2425,10 @@ def _apply_lab_adjustments(
 
     # ── 3. Tone Curve (L 채널 LUT) ──
     if tone_curve_strength >= 0.01:
-        tc_points = TONE_CURVE_PRESETS.get(tone_curve_preset)
-        if tc_points is not None and tone_curve_preset != "linear":
+        # 명시적 제어점이 오면 프리셋보다 우선한다 — 레퍼런스 사진에서
+        # 뽑아낸 곡선을 그대로 태우기 위한 통로다.
+        tc_points = tone_curve_points or TONE_CURVE_PRESETS.get(tone_curve_preset)
+        if tc_points is not None and (tone_curve_points or tone_curve_preset != "linear"):
             x_pts = np.array([p[0] for p in tc_points], dtype=np.float64)
             y_pts = np.array([p[1] for p in tc_points], dtype=np.float64)
             x_256 = np.linspace(0.0, 1.0, 256)
@@ -2520,6 +2525,7 @@ def apply_all_transforms(
     auto_wb: float = 0.0,
     denoise: float = 0.0,
     background_blur: float = 0.0,
+    tone_curve_points: list | None = None,
     preview: bool = False,
     cache: MediaPipeCache | None = None,
 ) -> Image.Image:
@@ -2581,7 +2587,7 @@ def apply_all_transforms(
                 split_shadow_hue, split_shadow_strength, split_highlight_hue,
                 split_highlight_strength, hsl_adjust, face_slim, jaw_sharpen,
                 eye_enlarge, leg_stretch, shoulder_width, waist_slim, preview,
-                auto_cache,
+                auto_cache, tone_curve_points=tone_curve_points,
             )
             # 배경 흐림은 색 보정이 끝난 뒤 — 그래야 선명도 보정이
             # 흐려 둔 배경을 다시 살려내지 않는다.
@@ -2596,7 +2602,7 @@ def apply_all_transforms(
             split_shadow_hue, split_shadow_strength, split_highlight_hue,
             split_highlight_strength, hsl_adjust, face_slim, jaw_sharpen,
             eye_enlarge, leg_stretch, shoulder_width, waist_slim, preview,
-            cache,
+            cache, tone_curve_points=tone_curve_points,
         )
         if background_blur >= 0.01:
             result = apply_background_blur(result, background_blur, cache)
@@ -2633,6 +2639,7 @@ def _apply_all_transforms_impl(
     waist_slim: float,
     preview: bool,
     cache: MediaPipeCache | None,
+    tone_curve_points: list | None = None,
 ) -> Image.Image:
     """apply_all_transforms의 내부 구현. cache를 전달받아 MediaPipe 재사용.
 
@@ -2664,6 +2671,7 @@ def _apply_all_transforms_impl(
         shadows=shadows,
         tone_curve_preset=tone_curve_preset,
         tone_curve_strength=tone_curve_strength,
+        tone_curve_points=tone_curve_points,
         brightness=brightness,
         contrast=contrast,
         clarity=clarity,
@@ -2733,6 +2741,7 @@ def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
         return {
             **default_params,
             "tone_curve_preset": "linear", "tone_curve_strength": 0.0,
+            "tone_curve_points": None,
             **_split_defaults,
             "hsl_adjust": None,
         }
@@ -2764,9 +2773,19 @@ def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
         except (TypeError, ValueError):
             strength = 0.0
         params["tone_curve_strength"] = round(max(0.0, min(1.0, strength)), 3)
+        raw_points = tone_curve.get("points")
+        if isinstance(raw_points, list) and len(raw_points) >= 2:
+            try:
+                pts = [(float(x), float(y)) for x, y in raw_points]
+                params["tone_curve_points"] = sorted(pts)
+            except (TypeError, ValueError):
+                params["tone_curve_points"] = None
+        else:
+            params["tone_curve_points"] = None
     else:
         params["tone_curve_preset"] = "linear"
         params["tone_curve_strength"] = 0.0
+        params["tone_curve_points"] = None
 
     # 스플릿 토닝 파싱
     split_toning = recommended.get("splitToning", {})

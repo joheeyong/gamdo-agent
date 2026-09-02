@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import cv2
@@ -273,9 +274,10 @@ def build_recommended_params(
     img: Image.Image,
     style_profile: dict[str, Any] | None,
     analysis: dict[str, Any] | None = None,
+    reference: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """[build_params_with_comment]에서 파라미터만 꺼내는 단축 함수."""
-    params, _ = build_params_with_comment(img, style_profile, analysis)
+    params, _ = build_params_with_comment(img, style_profile, analysis, reference)
     return params
 
 
@@ -283,6 +285,7 @@ def build_params_with_comment(
     img: Image.Image,
     style_profile: dict[str, Any] | None,
     analysis: dict[str, Any] | None = None,
+    reference: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """측정값 + 프로필 + 모델의 스타일 방향으로 recommendedParams와 설명을 만든다.
 
@@ -312,10 +315,20 @@ def build_params_with_comment(
     auto_wb_strength = round(0.65 * stats["cast_uniformity"], 3)
 
     # ── 측정값 ↔ 목표값 차이로 노출계 3형제를 정한다 ──
-    target_brightness = _BRIGHTNESS_TARGETS[_level_index(color_pref.get("brightnessTendency"))]
-    target_contrast = _CONTRAST_TARGETS[_level_index(color_pref.get("contrast"))]
-    target_saturation = _SATURATION_TARGETS[_level_index(color_pref.get("saturationTendency"))]
-    target_warmth = _TONE_TARGETS.get(color_pref.get("preferredTones") or "neutral", 0.0)
+    if reference:
+        # 사용자가 실제로 올리는 사진에서 잰 값. 카테고리 추정보다 정확하다.
+        target_brightness = reference["brightness"]
+        target_contrast = reference["contrast"]
+        target_saturation = reference["saturation"]
+        target_warmth = reference["warmth"]
+    else:
+        target_brightness = _BRIGHTNESS_TARGETS[_level_index(color_pref.get("brightnessTendency"))]
+        target_contrast = _CONTRAST_TARGETS[_level_index(color_pref.get("contrast"))]
+        target_saturation = _SATURATION_TARGETS[_level_index(color_pref.get("saturationTendency"))]
+        target_warmth = _TONE_TARGETS.get(color_pref.get("preferredTones") or "neutral", 0.0)
+
+    # ── 장면에 따라 기준을 바꾼다 ──
+    scene = detect_scene(stats, img)
 
     # 차이를 슬라이더 범위로 옮기는 배율. 측정 스케일과 슬라이더 스케일이 달라 실측으로 맞춘 값들이다.
     #
@@ -344,6 +357,15 @@ def build_params_with_comment(
     shadows = float(recipe.get("shadows", 0.0))
     highlights = float(recipe.get("highlights", 0.0))
 
+    if scene["backlit"]:
+        # 역광: 피사체가 실루엣으로 남는다. 쉐도우를 크게 들어올리고
+        # 날아간 배경을 눌러 준다.
+        shadows += 0.25
+        highlights -= 0.15
+    if scene["low_light"]:
+        # 저조도: 대비를 세우면 노이즈와 뭉갬이 같이 도드라진다
+        contrast *= 0.6
+
     # 날아간 하이라이트·뭉갠 쉐도우가 많으면 그만큼 더 되살린다
     if stats["highlight_clip"] > 0.02:
         highlights -= min(0.25, stats["highlight_clip"] * 4.0)
@@ -368,6 +390,8 @@ def build_params_with_comment(
     else:
         denoise_strength = min(1.0, (noise - 2.5) / 12.0)
         denoise_strength = min(1.0, denoise_strength + max(0.0, shadows) * 0.4)
+    if scene["low_light"]:
+        denoise_strength = min(1.0, denoise_strength + 0.2)
 
     # 안개 제거는 풍경에서 실제로 뿌옇게 측정될 때만
     dehaze = 0.0
@@ -401,6 +425,12 @@ def build_params_with_comment(
     if "tone_curve" in recipe and trend in _TREND_RECIPES:
         tone_preset, tone_strength = recipe["tone_curve"]
 
+    # 레퍼런스가 있으면 프리셋 대신 그 사람 사진의 밝기 분포를 따라간다.
+    # 프리셋은 "필름이면 이런 곡선"이라는 일반론이고, 이쪽은 그 사람의 실제 곡선이다.
+    tone_points = build_reference_tone_curve(img, reference, 0.45 * gain)
+    if tone_points:
+        tone_preset, tone_strength = "reference", 1.0
+
     split = recipe.get("split") or {}
     shadow_hue, shadow_str = split.get("shadow", (0, 0.0))
     hi_hue, hi_str = split.get("highlight", (0, 0.0))
@@ -428,7 +458,9 @@ def build_params_with_comment(
         "skin_smoothing": _clamp(skin_smoothing, 0.0, 1.0),
         "toneCurve": {
             "preset": tone_preset,
-            "strength": _clamp(float(tone_strength) * gain, 0.0, 1.0),
+            # 레퍼런스 곡선은 이미 strength만큼 섞어서 만들었으므로 그대로 태운다
+            "strength": 1.0 if tone_points else _clamp(float(tone_strength) * gain, 0.0, 1.0),
+            "points": tone_points,
         },
         "splitToning": {
             "shadow": {"hue": shadow_hue, "strength": _clamp(shadow_str * gain, 0.0, 1.0)},
@@ -674,3 +706,167 @@ def prefix_tilt_comment(comment: str, tilt: float | None) -> str:
     if tilt is None or abs(tilt) < _MIN_TILT:
         return comment
     return f"{abs(tilt):.1f}° 기울어 있어 수평을 맞추고, {comment}"
+
+
+# ── 레퍼런스 사진 기반 목표 ──
+#
+# 스타일 프로필의 5단계 카테고리("보통", "높음")는 두 번의 추측 위에 서 있다.
+# 모델이 피드를 눈으로 보고 고른 등급이고, 그 등급이 가리키는 수치는 검증된 적
+# 없는 상수다. 사용자의 대표 사진은 서버에 이미 저장돼 있으니 그냥 재면 된다.
+
+_LUMA_PERCENTILES = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+
+# (경로, mtime) → 통계. 요청마다 다시 읽지 않기 위한 캐시.
+_ref_cache: dict[tuple, dict[str, Any]] = {}
+
+
+def _luma_percentiles(img: Image.Image) -> list[float]:
+    """밝기 분포의 대표 지점들 (0~1). 톤 커브 매칭의 기준이 된다."""
+    small = img.convert("RGB")
+    w, h = small.size
+    if max(w, h) > 384:
+        r = 384 / max(w, h)
+        small = small.resize((max(1, int(w * r)), max(1, int(h * r))), Image.BILINEAR)
+    a = np.asarray(small, dtype=np.float32)
+    luma = 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
+    return [float(v) / 255.0 for v in np.percentile(luma, _LUMA_PERCENTILES)]
+
+
+def measure_reference_target(ref_paths: list[str]) -> dict[str, Any] | None:
+    """대표 사진들을 재서 '이 사용자가 실제로 올리는 사진'의 수치를 낸다.
+
+    반환: brightness / contrast / saturation / warmth 평균 + 밝기 분포 백분위.
+    읽을 수 있는 사진이 없으면 None (호출 쪽에서 카테고리 방식으로 폴백).
+    """
+    if not ref_paths:
+        return None
+
+    try:
+        key = tuple(sorted((p, os.path.getmtime(p)) for p in ref_paths))
+    except OSError:
+        key = tuple(sorted(ref_paths))
+    if key in _ref_cache:
+        return _ref_cache[key]
+
+    stats_list: list[dict[str, float]] = []
+    pct_list: list[list[float]] = []
+    for path in ref_paths[:5]:
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as exc:
+            log.warning("reference photo unreadable %s: %s", path, exc)
+            continue
+        stats_list.append(measure_image_stats(img))
+        pct_list.append(_luma_percentiles(img))
+
+    if not stats_list:
+        return None
+
+    target = {
+        key_: float(np.mean([s[key_] for s in stats_list]))
+        for key_ in ("brightness", "contrast", "saturation", "warmth")
+    }
+    target["luma_percentiles"] = [float(v) for v in np.mean(pct_list, axis=0)]
+    target["count"] = len(stats_list)
+
+    log.info(
+        "reference target from %d photos: b=%.3f c=%.3f s=%.3f w=%+.3f",
+        target["count"], target["brightness"], target["contrast"],
+        target["saturation"], target["warmth"],
+    )
+    _ref_cache[key] = target
+    return target
+
+
+def feed_compatibility(stats: dict[str, float], reference: dict[str, Any] | None) -> int | None:
+    """이 사진이 사용자 피드와 얼마나 어울리는지 0~100. 레퍼런스가 없으면 None.
+
+    예전에는 모델이 눈대중으로 매기던 점수인데, 이제 실제 거리로 계산한다.
+    """
+    if not reference:
+        return None
+
+    # 각 축의 "완전히 다르다"고 볼 만한 차이로 정규화한다
+    scale = {"brightness": 0.20, "contrast": 0.30, "saturation": 0.20, "warmth": 0.35}
+    diffs = [
+        abs(stats[k] - reference[k]) / scale[k]
+        for k in ("brightness", "contrast", "saturation", "warmth")
+    ]
+    distance = float(np.sqrt(np.mean(np.square(diffs))))
+    return int(round(100 * max(0.0, 1.0 - min(1.0, distance))))
+
+
+def build_reference_tone_curve(
+    img: Image.Image,
+    reference: dict[str, Any] | None,
+    strength: float,
+) -> list[tuple[float, float]] | None:
+    """사진의 밝기 분포를 레퍼런스 분포 쪽으로 옮기는 톤 커브 제어점.
+
+    평균값 네 개로는 "필름 룩"처럼 곡선 형태로 정의되는 취향을 담을 수 없다.
+    같은 평균 밝기라도 쉐도우가 들려 있는지 아닌지가 인상을 가른다.
+    백분위끼리 대응시켜 곡선을 만들고, strength만큼만 섞는다 —
+    100% 적용하면 사진의 원래 명암 구조가 통째로 사라진다.
+    """
+    if not reference or strength < 0.01:
+        return None
+    ref_pct = reference.get("luma_percentiles")
+    if not ref_pct:
+        return None
+
+    src_pct = _luma_percentiles(img)
+    xs = [0.0] + src_pct + [1.0]
+    ys = [0.0] + list(ref_pct) + [1.0]
+
+    # strength만큼만 이동 + 단조 증가 보장 (톤 반전 방지)
+    points: list[tuple[float, float]] = []
+    prev_y = -1.0
+    for x, y in zip(xs, ys):
+        blended = x * (1.0 - strength) + y * strength
+        blended = max(prev_y + 1e-4, min(1.0, blended))
+        prev_y = blended
+        points.append((round(float(x), 4), round(float(blended), 4)))
+
+    # x가 겹치는 점 제거 (보간이 깨진다)
+    deduped: list[tuple[float, float]] = []
+    for x, y in points:
+        if not deduped or x > deduped[-1][0] + 1e-4:
+            deduped.append((x, y))
+    return deduped if len(deduped) >= 3 else None
+
+
+# ── 장면 판단 ──
+
+
+def detect_scene(stats: dict[str, float], img: Image.Image) -> dict[str, bool]:
+    """보정 기준을 바꿔야 하는 촬영 상황을 가려낸다.
+
+    - backlit: 역광. 배경만 밝고 피사체가 어둡다 → 쉐도우를 크게 올려야 한다
+    - low_light: 저조도/야간 → 노이즈를 더 잡고 대비를 과하게 올리지 않는다
+    """
+    small = img.convert("L")
+    w, h = small.size
+    if max(w, h) > 320:
+        r = 320 / max(w, h)
+        small = small.resize((max(1, int(w * r)), max(1, int(h * r))), Image.BILINEAR)
+    luma = np.asarray(small, dtype=np.float32) / 255.0
+
+    # 가운데 절반(피사체가 있을 자리)과 바깥 테두리의 밝기 차
+    gh, gw = luma.shape
+    center = luma[gh // 4: gh * 3 // 4, gw // 4: gw * 3 // 4]
+    border = np.concatenate([
+        luma[: gh // 8].ravel(), luma[gh * 7 // 8:].ravel(),
+        luma[:, : gw // 8].ravel(), luma[:, gw * 7 // 8:].ravel(),
+    ])
+    backlit = bool(
+        center.mean() < border.mean() - 0.14
+        and border.mean() > 0.55
+        and center.mean() < 0.45
+    )
+
+    low_light = bool(stats["brightness"] < 0.32 and stats["noise"] > 3.0)
+
+    if backlit or low_light:
+        log.info("scene: backlit=%s low_light=%s (center=%.2f border=%.2f)",
+                 backlit, low_light, center.mean(), border.mean())
+    return {"backlit": backlit, "low_light": low_light}

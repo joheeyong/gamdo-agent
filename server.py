@@ -35,7 +35,10 @@ from claude_client import analyze_user, get_reference_image_paths, transform_pho
 from param_engine import (
     build_params_with_comment,
     detect_tilt_angle,
+    feed_compatibility,
     measure_color_analysis,
+    measure_image_stats,
+    measure_reference_target,
     prefix_tilt_comment,
 )
 from image_processor import (
@@ -176,10 +179,17 @@ def api_analyze_and_transform(
             analysis["colorAnalysis"] = color_analysis
         color_analysis.update(measure_color_analysis(img))
 
-        # 4. 보정 파라미터: 히스토그램 측정 + 스타일 프로필 규칙으로 산출.
-        #    왜 그 값이 나왔는지 설명도 함께 만든다 (모델 호출 없음).
+        # 4. 목표값은 사용자의 대표 사진에서 직접 잰다. 스타일 프로필의
+        #    5단계 카테고리는 모델의 눈대중 위에 상수를 얹은 구조라,
+        #    실제로 그 사람이 올리는 사진과 어긋날 수 있다.
+        reference = measure_reference_target(
+            get_reference_image_paths(req.user_id) if req.user_id else []
+        )
+
+        # 보정 파라미터: 히스토그램 측정 + 목표값으로 산출.
+        # 왜 그 값이 나왔는지 설명도 함께 만든다 (모델 호출 없음).
         analysis["recommendedParams"], params_comment = build_params_with_comment(
-            img, req.style_profile, analysis
+            img, req.style_profile, analysis, reference=reference
         )
         params = analysis_to_transform_params(analysis)
         log.info("analyze-and-transform: params=%s", params)
@@ -240,6 +250,14 @@ def api_analyze_and_transform(
             # 8. 슬라이더 변형 적용
             transformed = apply_all_transforms(img, cache=mp_cache, **params)
         result_b64 = encode_image_base64(transformed)
+
+        # 피드 적합도: 모델의 추측이 아니라 대표 사진과의 실제 거리
+        if reference:
+            before = feed_compatibility(measure_image_stats(img), reference)
+            after = feed_compatibility(measure_image_stats(transformed), reference)
+            analysis["feedCompatibility"] = after
+            analysis["feedCompatibilityBefore"] = before
+            log.info("analyze-and-transform: feed compatibility %s → %s", before, after)
 
         log.info("analyze-and-transform: success")
         return AnalyzeAndTransformResponse(
@@ -334,6 +352,7 @@ def api_apply_transform(
             "background_blur": req.background_blur,
             "tone_curve_preset": req.tone_curve_preset,
             "tone_curve_strength": req.tone_curve_strength,
+            "tone_curve_points": req.tone_curve_points,
             "split_shadow_hue": req.split_shadow_hue,
             "split_shadow_strength": req.split_shadow_strength,
             "split_highlight_hue": req.split_highlight_hue,
