@@ -47,12 +47,11 @@ ANALYZE_USER_PROMPT = """\
     "trendCategory": "warm_film | korean_gamsung | cinematic_moody | bright_airy | golden_hour | clean_minimal | custom",
     "secondaryStyles": ["보조 스타일1", "보조 스타일2"],
     "colorPreference": {{
-      "preferredTones": "warm | cool | neutral | mixed",
+      "preferredTones": "cool | slightly_cool | neutral | slightly_warm | warm | mixed",
       "dominantColors": ["#HEX1", "#HEX2", "#HEX3"],
-      "saturationTendency": "high | medium | low",
-      "brightnessTendency": "high | medium | low",
-      "contrast": "high | medium | low",
-      "colorTemperature": "warm | cool | neutral"
+      "saturationTendency": "very_low | low | medium | high | very_high",
+      "brightnessTendency": "very_low | low | medium | high | very_high",
+      "contrast": "very_low | low | medium | high | very_high"
     }},
     "compositionPreference": {{
       "preferredTechniques": ["삼분법", "중앙배치"],
@@ -61,8 +60,10 @@ ANALYZE_USER_PROMPT = """\
     }},
     "moodKeywords": ["키워드1", "키워드2", "키워드3"],
     "editingStyle": {{
-      "filterTendency": "heavy | moderate | minimal | none",
-      "contrastLevel": "high | medium | low",
+      "filterTendency": "none | minimal | moderate | strong | very_strong",
+      "grainPreference": "none | subtle | moderate | heavy | film",
+      "vignettePreference": "none | subtle | moderate | strong",
+      "skinRetouchLevel": "none | light | moderate | heavy",
       "description": "한국어로 이 사용자의 보정 성향 설명 (2-3문장)"
     }},
     "feedCohesion": {{
@@ -70,17 +71,6 @@ ANALYZE_USER_PROMPT = """\
       "toneConsistency": "high | medium | low",
       "coreColors": ["#HEX1", "#HEX2", "#HEX3"],
       "cohesionTip": "피드 일관성을 높이기 위한 한국어 조언 한 문장"
-    }},
-    "targetParams": {{
-      "brightness": -1.0~1.0,
-      "contrast": -1.0~1.0,
-      "highlights": -1.0~1.0,
-      "shadows": -1.0~1.0,
-      "saturation": -1.0~1.0,
-      "temperature": -1.0~1.0,
-      "sharpness": -1.0~1.0,
-      "grain": 0.0~1.0,
-      "vignette": -1.0~1.0
     }}
   }},
   "summary": "한국어로 이 사용자의 전체적인 사진 스타일을 설명하는 요약 (3-5문장)",
@@ -117,29 +107,6 @@ trendCategory 설명:
 feedCohesion 설명:
 사용자의 피드 일관성을 분석하세요. 일관된 색감 전략은 저장률 34%, 공유 27% 증가 효과가 있습니다.
 - coreColors: 피드에서 반복 등장하는 핵심 색상 3개 (60/30/10 비율 참고)
-
-targetParams 설명:
-사용자의 사진들이 공통적으로 가지는 보정 특성을 수치로 표현하세요.
-이 값은 새 사진을 변형할 때 "이 사용자의 피드 느낌에 맞추려면 이 정도 보정이 필요하다"는 기준값입니다.
-
-트렌드별 기준값 참고 (정규화 -1.0~1.0):
-- warm_film: brightness +0.1, contrast -0.1, highlights -0.2, shadows +0.25, saturation -0.15, temperature +0.2, grain 0.2
-- korean_gamsung: brightness +0.15, contrast -0.2, highlights -0.3, shadows +0.35, saturation -0.1, temperature +0.05, grain 0.0
-- cinematic_moody: brightness +0.1, contrast +0.15, highlights -0.1, shadows +0.15, saturation -0.05, temperature +0.25, vignette -0.2, grain 0.25
-- bright_airy: brightness +0.35, contrast -0.15, highlights +0.3, shadows +0.4, saturation -0.08, temperature +0.1, grain 0.0
-- golden_hour: brightness +0.15, contrast +0.05, shadows +0.15, saturation +0.05, temperature +0.35, grain 0.0, vignette 0.1
-- clean_minimal: 모든 값 0에 가까움, 미세 조정만
-
-각 파라미터:
-- brightness: 사진들이 전반적으로 밝으면 +, 어두우면 - (예: 밝은 감성 피드 → +0.2)
-- contrast: 대비가 강하면 +, 부드러우면 - (예: 드라마틱 피드 → +0.3, 감성 피드 → -0.2)
-- highlights: 하이라이트가 살아있으면 +, 억제되면 - (예: 필름 느낌 → -0.2)
-- shadows: 쉐도우가 밝으면 +, 깊으면 - (예: 감성/필름 → +0.3, 무디 → -0.1)
-- saturation: 채도가 높으면 +, 낮으면 - (예: 파스텔/감성 → -0.1~-0.2, 비비드 → +0.2)
-- temperature: 따뜻하면 +, 차가우면 - (예: 웜톤 피드 → +0.2~0.3)
-- sharpness: 선명하면 +, 부드러우면 - (예: 소프트 필름 느낌 → -0.1)
-- grain: 필름 느낌이면 0.15~0.25, 클린하면 0.0
-- vignette: 가장자리 어둡게 양수, 밝게 음수 (예: 시네마틱 → -0.2, 감성 → 0.1)
 
 engagementTips 설명:
 인스타그램 알고리즘과 사용자 행동 기반으로 구체적인 인기도 향상 팁을 제공하세요:
@@ -190,44 +157,17 @@ TRANSFORM_PHOTO_PROMPT = """\
 {style_profile}
 
 === 스타일 반영 규칙 ===
-위 프로필을 반드시 다음과 같이 반영하세요:
+위 프로필은 이 사용자가 어떤 사진을 올리는 사람인지를 말해 줍니다.
+보정 수치(밝기·대비·채도·색온도·톤커브·그레인 등)는 서버가 대표 사진을 측정해
+직접 계산하므로, 당신은 수치를 추천하지 마세요.
 
-1. targetParams가 있으면 (최우선): 이것이 사용자 피드의 기준 보정값입니다.
-   (참고: targetParams는 사용자의 과거 슬라이더 조정 피드백을 학습하여 자동 업데이트됩니다.)
-   - 현재 사진의 상태를 분석한 뒤, targetParams 방향으로 보정하세요.
-   - 예: targetParams.temperature가 +0.3(웜톤 피드)인데 현재 사진이 쿨톤이면 → temperature를 +0.4~0.5로 강하게 보정
-   - 예: targetParams.saturation이 -0.2(저채도 피드)인데 현재 사진이 채도 높으면 → saturation을 -0.3으로 보정
-   - targetParams와 현재 사진의 차이가 클수록 보정값도 커야 합니다.
-
-2. trendCategory가 있으면 해당 트렌드의 보정 패턴을 적극 반영:
-   - warm_film: shadows +, highlights -, saturation -, temperature +, grain +
-   - korean_gamsung: contrast -, shadows ++, highlights --, saturation -, grain 0
-   - cinematic_moody: contrast +, temperature +, vignette -, grain +
-   - bright_airy: brightness ++, shadows ++, contrast -, saturation -
-   - golden_hour: temperature ++, saturation +약간, vignette +약간
-   - clean_minimal: 최소 보정, 자연스러움 유지
-
-3. targetParams가 없으면 범주형 값으로 판단 (5단계 → 수치 매핑):
-   - preferredTones: "warm" → temperature +0.15~0.3, "slightly_warm" → +0.05~0.15, "neutral" → 0, "slightly_cool" → -0.05~-0.15, "cool" → -0.15~-0.3
-   - saturationTendency: "very_low" → saturation -0.2~-0.3, "low" → -0.1~-0.15, "medium" → 0, "high" → +0.1~0.15, "very_high" → +0.2~0.3
-   - brightnessTendency: "very_low" → brightness -0.2~-0.3, "low" → -0.1~-0.15, "medium" → 0, "high" → +0.1~0.2, "very_high" → +0.25~0.4
-   - contrast: "very_low" → contrast -0.2~-0.3, "low" → -0.1~-0.15, "medium" → 0, "high" → +0.1~0.15, "very_high" → +0.2~0.3
-   - filterTendency: "auto" → AI가 사진 상태를 보고 보정 강도를 자유롭게 판단(노출 문제가 크면 강하게, 이미 좋으면 최소화), "none" → 모든 보정값 최소(±0.05 이내), "minimal" → 약하게(±0.1 이내), "moderate" → 보통, "strong" → 전체적으로 강하게(1.3배), "very_strong" → 매우 강하게(1.6배)
-   - grainPreference: "auto" → AI가 스타일/트렌드에 맞게 판단(필름/빈티지면 grain 추가, 클린/미니멀이면 0), "none" → grain 0, "subtle" → 0.05~0.1, "moderate" → 0.15~0.25, "heavy" → 0.3~0.45, "film" → 0.4~0.6
-   - vignettePreference: "auto" → AI가 사진 구도와 피사체를 보고 자유롭게 판단(인물 중앙배치면 0.1~0.2, 넓은 풍경이면 0, 시네마틱이면 0.2~0.3 등), "none" → vignette 0, "subtle" → 0.05~0.1, "moderate" → 0.15~0.25, "strong" → 0.3~0.4
-   - skinRetouchLevel: "auto" → AI가 인물 사진이면 피부 상태를 보고 적절히 적용(클로즈업이면 강하게, 전신이면 약하게, 비인물이면 0), "none" → blemish_removal 0, skin_smoothing 0, "light" → 0.15~0.25, 0.1~0.2, "moderate" → 0.3~0.4, 0.2~0.3, "heavy" → 0.5~0.7, 0.4~0.5
-
-4. moodKeywords와 primaryStyle을 고려하여 전체 분위기를 맞추세요.
-
-5. 프로필이 비어있으면({{}}) 다음 기본 인스타 감성을 적용하세요:
-   - brightness +0.1, highlights -0.2, shadows +0.2, saturation -0.1, temperature +0.1
-   - 인물이면 blemish_removal 0.3, skin_smoothing 0.2 추가
-   - 이것은 2025-2026 인스타그램에서 가장 보편적으로 호감을 주는 보정입니다.
-
-6. 피드 일관성 원칙:
-   - feedCohesion.coreColors가 있으면, 변형 결과가 이 핵심 색상들과 조화를 이루도록 하세요.
-   - 사용자의 피드에 이 사진을 올렸을 때 기존 게시물들과 톤이 일관되어야 합니다.
-   - 일관된 색감 = 저장률 34%↑, 공유 27%↑
+프로필은 아래 판단에만 쓰세요:
+- subjectType: 어떤 레시피를 고를지 결정하는 값이라 정확해야 합니다.
+- autoEdits / regionParams: 눈으로 봐야 아는 판단입니다.
+- toneReport·팁·구도 분석: 이 사용자의 스타일(primaryStyle, trendCategory,
+  moodKeywords)에 비추어 설명하세요.
+- feedCohesion.coreColors가 있으면, 이 사진이 그 색들과 어울리는지를
+  toneReport와 팁에 반영하세요.
 
 === autoEdits (AI 자동 편집) 가이드 ===
 사진을 관찰하여 다음 자동 편집을 판단하세요.

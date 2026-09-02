@@ -129,6 +129,79 @@ def _apply_analysis_fallbacks(parsed: dict, problems: list[str]) -> None:
             parsed[key] = fallback
 
 
+# 스타일 프로필은 한 번 저장되면 이후 모든 보정을 좌우한다.
+# 잘못된 값이 들어가도 param_engine이 조용히 기본값으로 폴백해서
+# "왜 보정이 밋밋하지"의 원인을 추적하기 어렵다. 저장 전에 잡는다.
+_PROFILE_ENUMS: dict[str, tuple[str, ...]] = {
+    "colorPreference.preferredTones":
+        ("cool", "slightly_cool", "neutral", "slightly_warm", "warm", "mixed"),
+    "colorPreference.saturationTendency":
+        ("very_low", "low", "medium", "high", "very_high"),
+    "colorPreference.brightnessTendency":
+        ("very_low", "low", "medium", "high", "very_high"),
+    "colorPreference.contrast":
+        ("very_low", "low", "medium", "high", "very_high"),
+    "editingStyle.filterTendency":
+        ("none", "minimal", "moderate", "strong", "very_strong"),
+    "editingStyle.grainPreference":
+        ("none", "subtle", "moderate", "heavy", "film"),
+    "editingStyle.vignettePreference":
+        ("none", "subtle", "moderate", "strong"),
+    "editingStyle.skinRetouchLevel":
+        ("none", "light", "moderate", "heavy"),
+    "trendCategory": (
+        "warm_film", "korean_gamsung", "cinematic_moody",
+        "bright_airy", "golden_hour", "clean_minimal", "custom",
+    ),
+}
+
+# 값이 어긋났을 때 쓰는 중립값 — 방향을 지어내기보다 중간으로 둔다
+_PROFILE_DEFAULTS = {
+    "colorPreference.preferredTones": "neutral",
+    "colorPreference.saturationTendency": "medium",
+    "colorPreference.brightnessTendency": "medium",
+    "colorPreference.contrast": "medium",
+    "editingStyle.filterTendency": "moderate",
+    "editingStyle.grainPreference": "none",
+    "editingStyle.vignettePreference": "none",
+    "editingStyle.skinRetouchLevel": "none",
+    "trendCategory": "custom",
+}
+
+
+def _validate_style_profile(profile: dict) -> list[str]:
+    """열거형 값이 약속된 범위 안에 있는지 검사하고, 어긋난 경로를 돌려준다."""
+    problems: list[str] = []
+    for path, allowed in _PROFILE_ENUMS.items():
+        parent, _, leaf = path.rpartition(".")
+        node = profile.get(parent) if parent else profile
+        if parent and not isinstance(node, dict):
+            problems.append(f"{parent} (객체가 아님)")
+            continue
+        value = (node or {}).get(leaf)
+        if value is None:
+            problems.append(f"{path} (없음)")
+        elif value not in allowed:
+            problems.append(f"{path}={value!r}")
+    return problems
+
+
+def _repair_style_profile(profile: dict, problems: list[str]) -> None:
+    """어긋난 열거형만 중립값으로 되돌린다 (제자리 수정)."""
+    for problem in problems:
+        path = problem.split(" ")[0].split("=")[0]
+        default = _PROFILE_DEFAULTS.get(path)
+        if default is None:
+            continue
+        parent, _, leaf = path.rpartition(".")
+        if parent:
+            node = profile.setdefault(parent, {})
+            if isinstance(node, dict):
+                node[leaf] = default
+        else:
+            profile[leaf] = default
+
+
 def _format_items(items: list[dict]) -> str:
     """PostItem 목록을 텍스트로 변환."""
     if not items:
@@ -147,7 +220,13 @@ def _format_items(items: list[dict]) -> str:
 
 
 def _download_temp_image(url: str) -> str | None:
-    """이미지 URL을 다운로드하여 임시 파일로 저장한다. 실패 시 None."""
+    """이미지 URL을 받아 임시 파일로 저장한다. 이미지가 아니거나 실패하면 None.
+
+    실제로 열리는지까지 확인한다. Instagram의 VIDEO 게시물은 media_url이
+    .mp4라, 확인 없이 받으면 "다운로드 성공"으로 세어 분석 장수 한도를
+    까먹고는 나중에 조용히 버려진다. 게다가 그 빈자리 때문에 뒤따르는
+    사진들의 인덱스가 밀린다.
+    """
     try:
         import httpx
 
@@ -155,6 +234,10 @@ def _download_temp_image(url: str) -> str | None:
         resp.raise_for_status()
 
         content_type = resp.headers.get("content-type", "image/jpeg")
+        if not content_type.startswith("image/"):
+            log.warning("Not an image (%s): %s", content_type, url[:80])
+            return None
+
         ext = ".jpg"
         if "png" in content_type:
             ext = ".png"
@@ -164,6 +247,15 @@ def _download_temp_image(url: str) -> str | None:
         fd, path = tempfile.mkstemp(suffix=ext, dir=_TEMP_DIR)
         with os.fdopen(fd, "wb") as f:
             f.write(resp.content)
+
+        # 헤더를 믿지 않고 실제로 열어 본다
+        try:
+            with Image.open(path) as probe:
+                probe.verify()
+        except Exception as exc:
+            log.warning("Downloaded file is not a readable image (%s): %s", exc, url[:80])
+            os.unlink(path)
+            return None
 
         log.info("Downloaded image from %s → %s (%d bytes)", url[:80], path, len(resp.content))
         return path
@@ -342,10 +434,17 @@ def _cleanup_files(paths: list[str]) -> None:
             pass
 
 
-def _create_grid_image(image_paths: list[str], max_cols: int = 5) -> tuple[str, str]:
+def _create_grid_image(
+    image_paths: list[str], max_cols: int = 5
+) -> tuple[str, str, list[int]]:
     """여러 이미지를 하나의 그리드로 합성한다.
 
-    반환: (합성 이미지 경로, 레이아웃 설명)
+    반환: (합성 이미지 경로, 레이아웃 설명, 그리드 위치 → image_paths 인덱스)
+
+    세 번째 값이 중요하다. 열리지 않는 파일을 건너뛰면 그리드 위치와
+    원본 배열의 인덱스가 어긋나는데, 모델은 그리드 위치로 답한다.
+    이 매핑 없이 모델의 답을 원본 배열에 그대로 넣으면 다른 사진이
+    대표 사진으로 저장된다.
     """
     imgs: list[Image.Image] = []
     valid_indices: list[int] = []
@@ -396,7 +495,7 @@ def _create_grid_image(image_paths: list[str], max_cols: int = 5) -> tuple[str, 
         f"왼쪽 위부터 오른쪽으로 인덱스 0~{n-1} 순서."
     )
     log.info("Created grid image: %s (%dx%d, %d images)", path, canvas_w, canvas_h, n)
-    return path, layout_desc
+    return path, layout_desc, valid_indices
 
 
 def analyze_user(
@@ -442,16 +541,16 @@ def analyze_user(
             stories=_format_items(stories),
         )
 
+        grid_to_source: list[int] = []
         if downloaded_paths:
             # 모든 이미지를 하나의 그리드로 합성
-            grid_path, grid_desc = _create_grid_image(downloaded_paths)
+            grid_path, grid_desc, grid_to_source = _create_grid_image(downloaded_paths)
             temp_files.append(grid_path)
 
             prompt_text += (
                 "\n\n=== 첨부 이미지 (그리드) ===\n"
                 f"아래 이미지를 읽고(Read) 실제 색감, 밝기, 채도, 톤을 관찰하여 분석에 반영하세요.\n"
                 f"그리드 레이아웃: {grid_desc}\n"
-                f"특히 targetParams는 이 사진들의 공통된 보정 특성을 수치로 정확히 표현해야 합니다.\n"
                 f"그리고 referenceImageIndices에 스타일을 가장 잘 대표하는 사진 3장의 인덱스를 선택하세요.\n"
                 f"이미지 경로: {grid_path}\n"
             )
@@ -471,7 +570,24 @@ def analyze_user(
 
         # 대표 사진 3장을 영구 저장
         ref_indices = parsed.get("referenceImageIndices", [])
-        saved_refs = _save_reference_images(user_id, ref_indices, downloaded_paths)
+        # 모델은 그리드 위치로 답한다 — 원본 인덱스로 되돌려서 넘긴다
+        source_indices = [
+            grid_to_source[i]
+            for i in ref_indices
+            if isinstance(i, int) and 0 <= i < len(grid_to_source)
+        ]
+        # 열거형 검증 — 어긋난 값은 중립값으로 되돌리고 기록한다
+        style_profile = parsed.get("styleProfile")
+        if isinstance(style_profile, dict):
+            problems = _validate_style_profile(style_profile)
+            if problems:
+                log.error("style profile invalid: %s", problems)
+                _repair_style_profile(style_profile, problems)
+                parsed["warnings"] = [f"프로필 값 보정: {', '.join(problems)}"]
+        else:
+            log.error("style profile missing from analyze_user response")
+
+        saved_refs = _save_reference_images(user_id, source_indices, downloaded_paths)
         if saved_refs:
             parsed["referenceImages"] = saved_refs
             log.info("Saved %d reference images for user %s", len(saved_refs), user_id)

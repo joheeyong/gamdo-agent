@@ -53,6 +53,7 @@ def measure_image_stats(img: Image.Image) -> dict[str, float]:
     - saturation: HSV 채도 평균
     - warmth: R-B 균형. 양수면 웜톤
     - highlight_clip / shadow_crush: 날아간·뭉갠 픽셀 비율
+    - highlight_p95: 밝은 끝(95백분위)의 위치. 하이라이트를 누를 여지가 있는지
     - haze: Dark Channel Prior 평균. 높을수록 뿌옇다
     - sharpness: 라플라시안 분산을 0~1로 정규화
     """
@@ -96,6 +97,7 @@ def measure_image_stats(img: Image.Image) -> dict[str, float]:
         "contrast": float(p95 - p5) / 255.0,
         "saturation": saturation,
         "warmth": float(r.mean() - b.mean()) / 128.0,
+        "highlight_p95": float(p95) / 255.0,
         "highlight_clip": float((luma > 250).mean()),
         "shadow_crush": float((luma < 6).mean()),
         "haze": haze,
@@ -257,6 +259,14 @@ _SUBJECT_RECIPES: dict[str, dict[str, Any]] = {
 # 측정에서 나온 교정 성분 하나가 낼 수 있는 최대치
 _CORRECTION_BAND = 0.35
 
+# 노출은 다른 축보다 좁게 잡는다. 평균 휘도는 장면마다 정당하게 다르다 —
+# 설경·흰 벽 카페·역광은 원래 높고 야경은 원래 낮다. 목표 평균에 억지로
+# 맞추면 잘 찍은 밝은 사진이 전부 중간 회색으로 눌린다.
+# 목표에서 이 폭 안이면 노출이 맞은 것으로 보고 손대지 않는다.
+_EXPOSURE_DEADZONE = 0.06
+# 데드존을 벗어났을 때 노출 교정이 낼 수 있는 최대치
+_EXPOSURE_BAND = 0.20
+
 # 화이트밸런스 강도 1.0이 실제로 중화하는 비율 (채널 게인 상한 때문에 1은 아니다)
 _AWB_NEUTRALIZE = 0.8
 
@@ -268,6 +278,20 @@ def _clamp(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
 def _band(v: float, limit: float = _CORRECTION_BAND) -> float:
     """측정 기반 교정값을 ±limit로 묶는다."""
     return max(-limit, min(limit, v))
+
+
+def _deadzone(diff: float, width: float) -> float:
+    """목표와의 차이에서 width 안쪽은 0으로 죽이고, 벗어난 만큼만 남긴다."""
+    if abs(diff) <= width:
+        return 0.0
+    return diff - width if diff > 0 else diff + width
+
+
+def _ramp(v: float, lo: float, hi: float) -> float:
+    """lo 이하면 0, hi 이상이면 1, 사이는 선형. 0~1."""
+    if hi <= lo:
+        return 0.0
+    return max(0.0, min(1.0, (v - lo) / (hi - lo)))
 
 
 def build_recommended_params(
@@ -295,7 +319,7 @@ def build_params_with_comment(
     설명은 왜 이 값이 나왔는지를 한 문장으로 적은 것이다. 값을 정한 근거가
     여기 다 있으므로 모델에게 따로 물어볼 필요가 없다.
     """
-    profile = style_profile or {}
+    profile = normalize_style_profile(style_profile)
     analysis = analysis or {}
 
     stats = measure_image_stats(img)
@@ -336,7 +360,12 @@ def build_params_with_comment(
     # 교정이지 스타일이 아니다. 밴드가 없으면 거의 무채색인 사진 한 장이
     # saturation +1.0 같은 값을 만들어 이미지를 태워버린다. 스타일의 세기는
     # 아래 레시피가 담당한다.
-    brightness = _band((target_brightness - stats["brightness"]) * 2.2)
+    # 노출만은 "목표 평균에 맞추기"가 아니라 "빗나갔을 때만 당기기"다.
+    # 데드존 밖으로 나간 만큼만, 그것도 좁은 밴드 안에서 움직인다.
+    brightness = _band(
+        _deadzone(target_brightness - stats["brightness"], _EXPOSURE_DEADZONE) * 1.2,
+        _EXPOSURE_BAND,
+    )
     contrast = _band((target_contrast - stats["contrast"]) * 1.6)
     saturation = _band((target_saturation - stats["saturation"]) * 1.8)
     # 화이트밸런스가 먼저 중립으로 당기므로, 그 뒤에 남는 웜니스를 기준으로 잡는다.
@@ -355,7 +384,12 @@ def build_params_with_comment(
     contrast += float(subject_recipe.get("contrast", 0.0))
 
     shadows = float(recipe.get("shadows", 0.0))
-    highlights = float(recipe.get("highlights", 0.0))
+    # 레시피의 하이라이트 억제는 누를 밝은 부분이 있을 때만 뜻이 있다.
+    # 밝은 끝이 낮은 사진에 그대로 걸면 하이라이트가 아니라 중간톤이 눌려
+    # 사진 전체가 어두워진다. p95가 올라온 만큼만 비례해 적용한다.
+    highlights = float(recipe.get("highlights", 0.0)) * _ramp(
+        stats["highlight_p95"], 0.80, 0.95
+    )
 
     if scene["backlit"]:
         # 역광: 피사체가 실루엣으로 남는다. 쉐도우를 크게 들어올리고
@@ -393,10 +427,22 @@ def build_params_with_comment(
     if scene["low_light"]:
         denoise_strength = min(1.0, denoise_strength + 0.2)
 
-    # 안개 제거는 풍경에서 실제로 뿌옇게 측정될 때만
+    # 안개 제거는 풍경에서 실제로 뿌옇게 측정될 때만.
+    #
+    # 다크 채널 평균(stats["haze"])만 보면 안 된다. 그 값은 "가장 어두운 채널이
+    # 얼마나 들려 있나"라서 맑은 날 하늘이나 흰 벽처럼 어두운 물체가 없는
+    # 밝은 사진이면 무조건 높게 나온다 — 실측에서 맑은 하늘 0.55, 진짜 안개
+    # 0.63으로 거의 구분이 안 됐다. 그대로 믿으면 화창한 풍경마다 dehaze가
+    # 최대로 걸려 사진이 통째로 어두워진다.
+    #
+    # 안개는 세 가지가 동시에 성립할 때다: 검은 점이 들리고(veil),
+    # 대비가 눌리고(flat), 색이 빠진다(washed). 하나라도 아니면 안개가 아니다.
     dehaze = 0.0
-    if subject_recipe.get("use_haze") and stats["haze"] > 0.25:
-        dehaze = min(0.5, (stats["haze"] - 0.25) * 1.6)
+    if subject_recipe.get("use_haze"):
+        veil = _ramp(stats["haze"], 0.45, 0.75)
+        flat = _ramp(0.55 - stats["contrast"], 0.0, 0.25)
+        washed = 1.0 - _ramp(stats["saturation"], 0.22, 0.40)
+        dehaze = min(0.35, veil * flat * washed * 0.7)
 
     # 사람 사진이 아니면 피부 보정은 하지 않는다
     is_portrait = subject == "인물"
@@ -452,7 +498,7 @@ def build_params_with_comment(
         "auto_wb": _clamp(auto_wb_strength, 0.0, 1.0),
         "denoise": _clamp(denoise_strength, 0.0, 1.0),
         # 배경 흐림은 인물에서만. 얼굴이 없으면 apply 단계에서 무시된다.
-        "background_blur": _clamp(0.5 * gain if is_portrait else 0.0, 0.0, 1.0),
+        "background_blur": _clamp(0.25 * gain if is_portrait else 0.0, 0.0, 1.0),
         # 피부 보정은 사용자가 고른 강도 그대로 — 필터 게인을 곱하지 않는다
         "blemish_removal": _clamp(blemish, 0.0, 1.0),
         "skin_smoothing": _clamp(skin_smoothing, 0.0, 1.0),
@@ -870,3 +916,48 @@ def detect_scene(stats: dict[str, float], img: Image.Image) -> dict[str, bool]:
         log.info("scene: backlit=%s low_light=%s (center=%.2f border=%.2f)",
                  backlit, low_light, center.mean(), border.mean())
     return {"backlit": backlit, "low_light": low_light}
+
+
+# ── 스타일 프로필 정규화 ──
+#
+# 프로필을 만드는 쪽(ANALYZE_USER_PROMPT)과 읽는 쪽(이 파일), 그리고 앱의
+# 수동 편집 화면이 서로 다른 어휘를 써 왔다. 생성 쪽을 읽는 쪽 어휘에 맞췄지만,
+# Firebase에 이미 저장된 프로필은 옛 어휘로 남아 있다. 여기서 흡수한다.
+
+_LEGACY_FILTER = {"heavy": "strong"}          # 생성 쪽에만 있던 값
+_LEGACY_TONE = {"warm": "warm", "cool": "cool", "neutral": "neutral", "mixed": "mixed"}
+
+
+def normalize_style_profile(profile: dict[str, Any] | None) -> dict[str, Any]:
+    """옛 어휘로 저장된 프로필을 현재 어휘로 옮긴다 (원본은 건드리지 않는다).
+
+    조용히 폴백시키면 사용자가 고른 성향이 전부 '보통'으로 뭉개진다.
+    실제로 filterTendency='heavy'가 게인 0.8(auto)로 떨어지고 있었다.
+    """
+    if not profile:
+        return {}
+
+    out = dict(profile)
+    color = dict(out.get("colorPreference") or {})
+    editing = dict(out.get("editingStyle") or {})
+
+    filt = editing.get("filterTendency")
+    if filt in _LEGACY_FILTER:
+        log.info("profile: filterTendency %r → %r", filt, _LEGACY_FILTER[filt])
+        editing["filterTendency"] = _LEGACY_FILTER[filt]
+
+    # 옛 프로필은 대비를 editingStyle.contrastLevel에 담았다
+    if "contrast" not in color and editing.get("contrastLevel"):
+        color["contrast"] = editing["contrastLevel"]
+
+    tone = color.get("preferredTones")
+    if tone and tone not in _TONE_TARGETS:
+        # colorTemperature(옛 필드)라도 있으면 그쪽을 쓴다
+        fallback = color.get("colorTemperature")
+        color["preferredTones"] = _LEGACY_TONE.get(tone) or (
+            fallback if fallback in _TONE_TARGETS else "neutral"
+        )
+
+    out["colorPreference"] = color
+    out["editingStyle"] = editing
+    return out
