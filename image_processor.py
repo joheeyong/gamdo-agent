@@ -290,10 +290,16 @@ def decode_base64_image(b64: str) -> Image.Image:
     return Image.open(io.BytesIO(data)).convert("RGB")
 
 
-def encode_image_base64(img: Image.Image, fmt: str = "JPEG", quality: int = 90) -> str:
-    """PIL Image를 base64 문자열로 인코딩."""
+def encode_image_base64(img: Image.Image, fmt: str = "JPEG", quality: int = 92) -> str:
+    """PIL Image를 base64 문자열로 인코딩.
+
+    이 결과가 곧 사용자가 저장하는 사진이다. 90 → 92는 용량 대비 이득이
+    크지 않지만(실측 누적 오차 3.94 → 3.68), 업로드에서 이미 한 번 JPEG를
+    거친 뒤라 마지막 단계는 조금 여유를 둔다.
+    화질 손실의 주범은 압축이 아니라 해상도였다 (12MP → 1.8MP).
+    """
     buf = io.BytesIO()
-    img.save(buf, format=fmt, quality=quality)
+    img.save(buf, format=fmt, quality=quality, optimize=True)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
@@ -617,12 +623,21 @@ def adjust_brightness(img: Image.Image, factor: float) -> Image.Image:
     return Image.fromarray(result_rgb)
 
 
-def adjust_contrast(img: Image.Image, factor: float) -> Image.Image:
+def adjust_contrast(
+    img: Image.Image,
+    factor: float,
+    pivot: float | None = None,
+) -> Image.Image:
     """대비 조절. factor: -1.0 ~ +1.0 (0 = 원본).
 
     LAB 색공간의 L(밝기) 채널에서만 대비를 조절하여,
     채도와 색상 정보를 보존한다. 기존 RGB 전체 대비 감소는
     채도까지 떨어뜨려 하늘 같은 채색 영역을 회색으로 만들었다.
+
+    pivot: 대비를 벌리는 기준 밝기(L, 0~255). None이면 이미지 전체 평균.
+    영역별 보정에서는 반드시 그 영역 안의 평균을 넘겨야 한다. 전체 평균을
+    쓰면 영역 밖의 밝기가 기준을 끌고 가, 평탄한 영역에 대비를 걸었을 뿐인데
+    영역 전체가 밝아지거나 어두워진다.
     """
     if abs(factor) < 0.01:
         return img
@@ -632,7 +647,7 @@ def adjust_contrast(img: Image.Image, factor: float) -> Image.Image:
     lab = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
     l_ch = lab[:, :, 0]
-    mean_l = np.mean(l_ch)
+    mean_l = float(np.mean(l_ch)) if pivot is None else float(pivot)
 
     # L 채널에서만 대비 조절: factor > 0 → 중간값에서 멀어짐 / < 0 → 가까워짐
     l_ch = mean_l + (l_ch - mean_l) * (1.0 + factor)
@@ -1769,9 +1784,46 @@ _REGION_TONE_PARAMS = (
 # 오려 붙인 것처럼 겉돈다. 전체 보정으로 올릴 몫은 슬라이더 쪽에 있다.
 _FACE_TONE_LIMIT = 0.18
 
+# 국소 보정(local_*)의 파라미터별 상한. 얼굴과 달리 "날아간 창문을 살린다"처럼
+# 의도가 분명한 교정이라 더 크게 허용하되, 한 영역이 사진을 지배하지는 못하게 한다.
+_LOCAL_LIMITS: dict[str, float] = {
+    "brightness": 0.50,
+    "highlights": 0.60,
+    "shadows": 0.60,
+    "contrast": 0.35,
+    "saturation": 0.35,
+    "temperature": 0.35,
+    "sharpness": 0.50,
+}
+
+# 영역 딕셔너리에서 보정값이 아니라 마스크를 만드는 데 쓰이는 키.
+# 변형 함수를 찾을 때 건너뛴다.
+_REGION_META_KEYS = frozenset({"area", "shape", "feather", "reason"})
+
+# 국소 보정 영역 이름의 접두사. 모델은 local_0, local_1... 로 준다.
+_LOCAL_PREFIX = "local"
+
+# 국소 보정 영역의 개수·크기 한도.
+_LOCAL_MAX_COUNT = 4
+_LOCAL_MIN_AREA = 0.003   # 프레임 대비 — 이보다 작으면 마스크를 풀면 사라진다
+_LOCAL_MAX_AREA = 0.50    # 이보다 크면 국소 보정이 아니라 전체 보정이다
+
+# 텍스처를 건드리는 보정 — 비싸서 미리보기에서는 뺀다.
+_REGION_TEXTURE_PARAMS = ("blemish_removal", "skin_smoothing")
+
 # 영역 합성 우선순위 (작을수록 위). background는 하늘도 얼굴도 아닌 여집합이라
 # 항상 맨 아래여야 한다. 얼굴은 페더가 밖으로 뻗으므로 맨 위에 얹는다.
-_REGION_PRIORITY = {"face": 0, "sky": 1, "background": 2}
+# 국소 보정은 모델이 좌표까지 짚은 구체적 지시라 하늘·배경보다 위에 둔다.
+_REGION_PRIORITY = {"face": 0, "sky": 2, "background": 3}
+_LOCAL_PRIORITY = 1
+
+
+def _region_priority(region_name: str) -> int:
+    """합성 순서를 돌려준다. local_0, local_1... 은 모두 같은 층이다."""
+    if region_name.startswith(_LOCAL_PREFIX):
+        return _LOCAL_PRIORITY
+    return _REGION_PRIORITY.get(region_name, _LOCAL_PRIORITY)
+
 
 # 얼굴 마스크를 알파로 풀 때의 페더 크기 (영역 등가 반지름 대비).
 # 얼굴 크기에 비례해야 작게 찍힌 얼굴도 같은 정도로 부드러워진다.
@@ -1781,18 +1833,118 @@ _FACE_FEATHER_SIGMA = 0.12
 # 톤이 살고 윤곽은 원본으로 남는다.
 _FACE_FEATHER_GROW = 2.0
 
+# 국소 보정 페더. 모델이 짚은 영역을 넘어 번지면 안 되니 얼굴보다 좁게 잡고,
+# 넓힘도 sigma의 1배까지만 — 안쪽 알파는 1.0로 유지되면서 바깥 번짐은 억제된다.
+_LOCAL_FEATHER_SIGMA = 0.16
+_LOCAL_FEATHER_GROW = 1.0
 
-def _soften_region_mask(mask: np.ndarray, region_name: str) -> np.ndarray:
+
+def build_local_regions(
+    size: tuple[int, int],
+    region_params: dict[str, dict[str, Any]],
+) -> dict[str, np.ndarray]:
+    """region_params의 local_* 항목에서 국소 보정 마스크를 만든다.
+
+    모델이 좌표로 짚은 영역(밝기가 날아간 창문, 그늘에 묻힌 피사체 등)을
+    마스크로 바꾼다. 하늘·얼굴처럼 감지로 찾는 영역과 달리 기하 정보만
+    있으면 되므로 MediaPipe가 필요 없다.
+
+    각 항목의 형태::
+
+        "local_0": {
+            "area": {"x": 0.55, "y": 0.1, "width": 0.2, "height": 0.35},
+            "shape": "rect" | "ellipse",
+            "feather": 0.0~1.0,
+            "reason": "왼쪽 창문이 날아감",
+            "highlights": -0.45, "brightness": -0.15
+        }
+
+    좌표는 정규화(0~1)이고 area/shape/feather/reason은 보정값이 아니다.
+    범위를 벗어나거나 너무 작고 큰 영역은 조용히 버린다 — 모델이 좌표를
+    잘못 짚었을 때 사진 절반에 보정이 걸리는 것보다 아무것도 안 하는 게 낫다.
+    """
+    w, h = size
+    masks: dict[str, np.ndarray] = {}
+    if not region_params:
+        return masks
+
+    names = sorted(n for n in region_params if n.startswith(_LOCAL_PREFIX))
+    for name in names:
+        if len(masks) >= _LOCAL_MAX_COUNT:
+            log.info("local region %s: 개수 한도(%d) 초과 — 버림", name, _LOCAL_MAX_COUNT)
+            continue
+
+        spec = region_params.get(name)
+        if not isinstance(spec, dict):
+            continue
+        area = spec.get("area")
+        if not isinstance(area, dict):
+            log.info("local region %s: area 없음 — 버림", name)
+            continue
+
+        try:
+            ax = float(area.get("x", 0.0))
+            ay = float(area.get("y", 0.0))
+            aw = float(area.get("width", 0.0))
+            ah = float(area.get("height", 0.0))
+        except (TypeError, ValueError):
+            log.info("local region %s: area 좌표를 읽을 수 없음 — 버림", name)
+            continue
+
+        ax = min(max(ax, 0.0), 1.0)
+        ay = min(max(ay, 0.0), 1.0)
+        aw = min(max(aw, 0.0), 1.0 - ax)
+        ah = min(max(ah, 0.0), 1.0 - ay)
+
+        ratio = aw * ah
+        if ratio < _LOCAL_MIN_AREA or ratio > _LOCAL_MAX_AREA:
+            log.info("local region %s: 면적 %.1f%%가 허용 범위(%.1f~%.0f%%) 밖 — 버림",
+                     name, ratio * 100, _LOCAL_MIN_AREA * 100, _LOCAL_MAX_AREA * 100)
+            continue
+
+        left, top = int(ax * w), int(ay * h)
+        right, bottom = int((ax + aw) * w), int((ay + ah) * h)
+        if right - left < 2 or bottom - top < 2:
+            continue
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+        if str(spec.get("shape", "ellipse")).lower() == "rect":
+            mask[top:bottom, left:right] = 255
+        else:
+            cv2.ellipse(
+                mask,
+                center=((left + right) // 2, (top + bottom) // 2),
+                axes=(max(1, (right - left) // 2), max(1, (bottom - top) // 2)),
+                angle=0, startAngle=0, endAngle=360, color=255, thickness=-1,
+            )
+        masks[name] = mask
+        log.info("local region %s: %s %dx%d @ (%d,%d) — %s",
+                 name, spec.get("shape", "ellipse"), right - left, bottom - top,
+                 left, top, spec.get("reason") or "(이유 없음)")
+
+    return masks
+
+
+def _soften_region_mask(
+    mask: np.ndarray,
+    region_name: str,
+    feather_scale: float = 1.0,
+) -> np.ndarray:
     """영역 마스크(0/255)를 블렌딩용 알파(0.0~1.0)로 바꾼다.
 
     얼굴은 턱선·헤어라인이 실제 경계가 아니라 마스크의 끝일 뿐이므로,
     마스크를 밖으로 넓힌 뒤 얼굴 크기에 비례해 길게 푼다. 그래야 톤이
     목·귀까지 이어져 얼굴만 밝은 타원으로 보이지 않는다.
 
+    국소 보정도 같은 이유로 영역 크기에 비례해 풀되, 모델이 짚은 범위를
+    크게 벗어나지 않도록 얼굴보다 좁게 잡는다.
+
     하늘·배경은 지평선처럼 실제 경계를 따르므로 좁게 유지한다.
     넓게 풀면 건물이나 인물 윤곽에 후광이 생긴다.
     """
-    if region_name != "face":
+    is_face = region_name == "face"
+    is_local = region_name.startswith(_LOCAL_PREFIX)
+    if not (is_face or is_local):
         blur_size = max(21, int(min(mask.shape[:2]) * 0.03)) | 1
         return cv2.GaussianBlur(mask, (blur_size, blur_size), 0).astype(np.float32) / 255.0
 
@@ -1801,8 +1953,11 @@ def _soften_region_mask(mask: np.ndarray, region_name: str) -> np.ndarray:
     count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     area = float(stats[1:, cv2.CC_STAT_AREA].max()) if count > 1 else 0.0
     radius = max(8.0, float(np.sqrt(area / np.pi)))
-    sigma = max(4.0, radius * _FACE_FEATHER_SIGMA)
-    grow = max(1, int(sigma * _FACE_FEATHER_GROW))
+
+    sigma_ratio = _FACE_FEATHER_SIGMA if is_face else _LOCAL_FEATHER_SIGMA
+    grow_ratio = _FACE_FEATHER_GROW if is_face else _LOCAL_FEATHER_GROW
+    sigma = max(4.0, radius * sigma_ratio * feather_scale)
+    grow = max(1, int(sigma * grow_ratio))
 
     # 얼굴이 크면 넓히기·풀기 모두 원본 해상도에서 비싸다 (1400px 얼굴에서 0.7초).
     # 램프는 부드러운 저주파라 축소해서 만들고 되돌려도 눈에 차이가 없다.
@@ -1827,11 +1982,34 @@ def _soften_region_mask(mask: np.ndarray, region_name: str) -> np.ndarray:
     return work.astype(np.float32) / 255.0
 
 
+def _limit_region_value(region_name: str, param_name: str, value: float) -> float:
+    """영역별 보정값을 그 영역이 자연스럽게 감당할 수 있는 범위로 자른다."""
+    if region_name == "face" and param_name in _REGION_TONE_PARAMS:
+        return float(np.clip(value, -_FACE_TONE_LIMIT, _FACE_TONE_LIMIT))
+    if region_name.startswith(_LOCAL_PREFIX):
+        limit = _LOCAL_LIMITS.get(param_name)
+        if limit is not None:
+            return float(np.clip(value, -limit, limit))
+    return value
+
+
+def _feather_scale(spec: dict[str, Any]) -> float:
+    """모델이 준 feather(0~1)를 페더 배율(0.5~1.5)로 바꾼다. 없으면 1.0."""
+    raw = spec.get("feather")
+    if raw is None:
+        return 1.0
+    try:
+        return 0.5 + float(np.clip(float(raw), 0.0, 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def apply_regional_transforms(
     img: Image.Image,
     regions: dict[str, np.ndarray],
     region_params: dict[str, dict[str, float]],
     cache: MediaPipeCache | None = None,
+    preview: bool = False,
 ) -> Image.Image:
     """영역별로 다른 보정을 적용한 뒤 마스크 경계를 블렌딩.
 
@@ -1839,8 +2017,14 @@ def apply_regional_transforms(
     {
       "sky": {"brightness": 0.1, "saturation": -0.1, "temperature": 0.0},
       "face": {"brightness": 0.1, "blemish_removal": 0.3, "skin_smoothing": 0.2},
-      "background": {"brightness": 0.0, "contrast": 0.1, "saturation": -0.05}
+      "background": {"brightness": 0.0, "contrast": 0.1, "saturation": -0.05},
+      "local_0": {"area": {...}, "shape": "rect", "highlights": -0.45}
     }
+
+    local_* 영역의 마스크는 [build_local_regions]로 만들어 regions에 넣어 둔다.
+
+    preview가 True면 잡티 제거·피부 스무딩은 건너뛴다 (비용이 크다).
+    톤 보정은 그대로 적용해 미리보기와 저장본의 색이 갈리지 않게 한다.
 
     cache가 제공되면 MediaPipe 모델/결과 캐시를 재사용한다.
     """
@@ -1861,7 +2045,7 @@ def apply_regional_transforms(
     }
 
     # 영역별 결과와 알파를 먼저 모은다 — 순서대로 덧칠하면 안 된다.
-    layers: list[tuple[np.ndarray, np.ndarray]] = []
+    layers: list[tuple[str, np.ndarray, np.ndarray]] = []
 
     for region_name, params in region_params.items():
         if not params or region_name not in regions:
@@ -1874,20 +2058,35 @@ def apply_regional_transforms(
         # 이 영역에 해당하는 변형을 순서대로 적용
         region_img = img.copy()
         applied = False
-        for param_name, value in params.items():
-            value = float(value)
-            if region_name == "face" and param_name in _REGION_TONE_PARAMS:
-                limited = float(np.clip(value, -_FACE_TONE_LIMIT, _FACE_TONE_LIMIT))
-                if limited != value:
-                    log.info("regional: face %s %.2f → %.2f (톤 상한)",
-                             param_name, value, limited)
-                    value = limited
+        for param_name, raw in params.items():
+            if param_name in _REGION_META_KEYS:
+                continue
+            if preview and param_name in _REGION_TEXTURE_PARAMS:
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+
+            limited = _limit_region_value(region_name, param_name, value)
+            if limited != value:
+                log.info("regional: %s %s %.2f → %.2f (상한)",
+                         region_name, param_name, value, limited)
+                value = limited
             if abs(value) < 0.01:
                 continue
+
             func = transform_funcs.get(param_name)
-            if func is not None:
+            if func is None:
+                continue
+            if param_name == "contrast":
+                # 대비의 기준 밝기는 이 영역 안의 평균이어야 한다. 전체 평균을
+                # 쓰면 평탄한 영역에 대비를 걸었을 뿐인데 영역이 통째로
+                # 밝아지거나 어두워진다 (밝은 하늘이 기준을 끌어올린다).
+                region_img = func(region_img, value, pivot=_region_mean_l(img, mask))
+            else:
                 region_img = func(region_img, value)
-                applied = True
+            applied = True
 
         if not applied:
             continue
@@ -1895,7 +2094,7 @@ def apply_regional_transforms(
         layers.append((
             region_name,
             np.array(region_img, dtype=np.float32),
-            _soften_region_mask(mask, region_name),
+            _soften_region_mask(mask, region_name, _feather_scale(params)),
         ))
 
     if not layers:
@@ -1908,7 +2107,7 @@ def apply_regional_transforms(
     # 게다가 background 마스크는 얼굴의 여집합이라 얼굴 바로 밖에서 알파가
     # 1.0이었고, 얼굴 페더를 얼마나 넓혀도 경계에서 배경 보정이 이겼다.
     # face를 먼저 얹어야 얼굴 톤이 목·귀 쪽으로 실제로 번져 나간다.
-    layers.sort(key=lambda item: _REGION_PRIORITY.get(item[0], 1))
+    layers.sort(key=lambda item: _region_priority(item[0]))
 
     result = arr_rgb.copy()
     remaining = np.ones(arr_rgb.shape[:2], dtype=np.float32)
@@ -1919,6 +2118,15 @@ def apply_regional_transforms(
 
     return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8))
 
+
+def _region_mean_l(img: Image.Image, mask: np.ndarray) -> float:
+    """마스크 안 픽셀의 평균 L(0~255)을 돌려준다. 비면 전체 평균."""
+    lab = cv2.cvtColor(cv2.cvtColor(np.array(img, dtype=np.uint8), cv2.COLOR_RGB2BGR),
+                       cv2.COLOR_BGR2LAB)
+    l_ch = lab[:, :, 0]
+    if mask.shape[:2] != l_ch.shape[:2] or cv2.countNonZero(mask) == 0:
+        return float(l_ch.mean())
+    return float(cv2.mean(l_ch, mask=mask)[0])
 
 # ── 얼굴/체형 보정 (MLS Warp) ──
 

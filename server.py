@@ -1,8 +1,9 @@
 """GAMDO Agent Server — FastAPI + Claude Code CLI."""
 
 import base64
-import os
 import logging
+import os
+import threading
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -70,6 +71,12 @@ app.add_middleware(
 # GZip 압축: 500바이트 이상 응답을 자동 gzip 압축
 # CORSMiddleware 뒤에 추가하여 CORS 헤더가 먼저 설정된 후 압축 적용
 app.add_middleware(GZipMiddleware, minimum_size=500)
+
+# 이미지 처리는 메모리를 많이 쓴다 (2560px 한 장에 피크 ~1.1GB).
+# FastAPI는 동기 엔드포인트를 기본 40개 스레드까지 동시에 돌리므로,
+# 제한이 없으면 동시 요청 몇 건에 프로세스가 죽는다.
+_HEAVY_SLOTS = int(os.getenv("GAMDO_MAX_CONCURRENT", "3"))
+_heavy_semaphore = threading.Semaphore(_HEAVY_SLOTS)
 
 APP_TOKEN = os.getenv("APP_TOKEN", "")
 INSTAGRAM_CLIENT_ID = os.getenv("INSTAGRAM_CLIENT_ID", "")
@@ -157,7 +164,9 @@ def api_analyze_and_transform(
     """사진 분석 + 변형을 한 번에 수행. Claude가 사진을 분석하고, 결과를 바탕으로 즉시 변형."""
     _verify_token(authorization)
 
-    try:
+    # 메모리 폭증 방지 — 동시에 도는 무거운 처리를 제한한다
+    with _heavy_semaphore:
+      try:
         # 1. Claude가 사진 분석 (Vision)
         log.info("analyze-and-transform: analyzing photo")
         analysis = transform_photo(
@@ -275,7 +284,7 @@ def api_analyze_and_transform(
             params_comment=params_comment,
         )
 
-    except Exception as e:
+      except Exception as e:
         log.exception("analyze-and-transform failed")
         return AnalyzeAndTransformResponse(success=False, error=str(e))
 
