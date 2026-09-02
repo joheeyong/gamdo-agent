@@ -7,6 +7,7 @@ import hashlib
 import io
 import logging
 import os
+import tempfile
 from typing import Any
 
 import cv2
@@ -57,6 +58,12 @@ _MODEL_SPECS: dict[str, tuple[str, str]] = {
         "https://storage.googleapis.com/mediapipe-models/"
         "pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
     ),
+    # 인물 분할 — 배경 흐림에서 사람과 배경을 가른다. 249KB, 1080p에서 3.4ms.
+    "person": (
+        "selfie_segmenter.tflite",
+        "https://storage.googleapis.com/mediapipe-models/"
+        "image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",
+    ),
 }
 
 # 내려받은 모델을 둘 곳. site-packages는 uv sync 한 번에 날아가므로 쓰지 않는다.
@@ -88,7 +95,14 @@ def _download_model(url: str, dest: str) -> None:
     import urllib.request
 
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    tmp = f"{dest}.part"
+    # 임시 이름은 고유해야 한다. 고정 이름(.part)이면 첫 요청 두 개가 동시에
+    # 들어올 때 서로의 임시 파일을 지운다 — FastAPI는 동기 엔드포인트를
+    # 스레드풀에서 병렬로 돌리므로 실제로 겹칠 수 있다.
+    fd, tmp = tempfile.mkstemp(
+        prefix=os.path.basename(dest) + ".", suffix=".part",
+        dir=os.path.dirname(dest),
+    )
+    os.close(fd)
     try:
         urllib.request.urlretrieve(url, tmp)
         if os.path.getsize(tmp) < 1024:
@@ -142,6 +156,11 @@ def pose_model_path() -> str | None:
     return _resolve_model_path("pose")
 
 
+def person_model_path() -> str | None:
+    """인물 분할(ImageSegmenter) 모델 경로 (사용 시점에 확인·복구)."""
+    return _resolve_model_path("person")
+
+
 # ── 요청 스코프 MediaPipe 캐시 ──
 
 
@@ -162,8 +181,10 @@ class MediaPipeCache:
     def __init__(self) -> None:
         self._face_landmarker: Any | None = None
         self._pose_landmarker: Any | None = None
+        self._person_segmenter: Any | None = None
         self._face_results_cache: dict[str, Any] = {}
         self._pose_results_cache: dict[str, Any] = {}
+        self._person_mask_cache: dict[str, Any] = {}
 
     def __enter__(self) -> "MediaPipeCache":
         return self
@@ -185,8 +206,24 @@ class MediaPipeCache:
             except Exception:
                 pass
             self._pose_landmarker = None
+        self._close_person_segmenter()
         self._face_results_cache.clear()
         self._pose_results_cache.clear()
+        self._person_mask_cache.clear()
+
+    def _close_person_segmenter(self) -> None:
+        """분할기 인스턴스를 닫고 슬롯을 비운다.
+
+        잘못된 입력을 한 번 먹은 인스턴스는 다음 호출에서 영구히 멈춘다
+        (내부 그래프가 에러 상태로 남는다). 그래서 예외가 나면 재사용하지 않고
+        버리고 다시 만든다.
+        """
+        if self._person_segmenter is not None:
+            try:
+                self._person_segmenter.close()
+            except Exception:
+                pass
+            self._person_segmenter = None
 
     @staticmethod
     def _image_key(arr_rgb: np.ndarray) -> str:
@@ -231,6 +268,59 @@ class MediaPipeCache:
             )
             self._pose_landmarker = mp.tasks.vision.PoseLandmarker.create_from_options(options)
         return self._pose_landmarker
+
+    def _get_person_segmenter(self) -> Any:
+        """ImageSegmenter 인스턴스를 반환 (없으면 생성)."""
+        if self._person_segmenter is None:
+            model_path = person_model_path()
+            if model_path is None or mp is None:
+                return None
+            base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
+            options = mp.tasks.vision.ImageSegmenterOptions(
+                base_options=base_options,
+                # 0/255 이진 마스크(category_mask)보다 확률 마스크가 4배 빠르고,
+                # 경계가 부드러워 블렌딩에 그대로 쓸 수 있다.
+                output_confidence_masks=True,
+                output_category_mask=False,
+            )
+            self._person_segmenter = mp.tasks.vision.ImageSegmenter.create_from_options(
+                options
+            )
+        return self._person_segmenter
+
+    def get_person_mask(self, arr_rgb: np.ndarray) -> np.ndarray | None:
+        """인물 확률 마스크를 돌려준다 — float32 (h, w), 0.0~1.0.
+
+        모델이 없거나 분할에 실패하면 None. 입력 해상도로 이미 업샘플되어
+        나오므로 크기를 맞출 필요가 없다.
+        """
+        key = self._image_key(arr_rgb)
+        if key in self._person_mask_cache:
+            return self._person_mask_cache[key]
+
+        segmenter = self._get_person_segmenter()
+        if segmenter is None:
+            self._person_mask_cache[key] = None
+            return None
+
+        try:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=arr_rgb)
+            result = segmenter.segment(mp_image)
+            masks = getattr(result, "confidence_masks", None)
+            if not masks:
+                self._person_mask_cache[key] = None
+                return None
+            # numpy_view()는 owndata=False인 읽기 전용 뷰라 반드시 복사해 둔다
+            mask = np.array(masks[0].numpy_view(), dtype=np.float32).squeeze()
+        except Exception as exc:
+            # 한 번 실패한 인스턴스는 다음 호출에서 멈춘다 — 버리고 다시 만든다
+            log.warning("person segmentation failed: %s", exc)
+            self._close_person_segmenter()
+            self._person_mask_cache[key] = None
+            return None
+
+        self._person_mask_cache[key] = mask
+        return mask
 
     def get_face_landmarks(self, arr_rgb: np.ndarray) -> Any:
         """얼굴 랜드마크 감지 결과를 캐시에서 반환하거나 새로 감지한다.
@@ -553,70 +643,92 @@ def _keystone_with_matrix(
     return Image.fromarray(result), _translation(-crop, 0) @ matrix
 
 
+# 인물로 인정할 최소 면적 (확률 0.5 넘는 픽셀의 비율).
+# 분할 모델은 사람이 없는 사진에도 빈 마스크가 아니라 0에 가까운 확률장을 낸다.
+# 실측: 인물 사진 0.43~0.55, 사람 없는 사진 0.00008 — 최댓값으로 판단하면
+# (사람 없는 사진에서도 0.58까지 튄다) 오탐이 나므로 면적으로 판단한다.
+_BLUR_MIN_SUBJECT = 0.005
+
+# strength 1.0에서의 흐림 반경(sigma)을 짧은 변 대비로. 실측 sigma:
+#   0.19(기본) → 2.5,  0.5 → 6.5,  1.0 → 13.0
+# 예전에는 이 계수를 sigma가 아니라 커널 크기에 곱했다. OpenCV가 커널에서
+# 유도하는 sigma는 그 6분의 1이라, 기본 세기에서 sigma가 0.8 — 눈에 보이지
+# 않았다. 인물 사진마다 켜지는 기능이 사실상 아무 일도 하지 않았다.
+_BLUR_SIGMA_RATIO = 0.012
+
+
+def _blur_background(
+    arr: np.ndarray, alpha: np.ndarray, strength: float
+) -> np.ndarray:
+    """alpha(1=인물)를 써서 배경만 흐린 배열을 돌려준다."""
+    h, w = arr.shape[:2]
+    sigma = max(1.0, min(h, w) * _BLUR_SIGMA_RATIO * strength)
+
+    # sigma가 크면 원본 해상도의 가우시안이 비싸다. 흐림은 저주파라
+    # 축소해서 흐리고 되돌려도 결과가 같다 (실측 14ms → 8ms).
+    shrink = min(1.0, 8.0 / sigma)
+    if shrink < 1.0:
+        small = cv2.resize(arr, None, fx=shrink, fy=shrink,
+                           interpolation=cv2.INTER_AREA)
+        small = cv2.GaussianBlur(small, (0, 0), sigma * shrink)
+        blurred = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    else:
+        blurred = cv2.GaussianBlur(arr, (0, 0), sigma)
+
+    a = alpha[:, :, np.newaxis]
+    out = arr.astype(np.float32) * a + blurred.astype(np.float32) * (1.0 - a)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def apply_background_blur(
     img: Image.Image,
     strength: float,
     cache: "MediaPipeCache | None" = None,
 ) -> Image.Image:
-    """인물 뒤 배경을 흐린다. strength 0.0~1.0. 얼굴이 없으면 그대로 둔다.
+    """인물 뒤 배경을 흐린다. strength 0.0~1.0. 사람이 없으면 그대로 둔다.
 
-    얼굴 랜드마크에서 인물 영역을 추정해 마스크를 만들고, 그 바깥을
-    가우시안으로 흐린 뒤 경계를 부드럽게 섞는다.
+    MediaPipe 인물 분할(selfie_segmenter)로 사람 모양 그대로의 확률 마스크를
+    받아 그 바깥을 흐린다.
+
+    예전에는 얼굴 랜드마크에서 "얼굴 타원 + 그 아래 몸통 타원"을 그려 인물로
+    삼았다. 팔을 들거나 앉은 자세, 전신샷, 옆으로 선 구도에서는 팔다리가
+    배경으로 판정돼 흐려지고, 반대로 어깨 옆 배경은 타원 안이라 선명하게
+    남았다. 사람 모양은 타원이 아니다.
     """
     if strength < 0.01:
         return img
 
-    from_cache = cache is not None
     arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
-    h, w = arr.shape[:2]
 
-    ctx = cache if from_cache else MediaPipeCache()
+    ctx = cache if cache is not None else MediaPipeCache()
     try:
-        results = ctx.get_face_landmarks(arr) if from_cache else ctx.__enter__().get_face_landmarks(arr)
-    except Exception as exc:
-        log.warning("background_blur: face detection failed: %s", exc)
+        mask = ctx.get_person_mask(arr)
+    finally:
+        if cache is None:
+            ctx.close()
+
+    if mask is None:
+        # 모델을 받지 못했거나 분할이 실패했다. 예전의 타원 근사로 되돌리지
+        # 않는다 — 팔다리를 흐리는 잘못된 마스크보다 아무것도 안 하는 게 낫다.
+        log.info("background_blur: 인물 분할을 쓸 수 없어 건너뜀")
         return img
 
-    try:
-        if results is None or not getattr(results, "face_landmarks", None):
-            return img
+    coverage = float((mask > 0.5).mean())
+    if coverage < _BLUR_MIN_SUBJECT:
+        log.info("background_blur: 인물 면적 %.3f%% — 사람 없음으로 보고 건너뜀",
+                 coverage * 100)
+        return img
 
-        # 얼굴들을 감싸는 타원 + 그 아래 몸통을 인물 영역으로 본다
-        subject = np.zeros((h, w), dtype=np.uint8)
-        for landmarks in results.face_landmarks:
-            xs = np.array([lm.x for lm in landmarks]) * w
-            ys = np.array([lm.y for lm in landmarks]) * h
-            cx, cy = float(xs.mean()), float(ys.mean())
-            fw, fh = float(xs.max() - xs.min()), float(ys.max() - ys.min())
+    # 확률 마스크는 이미 경계가 부드럽다(내부 해상도 256px에서 업샘플된다).
+    # 애매한 영역의 잔점만 가볍게 눌러 준다.
+    smooth = max(1.0, min(arr.shape[:2]) * 0.003)
+    alpha = cv2.GaussianBlur(mask, (0, 0), smooth)
 
-            cv2.ellipse(subject, (int(cx), int(cy)),
-                        (int(fw * 0.85), int(fh * 0.95)), 0, 0, 360, 255, -1)
-            # 어깨~몸통: 얼굴 아래로 폭 2.2배의 사다리꼴
-            body_top = int(cy + fh * 0.55)
-            cv2.ellipse(subject, (int(cx), body_top + int(fh * 1.8)),
-                        (int(fw * 1.6), int(fh * 2.2)), 0, 0, 360, 255, -1)
-
-        if subject.max() == 0:
-            return img
-
-        # 경계를 부드럽게 — 딱 잘린 마스크는 오려붙인 티가 난다
-        feather = max(9, int(min(h, w) * 0.02)) | 1
-        mask = cv2.GaussianBlur(subject, (feather, feather), 0).astype(np.float32) / 255.0
-        mask = mask[..., None]
-
-        blur_px = max(3, int(min(h, w) * 0.012 * strength)) | 1
-        blurred = cv2.GaussianBlur(arr, (blur_px, blur_px), 0).astype(np.float32)
-
-        out = arr.astype(np.float32) * mask + blurred * (1.0 - mask)
-        log.info("background_blur: strength=%.2f faces=%d blur=%dpx",
-                 strength, len(results.face_landmarks), blur_px)
-        return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
-    finally:
-        if not from_cache:
-            try:
-                ctx.__exit__(None, None, None)
-            except Exception:
-                pass
+    out = _blur_background(arr, alpha, strength)
+    log.info("background_blur: strength=%.2f 인물 %.1f%% sigma=%.1f",
+             strength, coverage * 100,
+             max(1.0, min(arr.shape[:2]) * _BLUR_SIGMA_RATIO * strength))
+    return Image.fromarray(out)
 
 
 # ── 개별 변형 함수 ──
@@ -1154,20 +1266,50 @@ def apply_vignette(img: Image.Image, intensity: float) -> Image.Image:
     return Image.fromarray(result_rgb)
 
 
+# 그레인·샤픈의 기준 해상도.
+#
+# 앱은 미리보기를 800px, 저장을 2560px로 렌더한다. 효과의 크기를 화소 단위로
+# 고정하면 2560px에서 만든 것은 화면에 맞게 줄이는 순간 평균되어 사라진다 —
+# 미리보기에서 고른 그레인·선명도가 저장본에는 없다.
+# 실측: 같은 값에서 저장본의 그레인이 미리보기의 0.28~0.31배, 샤픈이 0.15~0.26배.
+_EFFECT_REFERENCE_PX = 800
+
+
 def apply_grain(img: Image.Image, intensity: float) -> Image.Image:
     """필름 그레인 효과. intensity: 0.0(없음) ~ 1.0(강한 노이즈).
 
     밝기 채널에만 모노크롬 노이즈를 추가하여 자연스러운 필름 느낌을 만든다.
+    알갱이 크기는 해상도에 비례해 미리보기와 저장본의 체감을 맞춘다.
     """
     if intensity < 0.01:
         return img
 
     arr = np.array(img, dtype=np.float32)
     h, w = arr.shape[:2]
+    sigma_target = intensity * 40.0   # 최대 40 밝기값 편차
 
-    # 모노크롬 노이즈 생성 (RGB 동일 → 컬러 노이즈 방지)
-    strength = intensity * 40.0  # 최대 40 밝기값 편차
-    noise = np.random.normal(0, strength, (h, w)).astype(np.float32)
+    # 기준 해상도에서 1화소짜리 노이즈를 만들고 원본 크기로 늘린다.
+    scale = max(1.0, min(h, w) / _EFFECT_REFERENCE_PX)
+    nh, nw = max(1, int(round(h / scale))), max(1, int(round(w / scale)))
+
+    # 씨앗을 사진에서 끌어온다. 무작위로 두면 같은 사진을 두 번 렌더할 때마다
+    # 그레인이 달라져 미리보기와 저장본이 절대 일치하지 않는다.
+    digest = hashlib.md5(
+        f"{h}x{w}".encode()
+        + arr[::max(1, h // 16), ::max(1, w // 16)].astype(np.uint8).tobytes(),
+        usedforsecurity=False,
+    ).hexdigest()[:8]
+    noise = np.random.default_rng(int(digest, 16)).normal(
+        0.0, sigma_target, (nh, nw)
+    ).astype(np.float32)
+
+    if (nh, nw) != (h, w):
+        noise = cv2.resize(noise, (w, h), interpolation=cv2.INTER_LINEAR)
+        # 확대하면 이웃이 섞여 진폭이 줄어든다. 목표 편차로 되돌린다.
+        actual = float(noise.std())
+        if actual > 1e-6:
+            noise *= sigma_target / actual
+
     noise = noise[:, :, np.newaxis]
 
     # 밝은 영역보다 중간톤에 그레인이 더 잘 보이도록 가중치
@@ -1231,9 +1373,28 @@ def apply_skin_smoothing(
 
 
 def apply_sharpness(img: Image.Image, factor: float) -> Image.Image:
-    """선명도 조절. factor: -1.0 ~ +1.0 (0 = 원본)."""
-    enhancer = ImageEnhance.Sharpness(img)
-    return enhancer.enhance(1.0 + factor)
+    """선명도 조절. factor: -1.0 ~ +1.0 (0 = 원본).
+
+    언샤프 마스크. 예전에는 PIL의 ImageEnhance.Sharpness를 썼는데 고정 3x3
+    커널이라 반경이 항상 1화소였다. 2560px 저장본에서는 800px 미리보기 때의
+    3분의 1 크기 디테일만 건드려 효과가 거의 사라졌다 (실측 0.15~0.26배).
+    반경을 해상도에 비례시켜 둘의 체감을 맞춘다.
+    """
+    if abs(factor) < 0.01:
+        return img
+
+    arr = np.array(img, dtype=np.float32)
+    h, w = arr.shape[:2]
+    sigma = max(0.6, 0.8 * min(h, w) / _EFFECT_REFERENCE_PX)
+    blurred = cv2.GaussianBlur(arr, (0, 0), sigma)
+
+    if factor > 0:
+        out = arr + (arr - blurred) * factor
+    else:
+        # 음수는 흐리게 — 디테일을 빼는 대신 흐린 쪽으로 섞는다.
+        # 그냥 뺐다가는 -1.0에서 디테일이 반전돼 윤곽이 이중으로 보인다.
+        out = arr * (1.0 + factor) - blurred * factor
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
 
 
 # ── 잡티 제거 (Blemish Removal) ──
@@ -1509,17 +1670,33 @@ def apply_blemish_removal(
 # ── AI 자동 편집 (autoEdits) ──
 
 
-def apply_smart_crop(img: Image.Image, crop: dict) -> Image.Image:
+# 크롭으로 남길 최소 비율. 프롬프트가 모델에게 약속한 값과 같다.
+#
+# 예전 하한은 0.05였고 그 외에는 절대 50px 가드뿐이었다. 프롬프트는 크롭을
+# "적극 추천", "과감하게 줌인"하라고 밀어붙이므로, 모델이 작은 박스를 주면
+# 4000x3000 사진이 240x180으로 잘려 나왔다 (50px 가드는 썸네일만 지킨다).
+_CROP_MIN_SIDE = 0.3
+
+
+def apply_smart_crop(
+    img: Image.Image, crop: dict, allow_vertical_crop: bool = True
+) -> Image.Image:
     """AI가 추천한 영역으로 이미지를 크롭(줌인)한다.
 
     crop: {"x": 0~1, "y": 0~1, "width": 0~1, "height": 0~1} (정규화 좌표)
+
+    allow_vertical_crop=False면 위아래를 자르지 않는다. 인물 사진에서 이 크롭이
+    머리와 발을 잘라 다리가 짧아 보이게 하던 경로다 — apply_instagram_ratio만
+    이 플래그를 받고 있어서 여기로 새어 나갔다.
     """
     try:
         w, h = img.size
         x = max(0.0, min(1.0, float(crop.get("x", 0))))
         y = max(0.0, min(1.0, float(crop.get("y", 0))))
-        cw = max(0.05, min(1.0, float(crop.get("width", 1))))
-        ch = max(0.05, min(1.0, float(crop.get("height", 1))))
+        cw = max(_CROP_MIN_SIDE, min(1.0, float(crop.get("width", 1))))
+        ch = max(_CROP_MIN_SIDE, min(1.0, float(crop.get("height", 1))))
+        if not allow_vertical_crop:
+            y, ch = 0.0, 1.0
 
         left = int(x * w)
         top = int(y * h)
@@ -1788,8 +1965,16 @@ def apply_auto_edits(
     크롭은 기하 보정 뒤에 남는다. 먼저 자르면 회전 보정이 그 프레임을 다시 잘라
     의도한 구도가 틀어진다. 대신 좌표를 변환 행렬로 함께 옮겨, 원본 기준으로
     짚은 박스가 새 프레임에서도 같은 곳을 가리키게 한다.
+
+    allow_vertical_crop은 auto_edits 안에 같은 이름의 키가 있으면 그것을 따른다.
+    분석 시점에만 피사체가 무엇인지 알 수 있는데, 저장·미리보기는 그때 만든
+    autoEdits를 앱이 되돌려 보내 다시 적용하는 구조다. 판단을 딕셔너리에
+    실어 두면 어느 경로로 들어와도 같은 결정이 적용된다.
     """
     src_size = img.size
+    recorded = auto_edits.get("allow_vertical_crop")
+    if isinstance(recorded, bool):
+        allow_vertical_crop = recorded
 
     # 1. 불필요한 요소 제거 — 원본 좌표계에서 (기하 보정 전에)
     remove_areas = auto_edits.get("remove_areas")
@@ -1822,7 +2007,7 @@ def apply_auto_edits(
         if mapped is None:
             log.info("smart_crop: 기하 보정 후 크롭 영역이 남지 않음 — 건너뜀")
         else:
-            img = apply_smart_crop(img, mapped)
+            img = apply_smart_crop(img, mapped, allow_vertical_crop)
 
     # 4. 인스타그램 비율 크롭
     ig_ratio = auto_edits.get("instagram_ratio")
@@ -1935,8 +2120,18 @@ _REGION_TONE_PARAMS = (
 # 오려 붙인 것처럼 겉돈다. 전체 보정으로 올릴 몫은 슬라이더 쪽에 있다.
 _FACE_TONE_LIMIT = 0.18
 
+# 얼굴 질감 보정(잡티·스무딩)의 상한. 전역 슬라이더가 같은 픽셀에 한 번 더
+# 적용하므로 두 패스가 겹친다.
+_FACE_TEXTURE_LIMIT = 0.5
+
 # 국소 보정(local_*)의 파라미터별 상한. 얼굴과 달리 "날아간 창문을 살린다"처럼
 # 의도가 분명한 교정이라 더 크게 허용하되, 한 영역이 사진을 지배하지는 못하게 한다.
+# 하늘·배경의 상한. 얼굴만 묶여 있었고 이쪽은 프롬프트가 -1.0~1.0을 허용했다.
+# 실측: sky brightness -1.0 → 하늘 평균 167에서 98로, background -1.0 → 165에서
+# 105로. 손대지 않은 피사체만 남고 주변이 터널처럼 어두워진다.
+_SKY_LIMIT = 0.35
+_BACKGROUND_LIMIT = 0.30
+
 _LOCAL_LIMITS: dict[str, float] = {
     "brightness": 0.50,
     "highlights": 0.60,
@@ -2135,8 +2330,18 @@ def _soften_region_mask(
 
 def _limit_region_value(region_name: str, param_name: str, value: float) -> float:
     """영역별 보정값을 그 영역이 자연스럽게 감당할 수 있는 범위로 자른다."""
-    if region_name == "face" and param_name in _REGION_TONE_PARAMS:
-        return float(np.clip(value, -_FACE_TONE_LIMIT, _FACE_TONE_LIMIT))
+    if region_name == "face":
+        if param_name in _REGION_TONE_PARAMS:
+            return float(np.clip(value, -_FACE_TONE_LIMIT, _FACE_TONE_LIMIT))
+        if param_name in _REGION_TEXTURE_PARAMS:
+            # 전역 슬라이더에서도 같은 픽셀에 한 번 더 걸리므로, 여기서 1.0을
+            # 허용하면 두 번 겹쳐 피부가 밀랍처럼 된다.
+            return float(np.clip(value, 0.0, _FACE_TEXTURE_LIMIT))
+        return value
+    if region_name == "sky" and param_name in _REGION_TONE_PARAMS:
+        return float(np.clip(value, -_SKY_LIMIT, _SKY_LIMIT))
+    if region_name == "background" and param_name in _REGION_TONE_PARAMS:
+        return float(np.clip(value, -_BACKGROUND_LIMIT, _BACKGROUND_LIMIT))
     if region_name.startswith(_LOCAL_PREFIX):
         limit = _LOCAL_LIMITS.get(param_name)
         if limit is not None:
@@ -2291,10 +2496,19 @@ _JAW_RIGHT = [397, 365, 379, 378, 400, 377]
 _JAW_TIP = [152]
 
 # 눈 인덱스 (방사형 확대용)
-_LEFT_EYE_CENTER = 468   # iris center (478 mesh)
-_RIGHT_EYE_CENTER = 473
-_LEFT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
-_RIGHT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+# 눈 확대는 눈 중심에서 바깥으로 밀어내는 변형이라, 윤곽과 중심이 반드시
+# 같은 눈이어야 한다. 예전에는 왼눈 윤곽에 오른눈 홍채 중심이 짝지어져 있어
+# 확대가 아니라 "반대편 눈 쪽으로 끌어당기기"가 됐고, 두 눈 사이의 코까지
+# 딸려가 한쪽 콧구멍만 커지는 결과가 나왔다.
+#
+# MediaPipe 규약 (FaceLandmarksConnections로 확인):
+#   LEFT_EYE  = 362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398
+#   RIGHT_EYE = 33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246
+#   홍채는 468~472가 LEFT, 473~477이 RIGHT이며 각 첫 번째가 중심이다.
+_LEFT_EYE_CENTER = 468    # LEFT iris 중심
+_RIGHT_EYE_CENTER = 473   # RIGHT iris 중심
+_LEFT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+_RIGHT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 
 
 def _mls_similarity_warp(
@@ -2473,9 +2687,13 @@ def apply_face_reshape(
         src_all: list[list[float]] = []
         dst_all: list[list[float]] = []
 
-        # 얼굴 중심축 (코 중앙)
-        nose_tip = _pt(1)
-        cx = nose_tip[0]
+        # 얼굴 중심축.
+        # 코끝(1)을 쓰면 얼굴이 조금만 돌아가도 축이 한쪽으로 치우쳐
+        # 볼 슬림·턱선 이동량이 좌우로 달라진다. 광대 양끝(234, 454)의
+        # 중점은 고개 방향에 훨씬 덜 흔들린다.
+        left_cheek = _pt(234)
+        right_cheek = _pt(454)
+        cx = (left_cheek[0] + right_cheek[0]) / 2.0
 
         # ── face_slim: 볼 양쪽을 중심 방향으로 ──
         if face_slim >= 0.01:
@@ -2553,13 +2771,15 @@ def apply_face_reshape(
         all_face_pts = [_pt(i) for i in range(min(len(face_lms), 468))]
         fxs = [p[0] for p in all_face_pts]
         fys = [p[1] for p in all_face_pts]
+        # 얼굴 경계 상자 + 여백. 폭/높이를 이미지 전체 크기로 자르면
+        # (min(w, ...)) x가 0으로 밀린 만큼을 반영하지 못해 블렌딩 타원이
+        # 얼굴에서 어긋나고, 얼굴의 한쪽만 변형된다.
         margin = int(min(h, w) * 0.05)
-        roi = (
-            max(0, int(min(fxs)) - margin),
-            max(0, int(min(fys)) - margin),
-            min(w, int(max(fxs) - min(fxs)) + 2 * margin),
-            min(h, int(max(fys) - min(fys)) + 2 * margin),
-        )
+        rx = max(0, int(min(fxs)) - margin)
+        ry = max(0, int(min(fys)) - margin)
+        rx2 = min(w, int(max(fxs)) + margin)
+        ry2 = min(h, int(max(fys)) + margin)
+        roi = (rx, ry, max(0, rx2 - rx), max(0, ry2 - ry))
 
         result_arr = _warp_with_mask(result_arr, src_pts, dst_pts, roi)
 

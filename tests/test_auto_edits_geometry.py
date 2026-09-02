@@ -18,7 +18,11 @@ from image_processor import (
 )
 
 W, H = 1440, 1080
-MARK = {"x": 0.68, "y": 0.20, "width": 0.10, "height": 0.10}
+# 크롭 검증용 박스는 _CROP_MIN_SIDE(0.3) 이상이어야 한다 — 그보다 작으면
+# 크롭이 최소 크기로 넓혀져 좌표 정확도를 재는 의미가 없어진다.
+MARK = {"x": 0.55, "y": 0.20, "width": 0.32, "height": 0.32}
+# 제거·매핑 검증용은 작아도 된다 (인페인팅 상한 2% 안쪽)
+SMALL = {"x": 0.68, "y": 0.20, "width": 0.10, "height": 0.10}
 GEOMETRY = {"keystone": 0.15, "straighten": 3.0}
 RED = (230, 40, 40)
 
@@ -50,8 +54,8 @@ def test_removal_hits_the_marker_after_geometry():
     예전 순서에서는 보정된 프레임에 원본 좌표를 그대로 적용해 표식이
     그대로 남았다 (측정: 제거 후에도 빨간 비율 1.12%).
     """
-    assert _redness(_marked()) > 0.005
-    out = apply_auto_edits(_marked(), {**GEOMETRY, "remove_areas": [MARK]})
+    assert _redness(_marked(SMALL)) > 0.005
+    out = apply_auto_edits(_marked(SMALL), {**GEOMETRY, "remove_areas": [SMALL]})
     assert _redness(out) < 0.001, f"표식이 {_redness(out):.2%} 남았다"
 
 
@@ -61,13 +65,13 @@ def test_no_geometry_leaves_coordinates_alone():
 
 
 def test_map_box_is_identity_without_geometry():
-    assert _map_normalized_box(MARK, None, (W, H), (W, H)) == MARK
+    assert _map_normalized_box(SMALL, None, (W, H), (W, H)) == SMALL
 
 
 def test_map_box_returns_none_when_pushed_off_frame():
     """변환으로 프레임 밖으로 나간 박스는 크롭하지 않는다."""
     far_right = np.array([[1.0, 0.0, W * 2.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-    assert _map_normalized_box(MARK, far_right, (W, H), (W, H)) is None
+    assert _map_normalized_box(SMALL, far_right, (W, H), (W, H)) is None
 
 
 def test_map_box_rejects_non_numeric_coordinates():
@@ -101,3 +105,32 @@ def test_small_removal_still_works():
     small = {"x": 0.4, "y": 0.4, "width": 0.06, "height": 0.06}
     out = apply_auto_edits(_marked(small), {"remove_areas": [small]})
     assert _redness(out) < 0.001
+
+
+def test_crop_keeps_a_usable_area():
+    """모델이 아주 작은 박스를 줘도 사진이 우표만큼 잘려 나오지 않아야 한다.
+
+    프롬프트는 크롭을 "적극 추천", "과감하게 줌인"하라고 밀어붙이고, 예전 하한은
+    0.05 + 절대 50px 가드뿐이었다 — 4000x3000 사진이 240x180이 됐다.
+    """
+    from image_processor import _CROP_MIN_SIDE, apply_smart_crop
+
+    img = Image.new("RGB", (4000, 3000), (128, 128, 128))
+    tiny = {"x": 0.45, "y": 0.45, "width": 0.06, "height": 0.06}
+    out = apply_smart_crop(img, tiny)
+    assert out.width >= 4000 * _CROP_MIN_SIDE * 0.99
+    assert out.height >= 3000 * _CROP_MIN_SIDE * 0.99
+
+
+def test_crop_respects_the_portrait_vertical_guard():
+    """인물이면 스마트 크롭도 위아래를 자르지 않아야 한다.
+
+    예전에는 allow_vertical_crop이 apply_instagram_ratio에만 전달돼,
+    모델이 권장받은 "하단을 잘라 다리가 길어 보이게" 크롭이 그대로 통과했다.
+    """
+    from image_processor import apply_smart_crop
+
+    img = Image.new("RGB", (900, 1400), (128, 128, 128))
+    box = {"x": 0.1, "y": 0.3, "width": 0.8, "height": 0.4}
+    assert apply_smart_crop(img, box, allow_vertical_crop=False).height == 1400
+    assert apply_smart_crop(img, box, allow_vertical_crop=True).height < 1400

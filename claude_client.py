@@ -37,6 +37,17 @@ _REF_DIR = os.path.join(os.path.dirname(__file__), "reference_images")
 os.makedirs(_REF_DIR, exist_ok=True)
 
 
+def _loads_strict(text: str) -> dict:
+    """JSON을 읽되 NaN·Infinity 리터럴은 None으로 바꾼다.
+
+    json.loads는 표준 밖의 NaN/Infinity/-Infinity를 그대로 float로 받아들인다.
+    그 값이 파라미터로 흘러가면 min/max 비교가 상한을 돌려주기 때문에 "무시"가
+    아니라 **최대 보정**이 됐다 (실측: straighten NaN → 8도 회전, 얼굴 워프
+    전 항목 상한). None으로 바꿔 두면 뒤쪽 검증·기본값이 정상적으로 걸러낸다.
+    """
+    return json.loads(text, parse_constant=lambda _name: None)
+
+
 def _parse_json_response(text: str) -> dict:
     """응답 텍스트에서 JSON을 추출한다."""
     text = text.strip()
@@ -50,12 +61,12 @@ def _parse_json_response(text: str) -> dict:
 
     # 그래도 안 되면 첫 번째 { 부터 마지막 } 까지 추출
     try:
-        return json.loads(text)
+        return _loads_strict(text)
     except json.JSONDecodeError:
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
-            return json.loads(text[start : end + 1])
+            return _loads_strict(text[start : end + 1])
         raise
 
 
@@ -159,6 +170,19 @@ _PROFILE_ENUMS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# 프로필에서 빠져도 되는 항목. param_engine이 "auto" 센티널로 알아서 정하므로
+# 여기서 값을 지어내면 안 된다.
+#
+# 예전에는 이 세 개도 _PROFILE_DEFAULTS를 타고 "none"으로 채워졌다. 그러면
+# param_engine의 `editing.get("grainPreference") or "auto"`가 "none"을 읽어
+# 그레인·비네팅·피부보정이 전부 0이 됐다. 실측: warm_film + strong 인물
+# 프로필에서 grain 0.20→0, vignette 0.12→0, 잡티 0.35→0, 스무딩 0.28→0.
+_PROFILE_OPTIONAL = (
+    "editingStyle.grainPreference",
+    "editingStyle.vignettePreference",
+    "editingStyle.skinRetouchLevel",
+)
+
 # 값이 어긋났을 때 쓰는 중립값 — 방향을 지어내기보다 중간으로 둔다
 _PROFILE_DEFAULTS = {
     "colorPreference.preferredTones": "neutral",
@@ -174,7 +198,12 @@ _PROFILE_DEFAULTS = {
 
 
 def _validate_style_profile(profile: dict) -> list[str]:
-    """열거형 값이 약속된 범위 안에 있는지 검사하고, 어긋난 경로를 돌려준다."""
+    """열거형 값이 약속된 범위 안에 있는지 검사하고, 어긋난 경로를 돌려준다.
+
+    선택 항목([_PROFILE_OPTIONAL])이 아예 없는 것은 문제가 아니다 —
+    param_engine이 "auto"로 알아서 정한다. 값이 있으면서 어휘를 벗어난 경우만
+    문제로 본다.
+    """
     problems: list[str] = []
     for path, allowed in _PROFILE_ENUMS.items():
         parent, _, leaf = path.rpartition(".")
@@ -184,7 +213,8 @@ def _validate_style_profile(profile: dict) -> list[str]:
             continue
         value = (node or {}).get(leaf)
         if value is None:
-            problems.append(f"{path} (없음)")
+            if path not in _PROFILE_OPTIONAL:
+                problems.append(f"{path} (없음)")
         elif value not in allowed:
             problems.append(f"{path}={value!r}")
     return problems
@@ -292,80 +322,40 @@ def _resize_for_vision(img: Image.Image, max_px: int = _VISION_MAX_PX) -> Image.
     return img.resize((new_w, new_h), Image.LANCZOS)
 
 
-def _create_composite_image(
-    main_path: str,
-    ref_paths: list[str],
-) -> tuple[str, str]:
-    """새 사진 + 대표 사진을 하나의 합성 이미지로 만든다.
+def _create_reference_strip(ref_paths: list[str]) -> str | None:
+    """대표 사진들을 세로로 이어 붙인 참고용 이미지를 만든다. 없으면 None.
 
-    레이아웃: [새 사진(크게)] | [대표1] [대표2] [대표3]
-    왼쪽 절반에 새 사진, 오른쪽에 대표 사진들을 세로로 배치.
-    대표 사진이 없으면 새 사진만 리사이즈하여 반환.
-
-    반환: (합성 이미지 경로, 레이아웃 설명 텍스트)
+    예전에는 변형할 사진과 대표 사진을 한 장으로 합성해서 보냈다. 그런데 모델은
+    "0~1 정규화 좌표"를 자기가 보고 있는 이미지 기준으로 답한다. 합성 이미지에서
+    변형할 사진은 왼쪽 2/3뿐이었으므로, 모델이 준 x·width가 모두 1.5배 어긋났다
+    (실측: 크롭 결과에 피사체가 5.4%만 들어옴, 의도한 박스는 69.4%).
+    좌표를 주는 사진은 반드시 그 사진 하나만 담긴 이미지여야 한다.
     """
-    main_img = _resize_for_vision(Image.open(main_path).convert("RGB"))
-
-    if not ref_paths:
-        # 대표 사진 없으면 새 사진만 저장
-        fd, path = tempfile.mkstemp(suffix=".jpg", dir=_TEMP_DIR)
-        os.close(fd)
-        main_img.save(path, "JPEG", quality=85)
-        return path, "이미지 전체가 변형할 새 사진입니다."
-
-    # 대표 사진 로드 및 리사이즈
     ref_imgs: list[Image.Image] = []
     for rp in ref_paths[:3]:
         try:
-            ref_imgs.append(
-                _resize_for_vision(Image.open(rp).convert("RGB"), max_px=512)
-            )
+            ref_imgs.append(_resize_for_vision(Image.open(rp).convert("RGB"), max_px=512))
         except Exception as exc:
             log.warning("Failed to load reference image %s: %s", rp, exc)
-
     if not ref_imgs:
-        fd, path = tempfile.mkstemp(suffix=".jpg", dir=_TEMP_DIR)
-        os.close(fd)
-        main_img.save(path, "JPEG", quality=85)
-        return path, "이미지 전체가 변형할 새 사진입니다."
+        return None
 
-    # 캔버스 크기 계산: 왼쪽 절반 = 새 사진, 오른쪽 절반 = 대표 사진 세로 스택
-    main_w, main_h = main_img.size
-    ref_cell_w = main_w // 2  # 오른쪽 영역 너비
-    ref_cell_h = main_h // len(ref_imgs)
-
-    canvas_w = main_w + ref_cell_w
-    canvas_h = main_h
-    canvas = Image.new("RGB", (canvas_w, canvas_h), (40, 40, 40))
-
-    # 왼쪽: 새 사진
-    canvas.paste(main_img, (0, 0))
-
-    # 오른쪽: 대표 사진들을 세로로 배치
+    cell_w = max(i.width for i in ref_imgs)
+    cell_h = max(i.height for i in ref_imgs)
+    canvas = Image.new("RGB", (cell_w, cell_h * len(ref_imgs)), (40, 40, 40))
     for i, ref in enumerate(ref_imgs):
-        # 셀에 맞게 리사이즈 (비율 유지, 중앙 크롭)
-        rw, rh = ref.size
-        scale = max(ref_cell_w / rw, ref_cell_h / rh)
-        scaled = ref.resize((int(rw * scale), int(rh * scale)), Image.LANCZOS)
-        sw, sh = scaled.size
-        left = (sw - ref_cell_w) // 2
-        top = (sh - ref_cell_h) // 2
-        cropped = scaled.crop((left, top, left + ref_cell_w, top + ref_cell_h))
-        canvas.paste(cropped, (main_w, i * ref_cell_h))
+        scale = max(cell_w / ref.width, cell_h / ref.height)
+        scaled = ref.resize((int(ref.width * scale), int(ref.height * scale)), Image.LANCZOS)
+        left = (scaled.width - cell_w) // 2
+        top = (scaled.height - cell_h) // 2
+        canvas.paste(scaled.crop((left, top, left + cell_w, top + cell_h)), (0, i * cell_h))
 
     fd, path = tempfile.mkstemp(suffix=".jpg", dir=_TEMP_DIR)
     os.close(fd)
     canvas.save(path, "JPEG", quality=85)
-
-    ref_count = len(ref_imgs)
-    layout_desc = (
-        f"합성 이미지 레이아웃: 왼쪽 2/3가 변형할 새 사진, "
-        f"오른쪽 1/3에 대표 사진 {ref_count}장이 위에서 아래로 배치되어 있습니다. "
-        f"새 사진의 색감·구도·피사체를 분석하고, 오른쪽 대표 사진들의 톤·색감을 참고하세요."
-    )
-    log.info("Created composite image: %s (%dx%d, %d refs)",
-             path, canvas_w, canvas_h, ref_count)
-    return path, layout_desc
+    log.info("Created reference strip: %s (%dx%d, %d refs)",
+             path, canvas.width, canvas.height, len(ref_imgs))
+    return path
 
 
 def _call_claude(
@@ -715,27 +705,38 @@ def transform_photo(
         # 대표 사진 경로 조회
         ref_paths = get_reference_image_paths(user_id) if user_id else []
 
-        # 합성 이미지 생성 (새 사진 + 대표 사진 → 1장)
-        composite_path, layout_desc = _create_composite_image(image_path, ref_paths)
-        if composite_path != image_path:
-            temp_files.append(composite_path)
+        # 대표 사진은 별도 이미지로 보낸다 — 변형할 사진과 합성하면 모델이
+        # 좌표를 합성 이미지 기준으로 답해 x·width가 1.5배 어긋난다.
+        ref_strip = _create_reference_strip(ref_paths)
+        if ref_strip:
+            temp_files.append(ref_strip)
 
         prompt_text = TRANSFORM_PHOTO_PROMPT.format(
             style_profile=json.dumps(style_profile, ensure_ascii=False, indent=2),
         )
 
-        # 프롬프트 조립 — 합성 이미지 1장만 Read하도록 안내
         full_prompt = prompt_text + "\n\n"
         full_prompt += (
             "=== 분석할 이미지 ===\n"
-            f"{layout_desc}\n"
-            f"이미지를 읽고(Read) 분석하세요: {composite_path}\n"
+            f"변형할 사진: {image_path}\n"
+            "이 사진을 Read로 읽고 분석하세요.\n"
+            "crop·remove_areas·local_* 의 정규화 좌표(0~1)는 모두 "
+            "**이 사진 한 장**을 기준으로 답하세요.\n"
         )
+        image_paths = [image_path]
+        if ref_strip:
+            image_paths.append(ref_strip)
+            full_prompt += (
+                f"\n대표 사진 모음(참고용): {ref_strip}\n"
+                "이 사용자가 평소 올리는 사진들을 위에서 아래로 이어 붙인 것입니다. "
+                "Read로 읽어 톤·색감의 방향만 참고하세요. "
+                "좌표의 기준이 아니며, 이 이미지를 변형하는 것도 아닙니다.\n"
+            )
 
         # Read 도구만 허용하여 불필요한 도구 사용 방지
         result = _call_claude(
             full_prompt, TRANSFORM_PHOTO_SYSTEM,
-            image_paths=[composite_path],
+            image_paths=image_paths,
             tools="Read",
         )
         parsed = _parse_json_response(result)

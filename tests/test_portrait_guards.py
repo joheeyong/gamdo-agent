@@ -92,3 +92,23 @@ def test_auto_edits_passes_vertical_crop_flag():
     edits = {"instagram_ratio": "4:5"}
     assert apply_auto_edits(tall, edits, allow_vertical_crop=False).size == (900, 1400)
     assert apply_auto_edits(tall, edits, allow_vertical_crop=True).size[1] < 1400
+
+
+def test_vertical_crop_decision_travels_in_auto_edits():
+    """분석 때 내린 판단이 저장·미리보기 경로에서도 적용돼야 한다.
+
+    앱은 analyze 응답의 autoEdits를 그대로 되돌려 보내 다시 적용한다.
+    예전에는 allow_vertical_crop이 analyze-and-transform 엔드포인트의 인자로만
+    있어서, 저장할 때 인물 사진의 세로 크롭이 다시 걸려 머리·발이 잘렸다.
+    """
+    tall = Image.new("RGB", (900, 1400), (128, 128, 128))
+    blocked = {"instagram_ratio": "4:5", "allow_vertical_crop": False}
+    allowed = {"instagram_ratio": "4:5", "allow_vertical_crop": True}
+
+    # 딕셔너리의 판단이 인자 기본값(True)을 눌러야 한다
+    assert apply_auto_edits(tall, blocked).size == (900, 1400)
+    assert apply_auto_edits(tall, allowed).size[1] < 1400
+
+    # 인자를 명시해도 딕셔너리에 기록된 판단이 이긴다
+    assert apply_auto_edits(tall, blocked, allow_vertical_crop=True).size == (900, 1400)
+

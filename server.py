@@ -3,6 +3,7 @@
 import base64
 import logging
 import os
+import secrets
 import threading
 
 from dotenv import load_dotenv
@@ -85,13 +86,19 @@ INSTAGRAM_CLIENT_SECRET = os.getenv("INSTAGRAM_CLIENT_SECRET", "")
 
 
 def _verify_token(authorization: str | None = Header(None)):
-    """Bearer 토큰 검증."""
+    """Bearer 토큰 검증.
+
+    removeprefix를 쓰는 이유: replace("Bearer ", "")는 문자열 어디서나 치환해
+    토큰 안에 그 문자열이 들어 있으면 값을 망친다.
+    compare_digest를 쓰는 이유: ==는 앞에서부터 비교하다 처음 다른 곳에서
+    멈춰, 응답 시간으로 토큰을 한 글자씩 알아낼 여지를 준다.
+    """
     if not APP_TOKEN:
         return
     if not authorization:
         raise HTTPException(status_code=401, detail="Authorization header required")
-    token = authorization.replace("Bearer ", "")
-    if token != APP_TOKEN:
+    token = authorization.removeprefix("Bearer ").strip()
+    if not secrets.compare_digest(token, APP_TOKEN):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
@@ -165,9 +172,7 @@ def api_analyze_and_transform(
     """사진 분석 + 변형을 한 번에 수행. Claude가 사진을 분석하고, 결과를 바탕으로 즉시 변형."""
     _verify_token(authorization)
 
-    # 메모리 폭증 방지 — 동시에 도는 무거운 처리를 제한한다
-    with _heavy_semaphore:
-      try:
+    try:
         # 1. Claude가 사진 분석 (Vision)
         log.info("analyze-and-transform: analyzing photo")
         analysis = transform_photo(
@@ -178,106 +183,114 @@ def api_analyze_and_transform(
         )
         log.info("analyze-and-transform: analysis complete")
 
-        # 2. 이미지 디코딩
-        img = decode_base64_image(req.image_base64)
+        # 메모리 폭증 방지 — 픽셀 처리만 제한한다. Claude 호출(수십 초)까지
+        # 함께 묶으면 슬롯이 LLM 대기로 차서, 슬라이더를 움직이는 다른 사용자의
+        # 미리보기가 그만큼 밀린다. 대기 중에는 메모리를 쓰지 않는다.
+        with _heavy_semaphore:
+            # 2. 이미지 디코딩
+            img = decode_base64_image(req.image_base64)
 
-        # 3. 색 분석 중 측정 가능한 값은 실제 픽셀에서 계산해 덮어쓴다.
-        #    모델이 hex를 눈대중하는 것보다 k-means가 정확하다.
-        color_analysis = analysis.get("colorAnalysis")
-        if not isinstance(color_analysis, dict):
-            color_analysis = {}
-            analysis["colorAnalysis"] = color_analysis
-        color_analysis.update(measure_color_analysis(img))
+            # 3. 색 분석 중 측정 가능한 값은 실제 픽셀에서 계산해 덮어쓴다.
+            #    모델이 hex를 눈대중하는 것보다 k-means가 정확하다.
+            color_analysis = analysis.get("colorAnalysis")
+            if not isinstance(color_analysis, dict):
+                color_analysis = {}
+                analysis["colorAnalysis"] = color_analysis
+            color_analysis.update(measure_color_analysis(img))
 
-        # 4. 목표값은 사용자의 대표 사진에서 직접 잰다. 스타일 프로필의
-        #    5단계 카테고리는 모델의 눈대중 위에 상수를 얹은 구조라,
-        #    실제로 그 사람이 올리는 사진과 어긋날 수 있다.
-        reference = measure_reference_target(
-            get_reference_image_paths(req.user_id) if req.user_id else []
-        )
-
-        # 보정 파라미터: 히스토그램 측정 + 목표값으로 산출.
-        # 왜 그 값이 나왔는지 설명도 함께 만든다 (모델 호출 없음).
-        analysis["recommendedParams"], params_comment = build_params_with_comment(
-            img, req.style_profile, analysis,
-            reference=reference, reshape_enabled=req.reshape_enabled,
-        )
-        params = analysis_to_transform_params(analysis)
-        log.info("analyze-and-transform: params=%s", params)
-        log.info("analyze-and-transform: comment=%s", params_comment)
-
-        # 5. 수평 보정 각도는 Hough 직선 검출로 잰다.
-        #    지평선·건물 모서리가 기준이 있으면 눈대중보다 정확하고,
-        #    기준선이 없거나 선들이 제각각이면 None을 돌려 손대지 않는다.
-        auto_edits = analysis.get("autoEdits")
-        if not isinstance(auto_edits, dict):
-            auto_edits = {}
-        # 수직 원근(키스톤)은 건축물용 변형이다. 한쪽 끝을 가로로 늘리므로
-        # 인물에 적용하면 몸이 옆으로 퍼지고 다리 비율이 무너진다.
-        # 사람이 주인공인 사진에서는 건드리지 않는다.
-        subject = str(analysis.get("subjectType") or "")
-        keystone = 0.0 if subject == "인물" else estimate_keystone(img)
-        if abs(keystone) >= 0.02:
-            auto_edits["keystone"] = keystone
-            log.info("analyze-and-transform: keystone %.3f", keystone)
-
-        measured_tilt = detect_tilt_angle(img)
-        if measured_tilt is not None:
-            auto_edits["straighten"] = measured_tilt
-            log.info("analyze-and-transform: measured tilt %.2f°", measured_tilt)
-        elif auto_edits.get("straighten") is not None:
-            # 측정이 확신하지 못하면 모델의 판단을 쓰되 안전 범위로 묶는다
-            try:
-                llm_tilt = max(-8.0, min(8.0, float(auto_edits["straighten"])))
-                auto_edits["straighten"] = llm_tilt
-                measured_tilt = llm_tilt
-                log.info("analyze-and-transform: using model tilt %.2f°", llm_tilt)
-            except (TypeError, ValueError):
-                auto_edits["straighten"] = None
-        analysis["autoEdits"] = auto_edits
-        params_comment = prefix_tilt_comment(params_comment, measured_tilt)
-
-        # 6. AI autoEdits 적용 (수평 보정, 크롭, 요소 제거, 인스타 비율)
-        if auto_edits:
-            log.info("analyze-and-transform: applying autoEdits=%s", auto_edits)
-            # 인물은 위아래를 자르지 않는다 (머리·발이 잘려 다리가 짧아 보인다)
-            img = apply_auto_edits(
-                img, auto_edits, allow_vertical_crop=(subject != "인물")
+            # 4. 목표값은 사용자의 대표 사진에서 직접 잰다. 스타일 프로필의
+            #    5단계 카테고리는 모델의 눈대중 위에 상수를 얹은 구조라,
+            #    실제로 그 사람이 올리는 사진과 어긋날 수 있다.
+            reference = measure_reference_target(
+                get_reference_image_paths(req.user_id) if req.user_id else []
             )
 
-        # MediaPipe 캐시를 요청 스코프로 공유 — detect_regions / apply_regional_transforms / apply_all_transforms 간 중복 호출 제거
-        with MediaPipeCache() as mp_cache:
-            # 7. 영역별 스마트 보정 (regionParams가 있으면)
-            region_params_raw = analysis.get("regionParams")
-            if region_params_raw and isinstance(region_params_raw, dict):
-                # null이 아닌 영역만 필터링
-                valid_region_params = {
-                    k: v for k, v in region_params_raw.items()
-                    if v is not None and isinstance(v, dict)
-                }
-                if valid_region_params:
-                    try:
-                        regions = detect_regions(img, cache=mp_cache)
-                        # 모델이 좌표로 짚은 국소 보정 영역(local_*)은 감지가 아니라
-                        # 기하 정보로 만든다. detect_regions의 하늘/얼굴/배경 위에 얹힌다.
-                        regions.update(build_local_regions(img.size, valid_region_params))
-                        img = apply_regional_transforms(img, regions, valid_region_params, cache=mp_cache)
-                        log.info("analyze-and-transform: applied regional transforms for regions=%s",
-                                 list(valid_region_params.keys()))
-                    except Exception as e:
-                        log.warning("analyze-and-transform: regional transforms failed, falling back: %s", e)
+            # 보정 파라미터: 히스토그램 측정 + 목표값으로 산출.
+            # 왜 그 값이 나왔는지 설명도 함께 만든다 (모델 호출 없음).
+            analysis["recommendedParams"], params_comment = build_params_with_comment(
+                img, req.style_profile, analysis,
+                reference=reference, reshape_enabled=req.reshape_enabled,
+            )
+            params = analysis_to_transform_params(analysis)
+            log.info("analyze-and-transform: params=%s", params)
+            log.info("analyze-and-transform: comment=%s", params_comment)
 
-            # 8. 슬라이더 변형 적용
-            transformed = apply_all_transforms(img, cache=mp_cache, **params)
-        result_b64 = encode_image_base64(transformed)
+            # 5. 수평 보정 각도는 Hough 직선 검출로 잰다.
+            #    지평선·건물 모서리가 기준이 있으면 눈대중보다 정확하고,
+            #    기준선이 없거나 선들이 제각각이면 None을 돌려 손대지 않는다.
+            auto_edits = analysis.get("autoEdits")
+            if not isinstance(auto_edits, dict):
+                auto_edits = {}
+            # 수직 원근(키스톤)은 건축물용 변형이다. 한쪽 끝을 가로로 늘리므로
+            # 인물에 적용하면 몸이 옆으로 퍼지고 다리 비율이 무너진다.
+            # 사람이 주인공인 사진에서는 건드리지 않는다.
+            subject = str(analysis.get("subjectType") or "")
+            keystone = 0.0 if subject == "인물" else estimate_keystone(img)
+            if abs(keystone) >= 0.02:
+                auto_edits["keystone"] = keystone
+                log.info("analyze-and-transform: keystone %.3f", keystone)
 
-        # 피드 적합도: 모델의 추측이 아니라 대표 사진과의 실제 거리
-        if reference:
-            before = feed_compatibility(measure_image_stats(img), reference)
-            after = feed_compatibility(measure_image_stats(transformed), reference)
-            analysis["feedCompatibility"] = after
-            analysis["feedCompatibilityBefore"] = before
-            log.info("analyze-and-transform: feed compatibility %s → %s", before, after)
+            measured_tilt = detect_tilt_angle(img)
+            if measured_tilt is not None:
+                auto_edits["straighten"] = measured_tilt
+                log.info("analyze-and-transform: measured tilt %.2f°", measured_tilt)
+            elif auto_edits.get("straighten") is not None:
+                # 측정이 확신하지 못하면 모델의 판단을 쓰되 안전 범위로 묶는다
+                try:
+                    llm_tilt = max(-8.0, min(8.0, float(auto_edits["straighten"])))
+                    auto_edits["straighten"] = llm_tilt
+                    measured_tilt = llm_tilt
+                    log.info("analyze-and-transform: using model tilt %.2f°", llm_tilt)
+                except (TypeError, ValueError):
+                    auto_edits["straighten"] = None
+            analysis["autoEdits"] = auto_edits
+            params_comment = prefix_tilt_comment(params_comment, measured_tilt)
+
+            # 6. AI autoEdits 적용 (수평 보정, 크롭, 요소 제거, 인스타 비율)
+            if auto_edits:
+                # 인물은 위아래를 자르지 않는다 (머리·발이 잘려 다리가 짧아 보인다).
+                # 판단을 autoEdits에 적어 둔다 — 앱이 저장·미리보기에서 이 딕셔너리를
+                # 그대로 되돌려 보내므로, 그 경로에서도 같은 결정이 적용된다.
+                # (예전에는 이 플래그가 이 엔드포인트의 인자로만 있어서, 저장할 때
+                #  인물 사진의 세로 크롭이 다시 걸려 머리·발이 잘렸다.)
+                auto_edits["allow_vertical_crop"] = subject != "인물"
+                analysis["autoEdits"] = auto_edits
+                log.info("analyze-and-transform: applying autoEdits=%s", auto_edits)
+                img = apply_auto_edits(img, auto_edits)
+
+            # MediaPipe 캐시를 요청 스코프로 공유 — detect_regions / apply_regional_transforms / apply_all_transforms 간 중복 호출 제거
+            with MediaPipeCache() as mp_cache:
+                # 7. 영역별 스마트 보정 (regionParams가 있으면)
+                region_params_raw = analysis.get("regionParams")
+                if region_params_raw and isinstance(region_params_raw, dict):
+                    # null이 아닌 영역만 필터링
+                    valid_region_params = {
+                        k: v for k, v in region_params_raw.items()
+                        if v is not None and isinstance(v, dict)
+                    }
+                    if valid_region_params:
+                        try:
+                            regions = detect_regions(img, cache=mp_cache)
+                            # 모델이 좌표로 짚은 국소 보정 영역(local_*)은 감지가 아니라
+                            # 기하 정보로 만든다. detect_regions의 하늘/얼굴/배경 위에 얹힌다.
+                            regions.update(build_local_regions(img.size, valid_region_params))
+                            img = apply_regional_transforms(img, regions, valid_region_params, cache=mp_cache)
+                            log.info("analyze-and-transform: applied regional transforms for regions=%s",
+                                     list(valid_region_params.keys()))
+                        except Exception as e:
+                            log.warning("analyze-and-transform: regional transforms failed, falling back: %s", e)
+
+                # 8. 슬라이더 변형 적용
+                transformed = apply_all_transforms(img, cache=mp_cache, **params)
+            result_b64 = encode_image_base64(transformed)
+
+            # 피드 적합도: 모델의 추측이 아니라 대표 사진과의 실제 거리
+            if reference:
+                before = feed_compatibility(measure_image_stats(img), reference)
+                after = feed_compatibility(measure_image_stats(transformed), reference)
+                analysis["feedCompatibility"] = after
+                analysis["feedCompatibilityBefore"] = before
+                log.info("analyze-and-transform: feed compatibility %s → %s", before, after)
 
         log.info("analyze-and-transform: success")
         return AnalyzeAndTransformResponse(
@@ -288,7 +301,7 @@ def api_analyze_and_transform(
             params_comment=params_comment,
         )
 
-      except Exception as e:
+    except Exception as e:
         log.exception("analyze-and-transform failed")
         return AnalyzeAndTransformResponse(success=False, error=str(e))
 
@@ -307,29 +320,32 @@ def api_auto_transform(
     try:
         log.info("auto-transform: computing params from analysis")
 
-        # 1. 이미지 디코딩
-        img = decode_base64_image(req.image_base64)
+        # 이 엔드포인트도 같은 파이프라인을 같은 해상도로 돌린다 —
+        # 제한 밖에 두면 여기로 들어온 요청이 메모리 상한을 넘길 수 있다.
+        with _heavy_semaphore:
+            # 1. 이미지 디코딩
+            img = decode_base64_image(req.image_base64)
 
-        # 2. 분석 → 파라미터. 분석 JSON에 recommendedParams가 있으면(옛 형식)
-        #    그대로 쓰고, 없으면 측정 + 프로필로 계산한다.
-        analysis = dict(req.analysis)
-        params_comment = None
-        if not isinstance(analysis.get("recommendedParams"), dict):
-            analysis["recommendedParams"], params_comment = build_params_with_comment(
-                img, req.style_profile, analysis
-            )
-        params = analysis_to_transform_params(analysis)
-        log.info("auto-transform: params=%s", params)
+            # 2. 분석 → 파라미터. 분석 JSON에 recommendedParams가 있으면(옛 형식)
+            #    그대로 쓰고, 없으면 측정 + 프로필로 계산한다.
+            analysis = dict(req.analysis)
+            params_comment = None
+            if not isinstance(analysis.get("recommendedParams"), dict):
+                analysis["recommendedParams"], params_comment = build_params_with_comment(
+                    img, req.style_profile, analysis
+                )
+            params = analysis_to_transform_params(analysis)
+            log.info("auto-transform: params=%s", params)
 
-        # 3. AI autoEdits 적용 (크롭, 요소 제거, 인스타 비율)
-        auto_edits = analysis.get("autoEdits", {})
-        if auto_edits and isinstance(auto_edits, dict):
-            log.info("auto-transform: applying autoEdits=%s", auto_edits)
-            img = apply_auto_edits(img, auto_edits)
+            # 3. AI autoEdits 적용 (크롭, 요소 제거, 인스타 비율)
+            auto_edits = analysis.get("autoEdits", {})
+            if auto_edits and isinstance(auto_edits, dict):
+                log.info("auto-transform: applying autoEdits=%s", auto_edits)
+                img = apply_auto_edits(img, auto_edits)
 
-        # 4. 슬라이더 변형 적용
-        transformed = apply_all_transforms(img, **params)
-        result_b64 = encode_image_base64(transformed)
+            # 4. 슬라이더 변형 적용
+            transformed = apply_all_transforms(img, **params)
+            result_b64 = encode_image_base64(transformed)
 
         log.info("auto-transform: success")
         return AutoTransformResponse(
@@ -387,33 +403,37 @@ def api_apply_transform(
         }
         log.info("apply-transform: params=%s, preview=%s", params, req.preview)
 
-        img = decode_base64_image(req.image_base64)
+        # analyze-and-transform과 같은 제한을 받아야 한다. 저장 경로도 같은
+        # 해상도로 같은 파이프라인(reshape 포함)을 돌려 메모리 피크가 같고,
+        # 슬라이더를 움직이는 동안 미리보기 요청이 연달아 들어온다.
+        with _heavy_semaphore:
+            img = decode_base64_image(req.image_base64)
 
-        # analyze-and-transform과 같은 순서로 재현한다.
-        # 슬라이더만 적용하면 저장본에서 수평·크롭·영역 보정이 사라진다.
-        if req.auto_edits:
-            img = apply_auto_edits(img, req.auto_edits)
+            # analyze-and-transform과 같은 순서로 재현한다.
+            # 슬라이더만 적용하면 저장본에서 수평·크롭·영역 보정이 사라진다.
+            if req.auto_edits:
+                img = apply_auto_edits(img, req.auto_edits)
 
-        with MediaPipeCache() as mp_cache:
-            valid_regions = {
-                k: v for k, v in (req.region_params or {}).items()
-                if isinstance(v, dict)
-            }
-            # 미리보기에서도 영역 보정을 적용한다. 건너뛰면 미리보기와 저장본의
-            # 색이 갈린다 — 비싼 것은 잡티·스무딩뿐이고 그건 preview가 걸러낸다.
-            if valid_regions:
-                try:
-                    regions = detect_regions(img, cache=mp_cache)
-                    regions.update(build_local_regions(img.size, valid_regions))
-                    img = apply_regional_transforms(
-                        img, regions, valid_regions, cache=mp_cache, preview=req.preview
-                    )
-                except Exception as exc:
-                    log.warning("apply-transform: regional transforms failed: %s", exc)
-            transformed = apply_all_transforms(
-                img, preview=req.preview, cache=mp_cache, **params
-            )
-        result_b64 = encode_image_base64(transformed)
+            with MediaPipeCache() as mp_cache:
+                valid_regions = {
+                    k: v for k, v in (req.region_params or {}).items()
+                    if isinstance(v, dict)
+                }
+                # 미리보기에서도 영역 보정을 적용한다. 건너뛰면 미리보기와 저장본의
+                # 색이 갈린다 — 비싼 것은 잡티·스무딩뿐이고 그건 preview가 걸러낸다.
+                if valid_regions:
+                    try:
+                        regions = detect_regions(img, cache=mp_cache)
+                        regions.update(build_local_regions(img.size, valid_regions))
+                        img = apply_regional_transforms(
+                            img, regions, valid_regions, cache=mp_cache, preview=req.preview
+                        )
+                    except Exception as exc:
+                        log.warning("apply-transform: regional transforms failed: %s", exc)
+                transformed = apply_all_transforms(
+                    img, preview=req.preview, cache=mp_cache, **params
+                )
+            result_b64 = encode_image_base64(transformed)
 
         log.info("apply-transform: success")
         return ApplyTransformResponse(

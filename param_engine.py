@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any
 
@@ -261,11 +262,23 @@ _SUBJECT_RECIPES: dict[str, dict[str, Any]] = {
 # 측정에서 나온 교정 성분 하나가 낼 수 있는 최대치
 _CORRECTION_BAND = 0.35
 
-# 쉐도우 바닥 차이(0~1)를 슬라이더 값으로 옮기는 배율. 실측으로 맞췄다.
-_SHADOW_LIFT_GAIN = 4.2
+# 측정분에 레시피 상수를 더한 뒤의 상한. 게인을 곱하기 전에 한 번 더 묶는다.
+_STYLE_BAND = 0.45
 
-# 하이라이트 천장 차이(0~1)를 슬라이더 값으로 옮기는 배율
-_HIGHLIGHT_GAIN = 4.2
+# 쉐도우 바닥 / 하이라이트 천장 차이(0~1)를 슬라이더 값으로 옮기는 배율.
+#
+# 4.2였을 때는 차이가 0.083만 넘으면 밴드(±0.35)에 박혔다. 실제 사진의 차이는
+# 0.01~0.36 범위라, 스윕 1,960건에서 shadows가 78.6%, highlights가 67.9%
+# 상한에 붙었다 — "측정 기반"이라면서 사실상 사진과 무관한 상수였다.
+# 1.5면 차이 0.23까지 비례하므로 대부분의 사진에서 값이 실제로 움직인다.
+_SHADOW_LIFT_GAIN = 1.5
+
+# 하이라이트도 같은 이유로 같은 배율을 쓴다 ([_SHADOW_LIFT_GAIN] 참고)
+_HIGHLIGHT_GAIN = 1.5
+
+# 날아간 화소가 이 비율에 이르면 하이라이트를 끌어내리지 않는다.
+# 눌러도 디테일은 돌아오지 않고 흰색만 회색이 된다.
+_HIGHLIGHT_CLIP_TOLERANCE = 0.12
 
 # 노출은 다른 축보다 좁게 잡는다. 평균 휘도는 장면마다 정당하게 다르다 —
 # 설경·흰 벽 카페·역광은 원래 높고 야경은 원래 낮다. 목표 평균에 억지로
@@ -278,13 +291,38 @@ _EXPOSURE_BAND = 0.20
 # 화이트밸런스 강도 1.0이 실제로 중화하는 비율 (채널 게인 상한 때문에 1은 아니다)
 _AWB_NEUTRALIZE = 0.8
 
+# 캐스트가 완전히 고를 때의 자동 화이트밸런스 세기
+_AWB_BASE = 0.65
+# 캐스트 방향이 사용자 취향과 일치할 때 교정을 덜어내는 비율.
+# 1.0이면 취향과 같은 방향의 캐스트는 아예 건드리지 않는다.
+_AWB_TASTE_RELIEF = 0.85
+
 
 def _clamp(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
+    """범위 안으로 자른다. NaN·무한은 0(보정 없음)으로 본다.
+
+    min/max는 NaN을 만나면 다른 쪽 인자를 그대로 돌려준다 — min(1.0, nan)은 1.0이다.
+    그래서 모델이 NaN을 보내면 값이 버려지는 게 아니라 **최대 보정**이 됐다.
+    실측: {"face_slim": NaN} → 0.5(상한), hslAdjust 전 채널 NaN → 전부 상한.
+    json.loads가 표준 밖의 NaN·Infinity 리터럴을 그대로 받아들이므로 실제로 닿는다.
+    """
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(v):
+        return 0.0
     return round(max(lo, min(hi, v)), 3)
 
 
 def _band(v: float, limit: float = _CORRECTION_BAND) -> float:
-    """측정 기반 교정값을 ±limit로 묶는다."""
+    """측정 기반 교정값을 ±limit로 묶는다. NaN은 0으로 본다 ([_clamp] 참고)."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(v):
+        return 0.0
     return max(-limit, min(limit, v))
 
 
@@ -347,9 +385,6 @@ def build_params_with_comment(
     # 게인: 보정 강도 성향이 전체 세기를 정한다
     gain = _FILTER_GAIN.get(editing.get("filterTendency") or "auto", 0.8)
 
-    # 화이트밸런스 세기는 색온도 계산보다 먼저 정해져야 한다 (아래에서 참조)
-    auto_wb_strength = round(0.65 * stats["cast_uniformity"], 3)
-
     # ── 측정값 ↔ 목표값 차이로 노출계 3형제를 정한다 ──
     if reference:
         # 사용자가 실제로 올리는 사진에서 잰 값. 카테고리 추정보다 정확하다.
@@ -362,6 +397,30 @@ def build_params_with_comment(
         target_contrast = _CONTRAST_TARGETS[_level_index(color_pref.get("contrast"))]
         target_saturation = _SATURATION_TARGETS[_level_index(color_pref.get("saturationTendency"))]
         target_warmth = _TONE_TARGETS.get(color_pref.get("preferredTones") or "neutral", 0.0)
+
+    # ── 자동 화이트밸런스 ──
+    #
+    # 고른 캐스트를 조명 탓으로 보고 중립으로 당긴다. 그런데 "고르다"는 것만으로는
+    # 잘못 잡힌 화이트밸런스와 의도한 빛을 가릴 수 없다. 따뜻한 실내 조명·골든아워·
+    # 촛불·텅스텐은 화면 전체를 고르게 물들이는데, 그게 그 사진의 빛이다.
+    # 사용자가 원하는 방향과 같은 캐스트까지 걷어내면, 장면의 빛을 지운 자리에
+    # temperature로 일반적인 색조를 덧칠하는 셈이 된다 — 두 보정이 서로 싸운다.
+    #
+    # 실측: 따뜻한 조명의 반려동물 사진(cast_uniformity 0.79)에서 auto_wb 0.51이
+    # 걸려 LAB a가 9 내려가고 황금색 털이 회녹색이 됐다. 프로필은 slightly_warm,
+    # 트렌드는 warm_film — 사용자가 원하는 바로 그 방향의 캐스트였다.
+    #
+    # 그래서 캐스트가 목표 방향과 일치하는 만큼 교정을 덜어낸다. 방향이 반대면
+    # (쿨한 사진 + 웜 취향) 그대로 다 교정한다 — 그건 정말 고쳐야 할 캐스트다.
+    #
+    # 색온도 계산이 이 값을 참조하므로 그보다 먼저 정해져야 한다.
+    taste_agreement = 0.0
+    if stats["warmth"] * target_warmth > 0:
+        taste_agreement = min(1.0, abs(stats["warmth"]) / abs(target_warmth))
+    auto_wb_strength = round(
+        _AWB_BASE * stats["cast_uniformity"] * (1.0 - _AWB_TASTE_RELIEF * taste_agreement),
+        3,
+    )
 
     # ── 장면에 따라 기준을 바꾼다 ──
     scene = detect_scene(stats, img)
@@ -391,9 +450,19 @@ def build_params_with_comment(
             return float(subject_recipe[key])
         return float(recipe.get(key, default))
 
-    saturation += float(recipe.get("saturation", 0.0)) + float(subject_recipe.get("saturation", 0.0))
-    temperature += float(recipe.get("temperature", 0.0)) + float(subject_recipe.get("temperature", 0.0))
-    contrast += float(subject_recipe.get("contrast", 0.0))
+    # 레시피 상수를 더한 뒤 스타일 밴드로 다시 묶는다.
+    #
+    # 예전에는 여기서 더한 값에 바로 게인(최대 1.3)을 곱했다. 트렌드와 피사체
+    # 레시피가 같은 방향이면 상수만 0.47까지 쌓이고, 측정분 0.35가 더해진 뒤
+    # 1.3배가 되어 temperature가 1.0에 박혔다 — 사진이 통째로 오렌지가 된다.
+    # 실측: (fog, golden_hour, 음식, very_strong) → temperature +1.000.
+    saturation = _band(
+        saturation + float(recipe.get("saturation", 0.0))
+        + float(subject_recipe.get("saturation", 0.0)), _STYLE_BAND)
+    temperature = _band(
+        temperature + float(recipe.get("temperature", 0.0))
+        + float(subject_recipe.get("temperature", 0.0)), _STYLE_BAND)
+    contrast = _band(contrast + float(subject_recipe.get("contrast", 0.0)), _STYLE_BAND)
 
     # 쉐도우는 "무조건 들어올린다"가 아니라 "바닥이 목표보다 낮으면 올린다"다.
     # 트렌드 상수(+0.15~0.35)를 모든 사진에 붙이면, 이미 어두운 끝이 열려 있는
@@ -414,6 +483,19 @@ def build_params_with_comment(
     highlights = _band(
         (target_ceiling - stats["highlight_p95"]) * _HIGHLIGHT_GAIN
     )
+    # 밝은 끝을 끌어내리는 방향은 조심해야 한다. 이미 255에 붙은 화소는 눌러도
+    # 디테일이 돌아오지 않고 흰색이 회색이 될 뿐이다 (아래 주석에 남아 있는,
+    # 클리핑 보너스를 제거한 이유와 같다).
+    #
+    # 게다가 흰 배경 스튜디오 사진·하늘·흰 옷처럼 "원래 흰" 영역이 넓으면
+    # p95는 노출과 무관하게 1.0으로 측정된다. 그러면 천장 목표를 좇는 것 자체가
+    # 틀린 판단이 된다 — 흰 배경을 회색으로 만들라는 지시가 되어 버린다.
+    #
+    # 실측: 흰 배경 인물 사진(p95 1.0, 날아간 화소 38%)에서 highlights -0.46이
+    # 걸려 배경이 탁한 갈색이 됐다. 날아간 비율만큼 이 방향을 덜어낸다.
+    if highlights < 0 and stats["highlight_clip"] > 0:
+        keep = max(0.0, 1.0 - stats["highlight_clip"] / _HIGHLIGHT_CLIP_TOLERANCE)
+        highlights = round(highlights * keep, 3)
 
     if scene["backlit"]:
         # 역광: 피사체가 실루엣으로 남는다. 쉐도우를 크게 들어올리고
@@ -504,6 +586,21 @@ def build_params_with_comment(
     split = recipe.get("split") or {}
     shadow_hue, shadow_str = split.get("shadow", (0, 0.0))
     hi_hue, hi_str = split.get("highlight", (0, 0.0))
+
+    # 사용자가 "보정 없음"을 골랐으면 정말로 아무것도 하지 않는다.
+    #
+    # 게인이 0이면 취향 기반 값들은 전부 0이 되지만, "촬영 결함 교정은 취향과
+    # 무관하다"는 이유로 게인을 곱하지 않는 항목들(auto_wb·denoise·잡티·스무딩)은
+    # 그대로 남아 있었다. 실측: filterTendency="none" 392건 중 350건이 사진을
+    # 바꿨고, 야간 인물에서는 denoise 1.0 + skin_smoothing 0.45 + 잡티 0.54가
+    # 걸려 피부와 천 질감이 전부 사라졌다. 그런데 설명문은 "보정 없음 설정이라
+    # 원본 톤을 그대로 두었어요"라고 말하고 있었다.
+    if gain <= 0.0:
+        auto_wb_strength = 0.0
+        denoise_strength = 0.0
+        blemish = 0.0
+        skin_smoothing = 0.0
+        dehaze = 0.0
 
     params: dict[str, Any] = {
         # 게인이 걸리는 항목 — 보정 강도 성향에 비례해 세진다
