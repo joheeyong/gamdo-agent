@@ -7,6 +7,7 @@ import logging
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import RedirectResponse
 
 import httpx
@@ -31,7 +32,9 @@ from models import (
     TransformPhotoResponse,
 )
 from claude_client import analyze_user, get_reference_image_paths, transform_photo
+from param_engine import build_params_with_comment, measure_color_analysis
 from image_processor import (
+    MediaPipeCache,
     analysis_to_transform_params,
     apply_all_transforms,
     apply_auto_edits,
@@ -54,6 +57,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# GZip 압축: 500바이트 이상 응답을 자동 gzip 압축
+# CORSMiddleware 뒤에 추가하여 CORS 헤더가 먼저 설정된 후 압축 적용
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 APP_TOKEN = os.getenv("APP_TOKEN", "")
 INSTAGRAM_CLIENT_ID = os.getenv("INSTAGRAM_CLIENT_ID", "")
@@ -152,38 +159,53 @@ def api_analyze_and_transform(
         )
         log.info("analyze-and-transform: analysis complete")
 
-        # 2. 분석 결과에서 파라미터 추출
-        params = analysis_to_transform_params(analysis)
-        log.info("analyze-and-transform: params=%s", params)
-
-        # 3. 이미지 디코딩
+        # 2. 이미지 디코딩
         img = decode_base64_image(req.image_base64)
 
-        # 4. AI autoEdits 적용 (크롭, 요소 제거, 인스타 비율)
+        # 3. 색 분석 중 측정 가능한 값은 실제 픽셀에서 계산해 덮어쓴다.
+        #    모델이 hex를 눈대중하는 것보다 k-means가 정확하다.
+        color_analysis = analysis.get("colorAnalysis")
+        if not isinstance(color_analysis, dict):
+            color_analysis = {}
+            analysis["colorAnalysis"] = color_analysis
+        color_analysis.update(measure_color_analysis(img))
+
+        # 4. 보정 파라미터: 히스토그램 측정 + 스타일 프로필 규칙으로 산출.
+        #    왜 그 값이 나왔는지 설명도 함께 만든다 (모델 호출 없음).
+        analysis["recommendedParams"], params_comment = build_params_with_comment(
+            img, req.style_profile, analysis
+        )
+        params = analysis_to_transform_params(analysis)
+        log.info("analyze-and-transform: params=%s", params)
+        log.info("analyze-and-transform: comment=%s", params_comment)
+
+        # 5. AI autoEdits 적용 (크롭, 요소 제거, 인스타 비율)
         auto_edits = analysis.get("autoEdits", {})
         if auto_edits and isinstance(auto_edits, dict):
             log.info("analyze-and-transform: applying autoEdits=%s", auto_edits)
             img = apply_auto_edits(img, auto_edits)
 
-        # 5. 영역별 스마트 보정 (regionParams가 있으면)
-        region_params_raw = analysis.get("regionParams")
-        if region_params_raw and isinstance(region_params_raw, dict):
-            # null이 아닌 영역만 필터링
-            valid_region_params = {
-                k: v for k, v in region_params_raw.items()
-                if v is not None and isinstance(v, dict)
-            }
-            if valid_region_params:
-                try:
-                    regions = detect_regions(img)
-                    img = apply_regional_transforms(img, regions, valid_region_params)
-                    log.info("analyze-and-transform: applied regional transforms for regions=%s",
-                             list(valid_region_params.keys()))
-                except Exception as e:
-                    log.warning("analyze-and-transform: regional transforms failed, falling back: %s", e)
+        # MediaPipe 캐시를 요청 스코프로 공유 — detect_regions / apply_regional_transforms / apply_all_transforms 간 중복 호출 제거
+        with MediaPipeCache() as mp_cache:
+            # 6. 영역별 스마트 보정 (regionParams가 있으면)
+            region_params_raw = analysis.get("regionParams")
+            if region_params_raw and isinstance(region_params_raw, dict):
+                # null이 아닌 영역만 필터링
+                valid_region_params = {
+                    k: v for k, v in region_params_raw.items()
+                    if v is not None and isinstance(v, dict)
+                }
+                if valid_region_params:
+                    try:
+                        regions = detect_regions(img, cache=mp_cache)
+                        img = apply_regional_transforms(img, regions, valid_region_params, cache=mp_cache)
+                        log.info("analyze-and-transform: applied regional transforms for regions=%s",
+                                 list(valid_region_params.keys()))
+                    except Exception as e:
+                        log.warning("analyze-and-transform: regional transforms failed, falling back: %s", e)
 
-        # 6. 슬라이더 변형 적용
-        transformed = apply_all_transforms(img, **params)
+            # 7. 슬라이더 변형 적용
+            transformed = apply_all_transforms(img, cache=mp_cache, **params)
         result_b64 = encode_image_base64(transformed)
 
         log.info("analyze-and-transform: success")
@@ -192,6 +214,7 @@ def api_analyze_and_transform(
             analysis=analysis,
             image_base64=result_b64,
             params=params,
+            params_comment=params_comment,
         )
 
     except Exception as e:
@@ -213,15 +236,22 @@ def api_auto_transform(
     try:
         log.info("auto-transform: computing params from analysis")
 
-        # 1. 분석 → 파라미터 자동 계산
-        params = analysis_to_transform_params(req.analysis)
-        log.info("auto-transform: params=%s", params)
-
-        # 2. 이미지 디코딩
+        # 1. 이미지 디코딩
         img = decode_base64_image(req.image_base64)
 
+        # 2. 분석 → 파라미터. 분석 JSON에 recommendedParams가 있으면(옛 형식)
+        #    그대로 쓰고, 없으면 측정 + 프로필로 계산한다.
+        analysis = dict(req.analysis)
+        params_comment = None
+        if not isinstance(analysis.get("recommendedParams"), dict):
+            analysis["recommendedParams"], params_comment = build_params_with_comment(
+                img, req.style_profile, analysis
+            )
+        params = analysis_to_transform_params(analysis)
+        log.info("auto-transform: params=%s", params)
+
         # 3. AI autoEdits 적용 (크롭, 요소 제거, 인스타 비율)
-        auto_edits = req.analysis.get("autoEdits", {})
+        auto_edits = analysis.get("autoEdits", {})
         if auto_edits and isinstance(auto_edits, dict):
             log.info("auto-transform: applying autoEdits=%s", auto_edits)
             img = apply_auto_edits(img, auto_edits)
@@ -235,6 +265,7 @@ def api_auto_transform(
             success=True,
             image_base64=result_b64,
             params=params,
+            params_comment=params_comment,
         )
 
     except Exception as e:
@@ -279,10 +310,10 @@ def api_apply_transform(
             "shoulder_width": req.shoulder_width,
             "waist_slim": req.waist_slim,
         }
-        log.info("apply-transform: params=%s", params)
+        log.info("apply-transform: params=%s, preview=%s", params, req.preview)
 
         img = decode_base64_image(req.image_base64)
-        transformed = apply_all_transforms(img, **params)
+        transformed = apply_all_transforms(img, preview=req.preview, **params)
         result_b64 = encode_image_base64(transformed)
 
         log.info("apply-transform: success")

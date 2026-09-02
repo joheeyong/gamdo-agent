@@ -92,6 +92,7 @@ class AnalyzeAndTransformResponse(BaseModel):
     analysis: dict | None = None
     image_base64: str | None = None
     params: dict | None = None
+    params_comment: str | None = Field(None, description="적용된 변형 요약 한 문장")
     error: str | None = None
 
 
@@ -108,12 +109,14 @@ class AutoTransformResponse(BaseModel):
     success: bool
     image_base64: str | None = None
     params: dict | None = None
+    params_comment: str | None = Field(None, description="적용된 변형 요약 한 문장")
     error: str | None = None
 
 
 class ApplyTransformRequest(BaseModel):
     """슬라이더 값으로 수동 변형 요청."""
     image_base64: str = Field(..., description="원본 이미지 (base64)")
+    preview: bool = Field(False, description="True이면 미리보기 모드 (색감 보정만, reshape/blemish 스킵)")
     brightness: float = Field(0.0, ge=-1.0, le=1.0)
     contrast: float = Field(0.0, ge=-1.0, le=1.0)
     clarity: float = Field(0.0, ge=-1.0, le=1.0, description="선명감 (미드톤 로컬 대비)")
