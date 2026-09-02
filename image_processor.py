@@ -1491,10 +1491,15 @@ def apply_smart_crop(img: Image.Image, crop: dict) -> Image.Image:
         return img
 
 
-def apply_instagram_ratio(img: Image.Image, ratio: str) -> Image.Image:
+def apply_instagram_ratio(
+    img: Image.Image, ratio: str, allow_vertical_crop: bool = True
+) -> Image.Image:
     """인스타그램 최적 비율로 중앙 크롭한다.
 
     ratio: "4:5" (피드 최적) 또는 "1:1" (정사각형)
+
+    allow_vertical_crop=False면 위아래를 자르지 않는다. 전신 인물 사진에서
+    가운데를 기준으로 위아래를 자르면 머리와 발이 잘려 다리가 짧아 보인다.
     """
     try:
         w, h = img.size
@@ -1516,6 +1521,8 @@ def apply_instagram_ratio(img: Image.Image, ratio: str) -> Image.Image:
             return img.crop((left, 0, left + new_w, h))
         else:
             # 세로가 더 길음 → 상하 크롭
+            if not allow_vertical_crop:
+                return img
             new_h = int(w / target)
             top = (h - new_h) // 2
             return img.crop((0, top, w, top + new_h))
@@ -1645,7 +1652,9 @@ def apply_straighten(img: Image.Image, angle: float) -> Image.Image:
         return img
 
 
-def apply_auto_edits(img: Image.Image, auto_edits: dict) -> Image.Image:
+def apply_auto_edits(
+    img: Image.Image, auto_edits: dict, allow_vertical_crop: bool = True
+) -> Image.Image:
     """AI autoEdits를 순서대로 적용한다.
 
     순서: 원근 보정 → 수평 보정 → 불필요 요소 제거 → 스마트 크롭 → 인스타 비율
@@ -1681,7 +1690,7 @@ def apply_auto_edits(img: Image.Image, auto_edits: dict) -> Image.Image:
     # 3. 인스타그램 비율 크롭
     ig_ratio = auto_edits.get("instagram_ratio")
     if ig_ratio and isinstance(ig_ratio, str):
-        img = apply_instagram_ratio(img, ig_ratio)
+        img = apply_instagram_ratio(img, ig_ratio, allow_vertical_crop)
 
     return img
 
@@ -1748,6 +1757,76 @@ def detect_regions(
     }
 
 
+# ── 영역별 보정 블렌딩 ──
+
+# 톤을 바꾸는 파라미터. 이웃 영역과 값이 벌어지면 경계가 그대로 드러난다.
+_REGION_TONE_PARAMS = (
+    "brightness", "contrast", "saturation", "temperature", "highlights", "shadows",
+)
+
+# 얼굴 톤 보정의 상한. 모델은 -1.0~1.0을 주지만 얼굴 마스크는 목·귀·머리카락을
+# 포함하지 않으므로, 이 범위를 넘겨 밝히면 페더를 아무리 넓혀도 얼굴만
+# 오려 붙인 것처럼 겉돈다. 전체 보정으로 올릴 몫은 슬라이더 쪽에 있다.
+_FACE_TONE_LIMIT = 0.18
+
+# 영역 합성 우선순위 (작을수록 위). background는 하늘도 얼굴도 아닌 여집합이라
+# 항상 맨 아래여야 한다. 얼굴은 페더가 밖으로 뻗으므로 맨 위에 얹는다.
+_REGION_PRIORITY = {"face": 0, "sky": 1, "background": 2}
+
+# 얼굴 마스크를 알파로 풀 때의 페더 크기 (영역 등가 반지름 대비).
+# 얼굴 크기에 비례해야 작게 찍힌 얼굴도 같은 정도로 부드러워진다.
+_FACE_FEATHER_SIGMA = 0.12
+# 블러 전에 마스크를 밖으로 넓히는 양 (sigma 대비).
+# 넓히지 않고 그냥 블러하면 얼굴 테두리의 알파가 깎여, 얼굴 한가운데만
+# 톤이 살고 윤곽은 원본으로 남는다.
+_FACE_FEATHER_GROW = 2.0
+
+
+def _soften_region_mask(mask: np.ndarray, region_name: str) -> np.ndarray:
+    """영역 마스크(0/255)를 블렌딩용 알파(0.0~1.0)로 바꾼다.
+
+    얼굴은 턱선·헤어라인이 실제 경계가 아니라 마스크의 끝일 뿐이므로,
+    마스크를 밖으로 넓힌 뒤 얼굴 크기에 비례해 길게 푼다. 그래야 톤이
+    목·귀까지 이어져 얼굴만 밝은 타원으로 보이지 않는다.
+
+    하늘·배경은 지평선처럼 실제 경계를 따르므로 좁게 유지한다.
+    넓게 풀면 건물이나 인물 윤곽에 후광이 생긴다.
+    """
+    if region_name != "face":
+        blur_size = max(21, int(min(mask.shape[:2]) * 0.03)) | 1
+        return cv2.GaussianBlur(mask, (blur_size, blur_size), 0).astype(np.float32) / 255.0
+
+    # 여러 명이 찍힌 사진에서 마스크 전체 면적을 쓰면 얼굴 수만큼 페더가
+    # 커진다. 가장 큰 얼굴 하나의 크기를 기준으로 삼는다.
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    area = float(stats[1:, cv2.CC_STAT_AREA].max()) if count > 1 else 0.0
+    radius = max(8.0, float(np.sqrt(area / np.pi)))
+    sigma = max(4.0, radius * _FACE_FEATHER_SIGMA)
+    grow = max(1, int(sigma * _FACE_FEATHER_GROW))
+
+    # 얼굴이 크면 넓히기·풀기 모두 원본 해상도에서 비싸다 (1400px 얼굴에서 0.7초).
+    # 램프는 부드러운 저주파라 축소해서 만들고 되돌려도 눈에 차이가 없다.
+    shrink = min(1.0, 8.0 / sigma)
+    work = mask
+    if shrink < 1.0:
+        work = cv2.resize(mask, None, fx=shrink, fy=shrink,
+                          interpolation=cv2.INTER_AREA)
+        sigma *= shrink
+        grow = max(1, int(grow * shrink))
+
+    work = cv2.dilate(
+        work,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow * 2 + 1,) * 2),
+    )
+    ksize = int(sigma * 6) | 1
+    work = cv2.GaussianBlur(work, (ksize, ksize), sigma)
+
+    if work.shape[:2] != mask.shape[:2]:
+        work = cv2.resize(work, (mask.shape[1], mask.shape[0]),
+                          interpolation=cv2.INTER_LINEAR)
+    return work.astype(np.float32) / 255.0
+
+
 def apply_regional_transforms(
     img: Image.Image,
     regions: dict[str, np.ndarray],
@@ -1767,9 +1846,6 @@ def apply_regional_transforms(
     """
     arr_rgb = np.array(img, dtype=np.float32)
 
-    # 영역별 변형 적용 후 블렌딩
-    result = arr_rgb.copy()
-
     # 사용 가능한 변형 함수 맵
     # blemish_removal은 cache를 전달해야 하므로 lambda로 래핑
     transform_funcs: dict[str, Any] = {
@@ -1784,6 +1860,9 @@ def apply_regional_transforms(
         "sharpness": apply_sharpness,
     }
 
+    # 영역별 결과와 알파를 먼저 모은다 — 순서대로 덧칠하면 안 된다.
+    layers: list[tuple[np.ndarray, np.ndarray]] = []
+
     for region_name, params in region_params.items():
         if not params or region_name not in regions:
             continue
@@ -1794,20 +1873,49 @@ def apply_regional_transforms(
 
         # 이 영역에 해당하는 변형을 순서대로 적용
         region_img = img.copy()
+        applied = False
         for param_name, value in params.items():
+            value = float(value)
+            if region_name == "face" and param_name in _REGION_TONE_PARAMS:
+                limited = float(np.clip(value, -_FACE_TONE_LIMIT, _FACE_TONE_LIMIT))
+                if limited != value:
+                    log.info("regional: face %s %.2f → %.2f (톤 상한)",
+                             param_name, value, limited)
+                    value = limited
             if abs(value) < 0.01:
                 continue
             func = transform_funcs.get(param_name)
             if func is not None:
                 region_img = func(region_img, value)
+                applied = True
 
-        # 마스크 경계를 가우시안 블러로 부드럽게
-        blur_size = max(21, int(min(mask.shape) * 0.03)) | 1
-        soft_mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
-        alpha = (soft_mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
+        if not applied:
+            continue
 
-        region_arr = np.array(region_img, dtype=np.float32)
-        result = result * (1.0 - alpha) + region_arr * alpha
+        layers.append((
+            region_name,
+            np.array(region_img, dtype=np.float32),
+            _soften_region_mask(mask, region_name),
+        ))
+
+    if not layers:
+        return img
+
+    # 우선순위 순으로 알파 합성한다. 앞선 영역이 덮은 만큼만 뒤 영역에 남긴다.
+    #
+    # 예전에는 영역을 차례로 덧칠했다. 각 영역을 매번 원본에서 새로 계산하니
+    # 나중 영역이 앞선 영역의 보정을 경계에서 원본으로 되돌려 놓았다.
+    # 게다가 background 마스크는 얼굴의 여집합이라 얼굴 바로 밖에서 알파가
+    # 1.0이었고, 얼굴 페더를 얼마나 넓혀도 경계에서 배경 보정이 이겼다.
+    # face를 먼저 얹어야 얼굴 톤이 목·귀 쪽으로 실제로 번져 나간다.
+    layers.sort(key=lambda item: _REGION_PRIORITY.get(item[0], 1))
+
+    result = arr_rgb.copy()
+    remaining = np.ones(arr_rgb.shape[:2], dtype=np.float32)
+    for _, region_arr, alpha in layers:
+        weight = (alpha * remaining)[:, :, np.newaxis]
+        result += (region_arr - arr_rgb) * weight
+        remaining *= 1.0 - alpha
 
     return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8))
 

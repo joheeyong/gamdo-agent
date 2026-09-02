@@ -277,7 +277,7 @@ TRANSFORM_PHOTO_PROMPT = """\
   }} | null,
   "regionParams": {{
     "sky": {{ "brightness": -1.0~1.0, "saturation": -1.0~1.0, "temperature": -1.0~1.0 }},
-    "face": {{ "brightness": -1.0~1.0, "blemish_removal": 0.0~1.0, "skin_smoothing": 0.0~1.0 }},
+    "face": {{ "brightness": -0.18~0.18, "blemish_removal": 0.0~1.0, "skin_smoothing": 0.0~1.0 }},
     "background": {{ "brightness": -1.0~1.0, "contrast": -1.0~1.0, "saturation": -1.0~1.0 }}
   }}
 }}
@@ -290,6 +290,10 @@ regionParams 설명:
 - face: 얼굴/피부 영역. 인물 사진에서 피부톤을 자연스럽게 보정.
   * 인물이 없으면 null로 두세요.
   * 피부톤 보호가 핵심: 오렌지/옐로우 톤 유지, 부드러운 보정.
+  * brightness는 -0.18~0.18만 쓰세요. 마스크가 얼굴까지만이라 목·귀는 원본
+    그대로 남습니다. 이보다 크게 밝히면 얼굴만 오려 붙인 것처럼 겉돕니다.
+    얼굴이 전체적으로 어두우면 영역 보정이 아니라 전체 brightness/shadows로
+    올리세요. (0.18을 넘겨 보내면 서버가 잘라냅니다.)
 - background: 하늘도 얼굴도 아닌 나머지 배경 영역.
   * 배경에 전체 보정과 다른 값이 필요할 때만 지정.
   * 특별히 다를 필요 없으면 null로 두세요.

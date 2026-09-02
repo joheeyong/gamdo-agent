@@ -189,7 +189,8 @@ def api_analyze_and_transform(
         # 보정 파라미터: 히스토그램 측정 + 목표값으로 산출.
         # 왜 그 값이 나왔는지 설명도 함께 만든다 (모델 호출 없음).
         analysis["recommendedParams"], params_comment = build_params_with_comment(
-            img, req.style_profile, analysis, reference=reference
+            img, req.style_profile, analysis,
+            reference=reference, reshape_enabled=req.reshape_enabled,
         )
         params = analysis_to_transform_params(analysis)
         log.info("analyze-and-transform: params=%s", params)
@@ -201,8 +202,11 @@ def api_analyze_and_transform(
         auto_edits = analysis.get("autoEdits")
         if not isinstance(auto_edits, dict):
             auto_edits = {}
-        # 수직 원근(키스톤)도 잰다 — 건물·카페를 아래에서 찍으면 위가 좁아진다
-        keystone = estimate_keystone(img)
+        # 수직 원근(키스톤)은 건축물용 변형이다. 한쪽 끝을 가로로 늘리므로
+        # 인물에 적용하면 몸이 옆으로 퍼지고 다리 비율이 무너진다.
+        # 사람이 주인공인 사진에서는 건드리지 않는다.
+        subject = str(analysis.get("subjectType") or "")
+        keystone = 0.0 if subject == "인물" else estimate_keystone(img)
         if abs(keystone) >= 0.02:
             auto_edits["keystone"] = keystone
             log.info("analyze-and-transform: keystone %.3f", keystone)
@@ -226,7 +230,10 @@ def api_analyze_and_transform(
         # 6. AI autoEdits 적용 (수평 보정, 크롭, 요소 제거, 인스타 비율)
         if auto_edits:
             log.info("analyze-and-transform: applying autoEdits=%s", auto_edits)
-            img = apply_auto_edits(img, auto_edits)
+            # 인물은 위아래를 자르지 않는다 (머리·발이 잘려 다리가 짧아 보인다)
+            img = apply_auto_edits(
+                img, auto_edits, allow_vertical_crop=(subject != "인물")
+            )
 
         # MediaPipe 캐시를 요청 스코프로 공유 — detect_regions / apply_regional_transforms / apply_all_transforms 간 중복 호출 제거
         with MediaPipeCache() as mp_cache:

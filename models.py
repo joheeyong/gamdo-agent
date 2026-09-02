@@ -85,6 +85,9 @@ class AnalyzeAndTransformRequest(BaseModel):
     style_profile: dict = Field(default_factory=dict, description="사용자 스타일 프로필")
     user_id: str = Field("", description="사용자 ID (대표 사진 레퍼런스 조회용)")
     media_type: str = "image/jpeg"
+    # 앱의 '얼굴/체형 보정' 토글. 기본은 꺼짐 — 몸을 건드리는 변형은
+    # 사용자가 명시적으로 켰을 때만 한다.
+    reshape_enabled: bool = Field(False, description="얼굴/체형 보정 허용 여부")
 
 
 class AnalyzeAndTransformResponse(BaseModel):

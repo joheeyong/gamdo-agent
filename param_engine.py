@@ -299,9 +299,12 @@ def build_recommended_params(
     style_profile: dict[str, Any] | None,
     analysis: dict[str, Any] | None = None,
     reference: dict[str, Any] | None = None,
+    reshape_enabled: bool = False,
 ) -> dict[str, Any]:
     """[build_params_with_comment]에서 파라미터만 꺼내는 단축 함수."""
-    params, _ = build_params_with_comment(img, style_profile, analysis, reference)
+    params, _ = build_params_with_comment(
+        img, style_profile, analysis, reference, reshape_enabled
+    )
     return params
 
 
@@ -310,6 +313,7 @@ def build_params_with_comment(
     style_profile: dict[str, Any] | None,
     analysis: dict[str, Any] | None = None,
     reference: dict[str, Any] | None = None,
+    reshape_enabled: bool = False,
 ) -> tuple[dict[str, Any], str]:
     """측정값 + 프로필 + 모델의 스타일 방향으로 recommendedParams와 설명을 만든다.
 
@@ -521,7 +525,9 @@ def build_params_with_comment(
         legacy = analysis.get("recommendedParams")
         if isinstance(legacy, dict):
             reshape = legacy.get("reshapeParams")
-    if isinstance(reshape, dict) and is_portrait:
+    # 몸의 비율을 바꾸는 변형은 사용자가 설정에서 켰을 때만 한다.
+    # 토글이 앱에만 저장되고 서버로 오지 않아, 꺼 둔 사람도 체형이 변형됐다.
+    if isinstance(reshape, dict) and is_portrait and reshape_enabled:
         params["reshapeParams"] = _clamp_reshape(reshape)
 
     log.info(
