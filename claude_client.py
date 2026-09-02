@@ -1,11 +1,15 @@
 """Claude Code CLI(claude -p)를 사용한 분석 클라이언트 — 이미지 Vision 지원."""
 
 import base64
+import copy
+import hashlib
 import json
+import logging
 import os
 import subprocess
 import tempfile
-import logging
+import time
+from collections import OrderedDict
 from typing import Any
 
 from PIL import Image
@@ -644,6 +648,45 @@ def get_reference_image_paths(user_id: str) -> list[str]:
     return paths
 
 
+# ── 분석 결과 캐시 ──
+#
+# 분석 한 번이 30~70초, $0.07이다. 그런데 앱이 백그라운드로 가면 소켓이
+# 끊기고, 사용자는 같은 사진으로 다시 시도한다. 캐시가 없으면 서버는 이미
+# 끝낸 일을 처음부터 다시 하고 요금도 두 번 낸다 (FastAPI 동기 엔드포인트는
+# 클라이언트가 끊겨도 끝까지 실행되므로, 첫 요청의 결과는 이미 나와 있다).
+_ANALYSIS_CACHE_MAX = 32
+_ANALYSIS_CACHE_TTL = 60 * 30  # 30분
+_analysis_cache: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+
+
+def _analysis_cache_key(image_base64: str, style_profile: dict, user_id: str) -> str:
+    """같은 사진 + 같은 프로필 + 같은 사용자면 같은 결과가 나온다."""
+    h = hashlib.sha256()
+    h.update(image_base64.encode())
+    h.update(json.dumps(style_profile, sort_keys=True, ensure_ascii=False).encode())
+    h.update(user_id.encode())
+    return h.hexdigest()
+
+
+def _analysis_cache_get(key: str) -> dict | None:
+    entry = _analysis_cache.get(key)
+    if entry is None:
+        return None
+    stored_at, value = entry
+    if time.time() - stored_at > _ANALYSIS_CACHE_TTL:
+        _analysis_cache.pop(key, None)
+        return None
+    _analysis_cache.move_to_end(key)
+    return copy.deepcopy(value)
+
+
+def _analysis_cache_put(key: str, value: dict) -> None:
+    _analysis_cache[key] = (time.time(), copy.deepcopy(value))
+    _analysis_cache.move_to_end(key)
+    while len(_analysis_cache) > _ANALYSIS_CACHE_MAX:
+        _analysis_cache.popitem(last=False)
+
+
 def transform_photo(
     style_profile: dict,
     image_base64: str,
@@ -656,6 +699,12 @@ def transform_photo(
     새 사진 + 대표 사진을 하나의 합성 이미지로 만들어 Read 1회로 분석한다.
     (기존: 파일 4개를 각각 Read → API 왕복 4~5회 → 합성 이미지 1회로 단축)
     """
+    cache_key = _analysis_cache_key(image_base64, style_profile or {}, user_id)
+    cached = _analysis_cache_get(cache_key)
+    if cached is not None:
+        log.info("transform_photo: 캐시 적중 — 모델 호출 건너뜀 (%s)", cache_key[:12])
+        return cached
+
     temp_files: list[str] = []
 
     try:
@@ -721,6 +770,7 @@ def transform_photo(
             _apply_analysis_fallbacks(parsed, problems)
             parsed["warnings"] = [f"분석 필드 누락: {', '.join(problems)}"]
 
+        _analysis_cache_put(cache_key, parsed)
         return parsed
     finally:
         _cleanup_files(temp_files)
