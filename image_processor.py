@@ -415,6 +415,176 @@ def apply_auto_white_balance(img: Image.Image, strength: float) -> Image.Image:
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
 
+def estimate_keystone(img: Image.Image, max_correction: float = 0.35) -> float:
+    """수직 원근 왜곡(키스톤)의 세기를 추정한다. -1~1, 확신 없으면 0.
+
+    건물을 아래에서 올려다보면 위쪽이 좁아진다. 화면 좌우의 "수직에 가까운"
+    선들이 위로 갈수록 서로 모이는지를 보고 그 정도를 잰다.
+    양수면 위가 좁다(올려다봄), 음수면 아래가 좁다(내려다봄).
+    """
+    gray = np.asarray(img.convert("L"), dtype=np.uint8)
+    h, w = gray.shape
+    if max(h, w) > 900:
+        scale = 900 / max(h, w)
+        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        h, w = gray.shape
+
+    edges = cv2.Canny(gray, 60, 180, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 720, threshold=60,
+                            minLineLength=int(h * 0.30),
+                            maxLineGap=int(h * 0.02) + 2)
+    if lines is None:
+        return 0.0
+
+    left_tilt: list[tuple[float, float]] = []   # (기울기, 길이)
+    right_tilt: list[tuple[float, float]] = []
+
+    for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
+        dx, dy = float(x2 - x1), float(y2 - y1)
+        length = float(np.hypot(dx, dy))
+        if abs(dy) < 1e-3:
+            continue
+        angle = abs(np.degrees(np.arctan2(dy, dx)))
+        # 수직에서 1.2~25도 벗어난 선만 — 완전한 수직은 왜곡 정보가 없고,
+        # 많이 기운 선은 지붕·계단 같은 진짜 사선이다.
+        if not (1.2 <= abs(angle - 90.0) <= 25.0):
+            continue
+        # 위로 갈수록 안쪽으로 기우는 정도 (x가 y에 대해 변하는 비율)
+        slope = dx / dy
+        cx = (x1 + x2) / 2.0
+        (left_tilt if cx < w / 2 else right_tilt).append((slope, length))
+
+    if len(left_tilt) < 2 or len(right_tilt) < 2:
+        return 0.0
+
+    def weighted_mean(items: list[tuple[float, float]]) -> float:
+        vals = np.array([v for v, _ in items])
+        wts = np.array([wt for _, wt in items])
+        return float((vals * wts).sum() / wts.sum())
+
+    left_slope = weighted_mean(left_tilt)
+    right_slope = weighted_mean(right_tilt)
+
+    # 위가 좁으면 왼쪽 선은 오른쪽으로, 오른쪽 선은 왼쪽으로 기운다.
+    convergence = (right_slope - left_slope) / 2.0
+
+    # 기울기(dx/dy)를 [apply_keystone]이 쓰는 단위로 바꾼다.
+    # 한 변이 전체 높이에 걸쳐 convergence*h 만큼 안으로 들어오므로,
+    # 좁아진 쪽을 그만큼 넓히려면 폭 대비 2*convergence*h/w 가 필요하다.
+    amount = 2.0 * convergence * h / w
+    if abs(amount) < 0.02:
+        return 0.0
+
+    return round(float(np.clip(amount, -max_correction, max_correction)), 3)
+
+
+def apply_keystone(img: Image.Image, amount: float) -> Image.Image:
+    """수직 원근을 편다. amount는 [estimate_keystone]의 반환값.
+
+    위쪽(또는 아래쪽) 변을 늘려 좌우 수직선을 평행하게 만든 뒤,
+    회전 보정과 같이 검은 여백 없이 내접 영역만 남긴다.
+    """
+    if abs(amount) < 0.02:
+        return img
+
+    amount = float(np.clip(amount, -0.35, 0.35))
+    arr = np.asarray(img.convert("RGB"))
+    h, w = arr.shape[:2]
+
+    # 좁아진 쪽 변을 그만큼 넓힌다
+    shift = abs(amount) * w * 0.5
+    if amount > 0:      # 위가 좁다 → 위를 넓힌다
+        src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+        dst = np.float32([[-shift, 0], [w + shift, 0], [w, h], [0, h]])
+    else:               # 아래가 좁다 → 아래를 넓힌다
+        src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+        dst = np.float32([[0, 0], [w, 0], [w + shift, h], [-shift, h]])
+
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    out_w = int(w + 2 * shift)
+    matrix[0, 2] += shift
+    warped = cv2.warpPerspective(
+        arr, matrix, (out_w, h),
+        flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE,
+    )
+
+    # 넓힌 만큼 가장자리는 늘어난 화소라 잘라낸다
+    crop = int(shift)
+    if out_w - 2 * crop < 50:
+        return img
+    result = warped[:, crop:out_w - crop]
+
+    log.info("keystone: amount=%.3f, %dx%d → %dx%d", amount, w, h,
+             result.shape[1], result.shape[0])
+    return Image.fromarray(result)
+
+
+def apply_background_blur(
+    img: Image.Image,
+    strength: float,
+    cache: "MediaPipeCache | None" = None,
+) -> Image.Image:
+    """인물 뒤 배경을 흐린다. strength 0.0~1.0. 얼굴이 없으면 그대로 둔다.
+
+    얼굴 랜드마크에서 인물 영역을 추정해 마스크를 만들고, 그 바깥을
+    가우시안으로 흐린 뒤 경계를 부드럽게 섞는다.
+    """
+    if strength < 0.01:
+        return img
+
+    from_cache = cache is not None
+    arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+    h, w = arr.shape[:2]
+
+    ctx = cache if from_cache else MediaPipeCache()
+    try:
+        results = ctx.get_face_landmarks(arr) if from_cache else ctx.__enter__().get_face_landmarks(arr)
+    except Exception as exc:
+        log.warning("background_blur: face detection failed: %s", exc)
+        return img
+
+    try:
+        if results is None or not getattr(results, "face_landmarks", None):
+            return img
+
+        # 얼굴들을 감싸는 타원 + 그 아래 몸통을 인물 영역으로 본다
+        subject = np.zeros((h, w), dtype=np.uint8)
+        for landmarks in results.face_landmarks:
+            xs = np.array([lm.x for lm in landmarks]) * w
+            ys = np.array([lm.y for lm in landmarks]) * h
+            cx, cy = float(xs.mean()), float(ys.mean())
+            fw, fh = float(xs.max() - xs.min()), float(ys.max() - ys.min())
+
+            cv2.ellipse(subject, (int(cx), int(cy)),
+                        (int(fw * 0.85), int(fh * 0.95)), 0, 0, 360, 255, -1)
+            # 어깨~몸통: 얼굴 아래로 폭 2.2배의 사다리꼴
+            body_top = int(cy + fh * 0.55)
+            cv2.ellipse(subject, (int(cx), body_top + int(fh * 1.8)),
+                        (int(fw * 1.6), int(fh * 2.2)), 0, 0, 360, 255, -1)
+
+        if subject.max() == 0:
+            return img
+
+        # 경계를 부드럽게 — 딱 잘린 마스크는 오려붙인 티가 난다
+        feather = max(9, int(min(h, w) * 0.02)) | 1
+        mask = cv2.GaussianBlur(subject, (feather, feather), 0).astype(np.float32) / 255.0
+        mask = mask[..., None]
+
+        blur_px = max(3, int(min(h, w) * 0.012 * strength)) | 1
+        blurred = cv2.GaussianBlur(arr, (blur_px, blur_px), 0).astype(np.float32)
+
+        out = arr.astype(np.float32) * mask + blurred * (1.0 - mask)
+        log.info("background_blur: strength=%.2f faces=%d blur=%dpx",
+                 strength, len(results.face_landmarks), blur_px)
+        return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
+    finally:
+        if not from_cache:
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+
+
 # ── 개별 변형 함수 ──
 
 
@@ -1423,10 +1593,18 @@ def apply_straighten(img: Image.Image, angle: float) -> Image.Image:
 def apply_auto_edits(img: Image.Image, auto_edits: dict) -> Image.Image:
     """AI autoEdits를 순서대로 적용한다.
 
-    순서: 수평 보정 → 불필요 요소 제거 → 스마트 크롭 → 인스타 비율
-    (수평 보정을 가장 먼저 해야 이후 크롭이 정확함)
+    순서: 원근 보정 → 수평 보정 → 불필요 요소 제거 → 스마트 크롭 → 인스타 비율
+    (기하 보정을 먼저 해야 이후 크롭이 정확함)
     """
-    # 0. 수평 보정 (기울기 교정)
+    # 0-a. 수직 원근 보정 (키스톤)
+    keystone = auto_edits.get("keystone")
+    if keystone is not None:
+        try:
+            img = apply_keystone(img, float(keystone))
+        except (TypeError, ValueError):
+            pass
+
+    # 0-b. 수평 보정 (기울기 교정)
     straighten = auto_edits.get("straighten")
     if straighten is not None:
         try:
@@ -2284,6 +2462,7 @@ def apply_all_transforms(
     waist_slim: float = 0.0,
     auto_wb: float = 0.0,
     denoise: float = 0.0,
+    background_blur: float = 0.0,
     preview: bool = False,
     cache: MediaPipeCache | None = None,
 ) -> Image.Image:
@@ -2332,10 +2511,13 @@ def apply_all_transforms(
         or skin_smoothing >= 0.01
     )
 
+    # 배경 흐림도 얼굴 감지가 필요하다
+    needs_mp = needs_mp or background_blur >= 0.01
+
     if needs_mp and cache is None:
         # 캐시가 없으면 자동 생성하여 함수 내에서 모델/결과 재사용
         with MediaPipeCache() as auto_cache:
-            return _apply_all_transforms_impl(
+            result = _apply_all_transforms_impl(
                 img, brightness, contrast, clarity, dehaze, highlights, shadows,
                 saturation, temperature, blemish_removal, skin_smoothing, vignette,
                 sharpness, grain, tone_curve_preset, tone_curve_strength,
@@ -2344,8 +2526,13 @@ def apply_all_transforms(
                 eye_enlarge, leg_stretch, shoulder_width, waist_slim, preview,
                 auto_cache,
             )
+            # 배경 흐림은 색 보정이 끝난 뒤 — 그래야 선명도 보정이
+            # 흐려 둔 배경을 다시 살려내지 않는다.
+            if background_blur >= 0.01:
+                result = apply_background_blur(result, background_blur, auto_cache)
+            return result
     else:
-        return _apply_all_transforms_impl(
+        result = _apply_all_transforms_impl(
             img, brightness, contrast, clarity, dehaze, highlights, shadows,
             saturation, temperature, blemish_removal, skin_smoothing, vignette,
             sharpness, grain, tone_curve_preset, tone_curve_strength,
@@ -2354,6 +2541,9 @@ def apply_all_transforms(
             eye_enlarge, leg_stretch, shoulder_width, waist_slim, preview,
             cache,
         )
+        if background_blur >= 0.01:
+            result = apply_background_blur(result, background_blur, cache)
+        return result
 
 
 def _apply_all_transforms_impl(
@@ -2471,6 +2661,7 @@ def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
         "grain": 0.0,
         "auto_wb": 0.0,
         "denoise": 0.0,
+        "background_blur": 0.0,
     }
 
     _split_defaults = {
@@ -2497,7 +2688,8 @@ def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
         except (TypeError, ValueError):
             val = default
         # 범위 클램핑
-        if key in ("blemish_removal", "skin_smoothing", "auto_wb", "denoise"):
+        if key in ("blemish_removal", "skin_smoothing", "auto_wb", "denoise",
+                   "background_blur"):
             val = max(0.0, min(1.0, val))
         else:
             val = max(-1.0, min(1.0, val))

@@ -136,6 +136,7 @@ class ApplyTransformRequest(BaseModel):
     grain: float = Field(0.0, ge=0.0, le=1.0)
     auto_wb: float = Field(0.0, ge=0.0, le=1.0, description="자동 화이트밸런스 강도")
     denoise: float = Field(0.0, ge=0.0, le=1.0, description="노이즈 제거 강도")
+    background_blur: float = Field(0.0, ge=0.0, le=1.0, description="배경 흐림 강도")
     tone_curve_preset: str = Field("linear", description="톤 커브 프리셋 (linear|s_curve|film|fade|high_contrast|bright)")
     tone_curve_strength: float = Field(0.0, ge=0.0, le=1.0, description="톤 커브 강도")
     split_shadow_hue: float = Field(0.0, ge=0.0, le=360.0, description="스플릿 토닝 쉐도우 색상 (0~360)")

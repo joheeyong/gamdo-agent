@@ -40,6 +40,7 @@ from param_engine import (
 )
 from image_processor import (
     MediaPipeCache,
+    estimate_keystone,
     analysis_to_transform_params,
     apply_all_transforms,
     apply_auto_edits,
@@ -190,6 +191,12 @@ def api_analyze_and_transform(
         auto_edits = analysis.get("autoEdits")
         if not isinstance(auto_edits, dict):
             auto_edits = {}
+        # 수직 원근(키스톤)도 잰다 — 건물·카페를 아래에서 찍으면 위가 좁아진다
+        keystone = estimate_keystone(img)
+        if abs(keystone) >= 0.02:
+            auto_edits["keystone"] = keystone
+            log.info("analyze-and-transform: keystone %.3f", keystone)
+
         measured_tilt = detect_tilt_angle(img)
         if measured_tilt is not None:
             auto_edits["straighten"] = measured_tilt
@@ -324,6 +331,7 @@ def api_apply_transform(
             "grain": req.grain,
             "auto_wb": req.auto_wb,
             "denoise": req.denoise,
+            "background_blur": req.background_blur,
             "tone_curve_preset": req.tone_curve_preset,
             "tone_curve_strength": req.tone_curve_strength,
             "split_shadow_hue": req.split_shadow_hue,

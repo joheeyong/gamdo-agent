@@ -421,6 +421,8 @@ def build_params_with_comment(
         # 촬영 결함 교정은 취향(보정 강도)과 무관하므로 게인을 곱하지 않는다
         "auto_wb": _clamp(auto_wb_strength, 0.0, 1.0),
         "denoise": _clamp(denoise_strength, 0.0, 1.0),
+        # 배경 흐림은 인물에서만. 얼굴이 없으면 apply 단계에서 무시된다.
+        "background_blur": _clamp(0.5 * gain if is_portrait else 0.0, 0.0, 1.0),
         # 피부 보정은 사용자가 고른 강도 그대로 — 필터 게인을 곱하지 않는다
         "blemish_removal": _clamp(blemish, 0.0, 1.0),
         "skin_smoothing": _clamp(skin_smoothing, 0.0, 1.0),
