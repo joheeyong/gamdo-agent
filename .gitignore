@@ -5,3 +5,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# 자동 내려받는 MediaPipe 모델
+.model_cache/
+
+# 사용자 인스타그램 대표 사진 (런타임 생성)
+reference_images/
+
+.DS_Store

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import logging
 import os
@@ -32,56 +33,252 @@ try:
     import mediapipe as mp
 
     _MP_AVAILABLE = True
-    # FaceLandmarker 모델 파일 경로 (패키지 내 번들 또는 자동 다운로드)
-    _MP_MODEL_PATH: str | None = None
-    _model_candidate = os.path.join(
-        os.path.dirname(mp.__file__), "models", "face_landmarker.task"
-    )
-    if os.path.exists(_model_candidate):
-        _MP_MODEL_PATH = _model_candidate
-    else:
-        try:
-            import urllib.request
-
-            os.makedirs(os.path.dirname(_model_candidate), exist_ok=True)
-            urllib.request.urlretrieve(
-                "https://storage.googleapis.com/mediapipe-models/"
-                "face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
-                _model_candidate,
-            )
-            _MP_MODEL_PATH = _model_candidate
-            log.info("Downloaded face_landmarker model to %s", _model_candidate)
-        except Exception as exc:
-            log.warning("Failed to download face_landmarker model: %s", exc)
 except ImportError:
     mp = None  # type: ignore[assignment]
     _MP_AVAILABLE = False
-    _MP_MODEL_PATH = None
     log.warning("mediapipe not installed — blemish removal disabled")
 
 
-# ── MediaPipe Pose Landmarker 초기화 ──
-_POSE_MODEL_PATH: str | None = None
-if _MP_AVAILABLE and mp is not None:
-    _pose_candidate = os.path.join(
-        os.path.dirname(mp.__file__), "models", "pose_landmarker_lite.task"
-    )
-    if os.path.exists(_pose_candidate):
-        _POSE_MODEL_PATH = _pose_candidate
-    else:
-        try:
-            import urllib.request as _urllib_req
+# ── MediaPipe 모델 파일 해석 ──
+#
+# 경로를 import 시점에 한 번만 계산하면, 그 뒤 프로젝트 디렉터리가 옮겨지거나
+# 가상환경이 재설치될 때 문자열만 남고 파일은 사라진 상태가 된다
+# (MediaPipe는 create_from_options 시점에 경로로 파일을 다시 연다).
+# 그래서 사용 시점마다 존재를 확인하고, 없으면 다시 받아 자가 복구한다.
 
-            os.makedirs(os.path.dirname(_pose_candidate), exist_ok=True)
-            _urllib_req.urlretrieve(
-                "https://storage.googleapis.com/mediapipe-models/"
-                "pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
-                _pose_candidate,
+_MODEL_SPECS: dict[str, tuple[str, str]] = {
+    "face": (
+        "face_landmarker.task",
+        "https://storage.googleapis.com/mediapipe-models/"
+        "face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
+    ),
+    "pose": (
+        "pose_landmarker_lite.task",
+        "https://storage.googleapis.com/mediapipe-models/"
+        "pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+    ),
+}
+
+# 내려받은 모델을 둘 곳. site-packages는 uv sync 한 번에 날아가므로 쓰지 않는다.
+# 이름 앞에 점을 붙여 같은 디렉터리의 models.py 모듈과 헷갈리지 않게 한다.
+_MODEL_CACHE_DIR = os.path.abspath(
+    os.environ.get(
+        "GAMDO_MODEL_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".model_cache"),
+    )
+)
+
+_model_path_cache: dict[str, str] = {}
+
+
+def _candidate_model_paths(filename: str) -> list[str]:
+    """모델 파일을 찾을 후보 경로 (우선순위 순)."""
+    paths = [os.path.join(_MODEL_CACHE_DIR, filename)]
+    if mp is not None:
+        # 패키지에 번들되어 있으면 그것도 사용한다
+        paths.append(os.path.join(os.path.dirname(mp.__file__), "models", filename))
+    return paths
+
+
+def _download_model(url: str, dest: str) -> None:
+    """모델을 임시 파일로 받은 뒤 원자적으로 교체한다.
+
+    중간에 끊겨도 손상된 파일이 남지 않게 한다.
+    """
+    import urllib.request
+
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = f"{dest}.part"
+    try:
+        urllib.request.urlretrieve(url, tmp)
+        if os.path.getsize(tmp) < 1024:
+            raise OSError(f"downloaded file too small ({os.path.getsize(tmp)} bytes)")
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _resolve_model_path(kind: str) -> str | None:
+    """MediaPipe 모델 경로를 반환한다 (없으면 내려받고, 실패 시 None)."""
+    if not _MP_AVAILABLE or mp is None:
+        return None
+
+    cached = _model_path_cache.get(kind)
+    if cached is not None and os.path.exists(cached):
+        return cached
+    if cached is not None:
+        # 경로가 사라졌다 — 프로젝트 이동이나 venv 재설치. 다시 찾는다.
+        log.warning("Model file vanished at %s — re-resolving", cached)
+        _model_path_cache.pop(kind, None)
+
+    filename, url = _MODEL_SPECS[kind]
+    candidates = _candidate_model_paths(filename)
+
+    for path in candidates:
+        if os.path.exists(path):
+            _model_path_cache[kind] = path
+            return path
+
+    dest = candidates[0]
+    try:
+        _download_model(url, dest)
+    except Exception as exc:
+        log.warning("Failed to download %s model: %s", kind, exc)
+        return None
+
+    log.info("Downloaded %s model to %s", kind, dest)
+    _model_path_cache[kind] = dest
+    return dest
+
+
+def face_model_path() -> str | None:
+    """FaceLandmarker 모델 경로 (사용 시점에 확인·복구)."""
+    return _resolve_model_path("face")
+
+
+def pose_model_path() -> str | None:
+    """PoseLandmarker 모델 경로 (사용 시점에 확인·복구)."""
+    return _resolve_model_path("pose")
+
+
+# ── 요청 스코프 MediaPipe 캐시 ──
+
+
+class MediaPipeCache:
+    """요청 단위로 MediaPipe 모델 인스턴스 + 랜드마크 결과를 캐시한다.
+
+    사용법::
+
+        with MediaPipeCache() as cache:
+            face_results = cache.get_face_landmarks(arr_rgb)
+            pose_results = cache.get_pose_landmarks(arr_rgb)
+
+    - 모델 인스턴스는 첫 호출 시 생성하고 컨텍스트 종료까지 재사용
+    - 동일 이미지(바이트 해시 기준)에 대한 감지 결과를 캐시하여 중복 호출 제거
+    - 컨텍스트 종료 시 모든 모델 인스턴스를 close()하여 메모리 누수 방지
+    """
+
+    def __init__(self) -> None:
+        self._face_landmarker: Any | None = None
+        self._pose_landmarker: Any | None = None
+        self._face_results_cache: dict[str, Any] = {}
+        self._pose_results_cache: dict[str, Any] = {}
+
+    def __enter__(self) -> "MediaPipeCache":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """모든 모델 인스턴스를 닫고 캐시를 비운다."""
+        if self._face_landmarker is not None:
+            try:
+                self._face_landmarker.close()
+            except Exception:
+                pass
+            self._face_landmarker = None
+        if self._pose_landmarker is not None:
+            try:
+                self._pose_landmarker.close()
+            except Exception:
+                pass
+            self._pose_landmarker = None
+        self._face_results_cache.clear()
+        self._pose_results_cache.clear()
+
+    @staticmethod
+    def _image_key(arr_rgb: np.ndarray) -> str:
+        """이미지 배열의 빠른 해시 키를 반환한다."""
+        # 전체 데이터 해시 대신 shape + 샘플 바이트로 빠른 키 생성
+        h, w = arr_rgb.shape[:2]
+        # 균등 간격 샘플링 (최대 ~4KB)
+        step_h = max(1, h // 32)
+        step_w = max(1, w // 32)
+        sample = arr_rgb[::step_h, ::step_w].tobytes()
+        digest = hashlib.md5(sample, usedforsecurity=False).hexdigest()
+        return f"{h}x{w}_{digest}"
+
+    def _get_face_landmarker(self) -> Any:
+        """FaceLandmarker 인스턴스를 반환 (없으면 생성)."""
+        if self._face_landmarker is None:
+            model_path = face_model_path()
+            if model_path is None or mp is None:
+                return None
+            base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
+            options = mp.tasks.vision.FaceLandmarkerOptions(
+                base_options=base_options,
+                num_faces=5,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
             )
-            _POSE_MODEL_PATH = _pose_candidate
-            log.info("Downloaded pose_landmarker model to %s", _pose_candidate)
-        except Exception as _exc:
-            log.warning("Failed to download pose_landmarker model: %s", _exc)
+            self._face_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+        return self._face_landmarker
+
+    def _get_pose_landmarker(self) -> Any:
+        """PoseLandmarker 인스턴스를 반환 (없으면 생성)."""
+        if self._pose_landmarker is None:
+            model_path = pose_model_path()
+            if model_path is None or mp is None:
+                return None
+            base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
+            options = mp.tasks.vision.PoseLandmarkerOptions(
+                base_options=base_options,
+                num_poses=3,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+            )
+            self._pose_landmarker = mp.tasks.vision.PoseLandmarker.create_from_options(options)
+        return self._pose_landmarker
+
+    def get_face_landmarks(self, arr_rgb: np.ndarray) -> Any:
+        """얼굴 랜드마크 감지 결과를 캐시에서 반환하거나 새로 감지한다.
+
+        반환: FaceLandmarkerResult (face_landmarks 속성 포함), 또는 감지 실패 시 None.
+        """
+        key = self._image_key(arr_rgb)
+        if key in self._face_results_cache:
+            return self._face_results_cache[key]
+
+        landmarker = self._get_face_landmarker()
+        if landmarker is None:
+            self._face_results_cache[key] = None
+            return None
+
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=arr_rgb)
+        results = landmarker.detect(mp_image)
+
+        if not results.face_landmarks:
+            self._face_results_cache[key] = None
+            return None
+
+        self._face_results_cache[key] = results
+        return results
+
+    def get_pose_landmarks(self, arr_rgb: np.ndarray) -> Any:
+        """포즈 랜드마크 감지 결과를 캐시에서 반환하거나 새로 감지한다.
+
+        반환: PoseLandmarkerResult (pose_landmarks 속성 포함), 또는 감지 실패 시 None.
+        """
+        key = self._image_key(arr_rgb)
+        if key in self._pose_results_cache:
+            return self._pose_results_cache[key]
+
+        landmarker = self._get_pose_landmarker()
+        if landmarker is None:
+            self._pose_results_cache[key] = None
+            return None
+
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=arr_rgb)
+        results = landmarker.detect(mp_image)
+
+        if not results.pose_landmarks:
+            self._pose_results_cache[key] = None
+            return None
+
+        self._pose_results_cache[key] = results
+        return results
 
 
 # ── Base64 ↔ PIL Image 변환 ──
@@ -178,18 +375,17 @@ def adjust_clarity(img: Image.Image, factor: float) -> Image.Image:
 
     # 로컬 평균 (큰 커널 가우시안 블러 → 저주파 성분)
     h, w = l_ch.shape[:2]
-    ksize = max(31, int(min(h, w) * 0.05)) | 1  # 해상도 적응형 커널
+    ksize = max(9, int(min(h, w) * 0.015)) | 1  # 해상도 적응형 커널
     l_blur = cv2.GaussianBlur(l_ch, (ksize, ksize), 0)
 
     # 하이패스 디테일 = 원본 - 로컬 평균
     detail = l_ch - l_blur
 
-    # 중간톤 마스크: 밝기 64~192 구간에 높은 가중치 (극단은 보호)
-    midtone_mask = 1.0 - np.abs(l_ch - 128.0) / 128.0
-    midtone_mask = np.clip(midtone_mask * 1.5, 0.0, 1.0)
+    # 중간톤 마스크: 모든 톤에 최소 30% 적용, 중간톤에 100% 적용
+    midtone_mask = 0.3 + 0.7 * (1.0 - np.abs(l_ch - 128.0) / 128.0)
 
     # factor 비례로 디테일 증폭 (양수: 로컬 대비 강화, 음수: 소프트)
-    l_ch = l_ch + detail * factor * 1.5 * midtone_mask
+    l_ch = l_ch + detail * factor * 0.8 * midtone_mask
     lab[:, :, 0] = np.clip(l_ch, 0, 255)
 
     result_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
@@ -333,9 +529,10 @@ def adjust_highlights(img: Image.Image, factor: float) -> Image.Image:
 
     l_ch = lab[:, :, 0]
 
-    # 밝은 영역 마스크 (L > 128 부분에 그라데이션)
-    threshold = 128.0
-    mask = np.clip((l_ch - threshold) / threshold, 0.0, 1.0)
+    # 밝은 영역 마스크 — 시그모이드 기반 부드러운 전환
+    # 중심점 160: 진짜 하이라이트 영역에 집중, 폭 40: 부드러운 그라데이션
+    normalized = (l_ch - 160.0) / 40.0
+    mask = 1.0 / (1.0 + np.exp(-normalized))
 
     # L 채널에서만 조절
     l_ch = l_ch + factor * 60.0 * mask
@@ -362,9 +559,10 @@ def adjust_shadows(img: Image.Image, factor: float) -> Image.Image:
 
     l_ch = lab[:, :, 0]
 
-    # 어두운 영역 마스크 (L < 128 부분에 그라데이션)
-    threshold = 128.0
-    mask = np.clip((threshold - l_ch) / threshold, 0.0, 1.0)
+    # 어두운 영역 마스크 — 시그모이드 기반 부드러운 전환
+    # 중심점 96: 진짜 쉐도우 영역에 집중, 폭 40: 부드러운 그라데이션
+    normalized = (96.0 - l_ch) / 40.0
+    mask = 1.0 / (1.0 + np.exp(-normalized))
 
     # L 채널에서만 조절
     l_ch = l_ch + factor * 60.0 * mask
@@ -660,10 +858,10 @@ def apply_skin_smoothing(img: Image.Image, intensity: float) -> Image.Image:
     arr = np.array(img)
     arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
-    # intensity에 비례하여 필터 강도 조절
-    d = int(5 + intensity * 10)           # diameter: 5 ~ 15
-    sigma_color = 20 + intensity * 55     # 20 ~ 75
-    sigma_space = 20 + intensity * 55     # 20 ~ 75
+    # intensity에 비례하여 필터 강도 조절 (과도한 스무딩 방지를 위해 상한 제한)
+    d = int(5 + intensity * 4)            # diameter: 5 ~ 9 (최대 18px 커널)
+    sigma_color = 20 + intensity * 30     # 20 ~ 50 (색상 병합 범위 제한)
+    sigma_space = 20 + intensity * 30     # 20 ~ 50 (공간 병합 범위 제한)
 
     smoothed = cv2.bilateralFilter(arr_bgr, d, sigma_color, sigma_space)
 
@@ -698,34 +896,45 @@ _LEFT_EYEBROW = [70, 63, 105, 66, 107, 55, 65, 52, 53, 46]
 _RIGHT_EYEBROW = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276]
 
 
-def _get_skin_mask(img_rgb: np.ndarray) -> np.ndarray | None:
+def _get_skin_mask(
+    img_rgb: np.ndarray,
+    cache: MediaPipeCache | None = None,
+) -> np.ndarray | None:
     """MediaPipe FaceLandmarker로 피부 영역 마스크를 생성한다.
 
     반환: 얼굴 경계에서 충분히 안쪽으로 침식된 피부 마스크, 얼굴 미감지 시 None.
     다중 얼굴이면 모든 얼굴의 마스크를 합친다.
+
+    cache가 제공되면 모델 인스턴스와 감지 결과를 캐시에서 재사용한다.
     """
-    if not _MP_AVAILABLE or _MP_MODEL_PATH is None:
+    model_path = face_model_path()
+    if model_path is None:
         return None
 
     h, w = img_rgb.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
 
-    base_options = mp.tasks.BaseOptions(model_asset_path=_MP_MODEL_PATH)
-    options = mp.tasks.vision.FaceLandmarkerOptions(
-        base_options=base_options,
-        num_faces=5,
-        min_face_detection_confidence=0.5,
-        min_face_presence_confidence=0.5,
-    )
-    landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
-    try:
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
-        results = landmarker.detect(mp_image)
-    finally:
-        landmarker.close()
+    if cache is not None:
+        results = cache.get_face_landmarks(img_rgb)
+        if results is None:
+            return None
+    else:
+        base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
+        options = mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            num_faces=5,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+        )
+        landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+        try:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+            results = landmarker.detect(mp_image)
+        finally:
+            landmarker.close()
 
-    if not results.face_landmarks:
-        return None
+        if not results.face_landmarks:
+            return None
 
     for face_lms in results.face_landmarks:
         def _idx_to_pt(idx: int) -> tuple[int, int]:
@@ -781,16 +990,16 @@ def _detect_blemishes(
     a_ch = lab[:, :, 1].astype(np.float32)
     b_ch = lab[:, :, 2].astype(np.float32)
 
-    # 해상도 적응형 커널 — 잡티보다 훨씬 큰 스케일의 로컬 평균
-    ksize = max(31, int(short_side * 0.06)) | 1
+    # 해상도 적응형 커널 — 잡티(10~20px) 감지에 적합한 스케일의 로컬 평균
+    ksize = max(15, int(short_side * 0.02)) | 1
     a_mean = cv2.GaussianBlur(a_ch, (ksize, ksize), 0)
     b_mean = cv2.GaussianBlur(b_ch, (ksize, ksize), 0)
 
     # 색상 편차 (A·B만)
     diff = np.sqrt((a_ch - a_mean) ** 2 + (b_ch - b_mean) ** 2)
 
-    # 높은 임계값: intensity 0.3 → 20, 1.0 → 10
-    threshold = 22.0 - intensity * 12.0
+    # 높은 임계값: intensity 0.3 → 27, 1.0 → 20 (정상 피부 질감 오탐 방지)
+    threshold = 30.0 - intensity * 10.0
     threshold = max(threshold, 8.0)
 
     blemish_mask = (diff > threshold).astype(np.uint8) * 255
@@ -814,11 +1023,15 @@ def _detect_blemishes(
 
 
 def _inpaint_blemishes(img_bgr: np.ndarray, blemish_mask: np.ndarray) -> np.ndarray:
-    """OpenCV INPAINT_TELEA로 잡티 영역을 복원한다."""
-    return cv2.inpaint(img_bgr, blemish_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+    """OpenCV INPAINT_NS(Navier-Stokes)로 잡티 영역을 복원한다."""
+    return cv2.inpaint(img_bgr, blemish_mask, inpaintRadius=3, flags=cv2.INPAINT_NS)
 
 
-def apply_blemish_removal(img: Image.Image, intensity: float) -> Image.Image:
+def apply_blemish_removal(
+    img: Image.Image,
+    intensity: float,
+    cache: MediaPipeCache | None = None,
+) -> Image.Image:
     """잡티 자동 제거. intensity: 0.0(비활성) ~ 1.0(최대 감도).
 
     파이프라인:
@@ -826,6 +1039,8 @@ def apply_blemish_removal(img: Image.Image, intensity: float) -> Image.Image:
       2. LAB A·B 채널 색상 이상치로 잡티 탐지
       3. OpenCV inpainting으로 잡티 영역만 복원
       4. 잡티 영역만 마스크 기반 블렌딩
+
+    cache가 제공되면 MediaPipe 모델/결과 캐시를 재사용한다.
     """
     if intensity < 0.01:
         return img
@@ -834,7 +1049,7 @@ def apply_blemish_removal(img: Image.Image, intensity: float) -> Image.Image:
     arr_bgr = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2BGR)
 
     # 1. 피부 마스크 (얼굴 미감지 → 원본 반환)
-    skin_mask = _get_skin_mask(arr_rgb)
+    skin_mask = _get_skin_mask(arr_rgb, cache=cache)
     if skin_mask is None:
         return img
 
@@ -1077,11 +1292,16 @@ def apply_auto_edits(img: Image.Image, auto_edits: dict) -> Image.Image:
 # ── 영역별 스마트 보정 ──
 
 
-def detect_regions(img: Image.Image) -> dict[str, np.ndarray]:
+def detect_regions(
+    img: Image.Image,
+    cache: MediaPipeCache | None = None,
+) -> dict[str, np.ndarray]:
     """HSV 기반 하늘 감지 + MediaPipe 얼굴 감지 + 나머지=배경.
 
     반환: {"sky": mask, "face": mask, "background": mask}
     각 마스크는 0~255 uint8 단채널. 영역이 없으면 해당 키가 빈 마스크(전체 0).
+
+    cache가 제공되면 MediaPipe 모델/결과 캐시를 재사용한다.
     """
     arr_rgb = np.array(img, dtype=np.uint8)
     h, w = arr_rgb.shape[:2]
@@ -1114,7 +1334,7 @@ def detect_regions(img: Image.Image) -> dict[str, np.ndarray]:
         sky_mask = np.zeros((h, w), dtype=np.uint8)
 
     # ── 얼굴/피부 감지: 기존 _get_skin_mask() 재사용 ──
-    face_mask = _get_skin_mask(arr_rgb)
+    face_mask = _get_skin_mask(arr_rgb, cache=cache)
     if face_mask is None:
         face_mask = np.zeros((h, w), dtype=np.uint8)
 
@@ -1133,6 +1353,7 @@ def apply_regional_transforms(
     img: Image.Image,
     regions: dict[str, np.ndarray],
     region_params: dict[str, dict[str, float]],
+    cache: MediaPipeCache | None = None,
 ) -> Image.Image:
     """영역별로 다른 보정을 적용한 뒤 마스크 경계를 블렌딩.
 
@@ -1142,6 +1363,8 @@ def apply_regional_transforms(
       "face": {"brightness": 0.1, "blemish_removal": 0.3, "skin_smoothing": 0.2},
       "background": {"brightness": 0.0, "contrast": 0.1, "saturation": -0.05}
     }
+
+    cache가 제공되면 MediaPipe 모델/결과 캐시를 재사용한다.
     """
     arr_rgb = np.array(img, dtype=np.float32)
 
@@ -1149,14 +1372,15 @@ def apply_regional_transforms(
     result = arr_rgb.copy()
 
     # 사용 가능한 변형 함수 맵
-    transform_funcs = {
+    # blemish_removal은 cache를 전달해야 하므로 lambda로 래핑
+    transform_funcs: dict[str, Any] = {
         "brightness": adjust_brightness,
         "contrast": adjust_contrast,
         "saturation": adjust_saturation,
         "temperature": adjust_color_temperature,
         "highlights": adjust_highlights,
         "shadows": adjust_shadows,
-        "blemish_removal": apply_blemish_removal,
+        "blemish_removal": lambda img_, val: apply_blemish_removal(img_, val, cache=cache),
         "skin_smoothing": apply_skin_smoothing,
         "sharpness": apply_sharpness,
     }
@@ -1266,34 +1490,63 @@ def _warp_with_mask(
     """MLS 워프 + 가우시안 마스크 블렌딩으로 원본과 자연스럽게 합성.
 
     roi: (x, y, w, h) — 워프 영향 영역. None이면 전체.
+    ROI가 주어지면 패딩된 ROI 영역만 워프하여 성능 향상 + 배경 아티팩트 방지.
     """
-    warped = _mls_similarity_warp(img, src_pts, dst_pts)
-
     if roi is None:
-        return warped
+        return _mls_similarity_warp(img, src_pts, dst_pts)
 
     h, w = img.shape[:2]
     rx, ry, rw, rh = roi
-    # 안전한 범위
     rx = max(0, rx)
     ry = max(0, ry)
     rw = min(w - rx, rw)
     rh = min(h - ry, rh)
 
-    # 타원형 마스크 (부드러운 경계)
-    mask = np.zeros((h, w), dtype=np.float32)
+    if rw <= 0 or rh <= 0:
+        return img
+
+    # ROI를 패딩하여 블렌딩 경계가 자연스럽도록 (블러 커널 크기의 1.5배)
+    blur_size = max(31, int(min(rw, rh) * 0.3)) | 1
+    pad = blur_size
+    crop_x1 = max(0, rx - pad)
+    crop_y1 = max(0, ry - pad)
+    crop_x2 = min(w, rx + rw + pad)
+    crop_y2 = min(h, ry + rh + pad)
+    crop_w = crop_x2 - crop_x1
+    crop_h = crop_y2 - crop_y1
+
+    # ROI 영역만 잘라내서 워프 (제어점도 ROI 좌표계로 변환)
+    crop = img[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+    offset = np.array([crop_x1, crop_y1], dtype=np.float32)
+    crop_src = src_pts - offset
+    crop_dst = dst_pts - offset
+
+    warped_crop = _mls_similarity_warp(crop, crop_src, crop_dst)
+
+    # 타원형 마스크 (ROI 좌표계)
+    mask = np.zeros((crop_h, crop_w), dtype=np.float32)
+    # 타원 중심과 축을 crop 좌표계로 변환
+    ellipse_cx = rx + rw // 2 - crop_x1
+    ellipse_cy = ry + rh // 2 - crop_y1
     cv2.ellipse(
         mask,
-        center=(rx + rw // 2, ry + rh // 2),
+        center=(ellipse_cx, ellipse_cy),
         axes=(rw // 2, rh // 2),
         angle=0, startAngle=0, endAngle=360,
         color=1.0, thickness=-1,
     )
-    blur_size = max(31, int(min(rw, rh) * 0.3)) | 1
     mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
     mask = mask[:, :, np.newaxis]
 
-    return (img.astype(np.float32) * (1 - mask) + warped.astype(np.float32) * mask).astype(np.uint8)
+    # 블렌딩 후 원본에 합성
+    blended_crop = (
+        crop.astype(np.float32) * (1 - mask)
+        + warped_crop.astype(np.float32) * mask
+    ).astype(np.uint8)
+
+    result = img.copy()
+    result[crop_y1:crop_y2, crop_x1:crop_x2] = blended_crop
+    return result
 
 
 def apply_face_reshape(
@@ -1301,6 +1554,7 @@ def apply_face_reshape(
     face_slim: float = 0.0,
     jaw_sharpen: float = 0.0,
     eye_enlarge: float = 0.0,
+    cache: MediaPipeCache | None = None,
 ) -> Image.Image:
     """얼굴 보정 — MediaPipe 478 랜드마크 기반 MLS 워프.
 
@@ -1309,32 +1563,39 @@ def apply_face_reshape(
     eye_enlarge: 0~1 (눈 확대)
 
     얼굴 미감지 시 원본 반환. 다중 얼굴은 각각 독립 적용.
+    cache가 제공되면 MediaPipe 모델/결과 캐시를 재사용한다.
     """
     if face_slim < 0.01 and jaw_sharpen < 0.01 and eye_enlarge < 0.01:
         return img
 
-    if not _MP_AVAILABLE or _MP_MODEL_PATH is None:
+    model_path = face_model_path()
+    if model_path is None:
         return img
 
     arr_rgb = np.array(img, dtype=np.uint8)
     h, w = arr_rgb.shape[:2]
 
-    base_options = mp.tasks.BaseOptions(model_asset_path=_MP_MODEL_PATH)
-    options = mp.tasks.vision.FaceLandmarkerOptions(
-        base_options=base_options,
-        num_faces=5,
-        min_face_detection_confidence=0.5,
-        min_face_presence_confidence=0.5,
-    )
-    landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
-    try:
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=arr_rgb)
-        results = landmarker.detect(mp_image)
-    finally:
-        landmarker.close()
+    if cache is not None:
+        results = cache.get_face_landmarks(arr_rgb)
+        if results is None:
+            return img
+    else:
+        base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
+        options = mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            num_faces=5,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+        )
+        landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+        try:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=arr_rgb)
+            results = landmarker.detect(mp_image)
+        finally:
+            landmarker.close()
 
-    if not results.face_landmarks:
-        return img
+        if not results.face_landmarks:
+            return img
 
     result_arr = arr_rgb.copy()
 
@@ -1444,6 +1705,7 @@ def apply_body_reshape(
     leg_stretch: float = 0.0,
     shoulder_width: float = 0.0,
     waist_slim: float = 0.0,
+    cache: MediaPipeCache | None = None,
 ) -> Image.Image:
     """체형 보정 — MediaPipe Pose 33 랜드마크 기반.
 
@@ -1452,32 +1714,39 @@ def apply_body_reshape(
     waist_slim: 0~1 (허리 양쪽을 안쪽으로)
 
     바디 미감지 시 원본 반환. 다중 바디는 가장 신뢰도 높은 것만.
+    cache가 제공되면 MediaPipe 모델/결과 캐시를 재사용한다.
     """
     if abs(leg_stretch) < 0.01 and abs(shoulder_width) < 0.01 and abs(waist_slim) < 0.01:
         return img
 
-    if not _MP_AVAILABLE or _POSE_MODEL_PATH is None:
+    model_path = pose_model_path()
+    if model_path is None:
         return img
 
     arr_rgb = np.array(img, dtype=np.uint8)
     h, w = arr_rgb.shape[:2]
 
-    base_options = mp.tasks.BaseOptions(model_asset_path=_POSE_MODEL_PATH)
-    options = mp.tasks.vision.PoseLandmarkerOptions(
-        base_options=base_options,
-        num_poses=3,
-        min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
-    )
-    landmarker = mp.tasks.vision.PoseLandmarker.create_from_options(options)
-    try:
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=arr_rgb)
-        results = landmarker.detect(mp_image)
-    finally:
-        landmarker.close()
+    if cache is not None:
+        results = cache.get_pose_landmarks(arr_rgb)
+        if results is None:
+            return img
+    else:
+        base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
+        options = mp.tasks.vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            num_poses=3,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
+        )
+        landmarker = mp.tasks.vision.PoseLandmarker.create_from_options(options)
+        try:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=arr_rgb)
+            results = landmarker.detect(mp_image)
+        finally:
+            landmarker.close()
 
-    if not results.pose_landmarks:
-        return img
+        if not results.pose_landmarks:
+            return img
 
     # 가장 큰(키가 큰) 바디만 선택
     best_pose = None
@@ -1547,21 +1816,38 @@ def apply_body_reshape(
 
     # ── shoulder_width: 어깨 너비 조절 ──
     if abs(shoulder_width) >= 0.01:
-        # Pose: 11=왼쪽 어깨, 12=오른쪽 어깨
+        # Pose: 11=왼쪽 어깨, 12=오른쪽 어깨, 23=왼쪽 힙, 24=오른쪽 힙
         ls = _pt(11)
         rs = _pt(12)
         mid_x = (ls[0] + rs[0]) / 2.0
         mid_y = (ls[1] + rs[1]) / 2.0
         strength = shoulder_width * 0.06  # 최대 6%
 
-        src_pts = np.array([
-            [ls[0], ls[1]],
-            [rs[0], rs[1]],
-        ], dtype=np.float32)
-        dst_pts = np.array([
+        # 어깨 위 1/3 지점과 어깨 사이 보간점 추가 → 자연스러운 워프
+        neck_y = mid_y - abs(rs[0] - ls[0]) * 0.25  # 어깨 위 목 부근
+        below_y = mid_y + abs(rs[0] - ls[0]) * 0.3   # 어깨 아래
+
+        src_list = [
+            [ls[0], ls[1]],  # 왼쪽 어깨
+            [rs[0], rs[1]],  # 오른쪽 어깨
+            # 어깨-목 사이 보간점 (강도 50%)
+            [(ls[0] + mid_x) / 2, neck_y],
+            [(rs[0] + mid_x) / 2, neck_y],
+            # 고정 앵커 (목 중앙, 어깨 아래 중앙) — 변형되지 않아야 할 점
+            [mid_x, neck_y],
+            [mid_x, below_y],
+        ]
+        dst_list = [
             [ls[0] + (ls[0] - mid_x) * strength, ls[1]],
             [rs[0] + (rs[0] - mid_x) * strength, rs[1]],
-        ], dtype=np.float32)
+            [(ls[0] + mid_x) / 2 + ((ls[0] + mid_x) / 2 - mid_x) * strength * 0.3, neck_y],
+            [(rs[0] + mid_x) / 2 + ((rs[0] + mid_x) / 2 - mid_x) * strength * 0.3, neck_y],
+            [mid_x, neck_y],      # 고정
+            [mid_x, below_y],     # 고정
+        ]
+
+        src_pts = np.array(src_list, dtype=np.float32)
+        dst_pts = np.array(dst_list, dtype=np.float32)
 
         shoulder_w = abs(rs[0] - ls[0])
         shoulder_h = shoulder_w * 0.6
@@ -1589,26 +1875,216 @@ def apply_body_reshape(
 
         strength = waist_slim * 0.06  # 최대 6%
 
-        src_pts = np.array([
+        # 허리 위/아래 보간점 + 고정 앵커 추가 → 자연스러운 수직 그라데이션
+        above_y = (ls[1] + waist_y) / 2.0   # 어깨-허리 중간
+        below_y = (waist_y + lhip[1]) / 2.0  # 허리-힙 중간
+
+        src_list = [
+            # 허리 중심 (주 제어점 — 강도 100%)
             [waist_left_x, waist_y],
             [waist_right_x, waist_y],
-        ], dtype=np.float32)
-        dst_pts = np.array([
+            # 허리 위 보간 (강도 40%)
+            [waist_left_x, above_y],
+            [waist_right_x, above_y],
+            # 허리 아래 보간 (강도 40%)
+            [waist_left_x, below_y],
+            [waist_right_x, below_y],
+            # 고정 앵커 (중심축, 어깨, 힙 — 변형되지 않아야 할 점)
+            [mid_x, waist_y],
+            [ls[0], ls[1]],
+            [rs[0], rs[1]],
+            [lhip[0], lhip[1]],
+            [rhip[0], rhip[1]],
+        ]
+        dst_list = [
+            # 허리 중심 (주 변형)
             [waist_left_x + (mid_x - waist_left_x) * strength, waist_y],
             [waist_right_x + (mid_x - waist_right_x) * strength, waist_y],
-        ], dtype=np.float32)
+            # 허리 위 보간 (40% 강도)
+            [waist_left_x + (mid_x - waist_left_x) * strength * 0.4, above_y],
+            [waist_right_x + (mid_x - waist_right_x) * strength * 0.4, above_y],
+            # 허리 아래 보간 (40% 강도)
+            [waist_left_x + (mid_x - waist_left_x) * strength * 0.4, below_y],
+            [waist_right_x + (mid_x - waist_right_x) * strength * 0.4, below_y],
+            # 고정 앵커 (원래 위치 유지)
+            [mid_x, waist_y],
+            [ls[0], ls[1]],
+            [rs[0], rs[1]],
+            [lhip[0], lhip[1]],
+            [rhip[0], rhip[1]],
+        ]
+
+        src_pts = np.array(src_list, dtype=np.float32)
+        dst_pts = np.array(dst_list, dtype=np.float32)
 
         waist_w = abs(waist_right_x - waist_left_x)
         waist_h = abs(lhip[1] - ls[1])
         roi = (
-            max(0, int(waist_left_x - waist_w * 0.2)),
-            max(0, int(waist_y - waist_h * 0.4)),
-            min(w, int(waist_w + waist_w * 0.4)),
-            min(h, int(waist_h * 0.8)),
+            max(0, int(waist_left_x - waist_w * 0.3)),
+            max(0, int(min(ls[1], above_y) - waist_h * 0.1)),
+            min(w, int(waist_w + waist_w * 0.6)),
+            min(h, int(waist_h * 1.2)),
         )
         result_arr = _warp_with_mask(result_arr, src_pts, dst_pts, roi)
 
     return Image.fromarray(result_arr)
+
+
+# ── LAB 일괄 보정 헬퍼 (색 공간 변환 1회) ──
+
+
+def _apply_lab_adjustments(
+    img: Image.Image,
+    highlights: float = 0.0,
+    shadows: float = 0.0,
+    tone_curve_preset: str = "linear",
+    tone_curve_strength: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    clarity: float = 0.0,
+    dehaze: float = 0.0,
+    temperature: float = 0.0,
+    saturation: float = 0.0,
+) -> Image.Image:
+    """LAB 기반 색감 보정을 한 번의 색 공간 변환 안에서 일괄 처리한다.
+
+    기존에 개별 함수가 각각 PIL→uint8→BGR→LAB→float32 변환을 반복하면서
+    발생하던 양자화 손실(float32→uint8→float32 반복)을 제거한다.
+
+    처리 순서 (apply_all_transforms의 기존 순서 유지):
+      highlights → shadows → tone_curve → brightness → contrast
+      → clarity → dehaze → temperature → saturation
+
+    dehaze의 양수(Dark Channel Prior)는 BGR 공간이 필요하므로,
+    BGR 단계에서 먼저 처리한 뒤 LAB로 진입한다:
+      1단계: dehaze 양수 → BGR에서 Dark Channel Prior 적용
+      2단계: BGR → LAB 변환 (1회)
+      3단계: highlights ~ clarity (L 채널)
+      4단계: dehaze 음수 + temperature + saturation (LAB)
+      5단계: LAB → RGB 역변환 (1회)
+    """
+    # 모든 조정이 불필요하면 즉시 반환
+    if (abs(highlights) < 0.01 and abs(shadows) < 0.01
+            and (tone_curve_strength < 0.01 or tone_curve_preset == "linear"
+                 or tone_curve_preset not in TONE_CURVE_PRESETS)
+            and abs(brightness) < 0.01 and abs(contrast) < 0.01
+            and abs(clarity) < 0.01 and abs(dehaze) < 0.01
+            and abs(temperature) < 0.01 and abs(saturation) < 0.01):
+        return img
+
+    arr = np.array(img, dtype=np.uint8)
+    arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+    # ── dehaze 양수(Dark Channel Prior)는 BGR에서 먼저 처리 ──
+    if dehaze > 0.01:
+        b, g, r = cv2.split(arr_bgr)
+        dark = np.minimum(np.minimum(b, g), r).astype(np.float32)
+        ksize_dh = max(7, int(min(arr_bgr.shape[:2]) * 0.01)) | 1
+        dark = cv2.erode(dark, np.ones((ksize_dh, ksize_dh), np.uint8))
+
+        num_pixels = dark.size
+        n_bright = max(1, int(num_pixels * 0.001))
+        flat_dark = dark.flatten()
+        indices = np.argpartition(flat_dark, -n_bright)[-n_bright:]
+        arr_f = arr_bgr.astype(np.float32)
+        flat_img = arr_f.reshape(-1, 3)
+        atm = flat_img[indices].mean(axis=0)
+        atm = np.clip(atm, 1.0, 255.0)
+
+        norm = arr_f / atm[np.newaxis, np.newaxis, :]
+        dark_norm = np.min(norm, axis=2)
+        dark_norm_blur = cv2.GaussianBlur(
+            dark_norm, (ksize_dh * 2 + 1, ksize_dh * 2 + 1), 0
+        )
+        omega = dehaze * 0.95
+        transmission = 1.0 - omega * dark_norm_blur
+        transmission = np.clip(transmission, 0.1, 1.0)
+
+        t = transmission[:, :, np.newaxis]
+        result_f = (arr_f - atm) / t + atm
+        arr_bgr = np.clip(result_f, 0, 255).astype(np.uint8)
+
+    # ── BGR → LAB (float32) 1회 변환 ──
+    lab = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    l_ch = lab[:, :, 0]
+    a_ch = lab[:, :, 1]
+    b_ch = lab[:, :, 2]
+
+    # ── 1. Highlights (L 채널) ──
+    if abs(highlights) >= 0.01:
+        hl_mask = np.clip((l_ch - 128.0) / 128.0, 0.0, 1.0)
+        l_ch = l_ch + highlights * 60.0 * hl_mask
+
+    # ── 2. Shadows (L 채널) ──
+    if abs(shadows) >= 0.01:
+        sh_mask = np.clip((128.0 - l_ch) / 128.0, 0.0, 1.0)
+        l_ch = l_ch + shadows * 60.0 * sh_mask
+
+    # ── 3. Tone Curve (L 채널 LUT) ──
+    if tone_curve_strength >= 0.01:
+        tc_points = TONE_CURVE_PRESETS.get(tone_curve_preset)
+        if tc_points is not None and tone_curve_preset != "linear":
+            x_pts = np.array([p[0] for p in tc_points], dtype=np.float64)
+            y_pts = np.array([p[1] for p in tc_points], dtype=np.float64)
+            x_256 = np.linspace(0.0, 1.0, 256)
+            curve = np.interp(x_256, x_pts, y_pts)
+            identity = x_256
+            blended_curve = identity * (1.0 - tone_curve_strength) + curve * tone_curve_strength
+            # float32 LUT (0~255)
+            tc_lut = np.clip(blended_curve * 255.0, 0, 255).astype(np.float32)
+            # l_ch를 uint8 인덱스로 변환하여 LUT 적용, 결과는 float32 유지
+            l_idx = np.clip(l_ch, 0, 255).astype(np.uint8)
+            l_ch = tc_lut[l_idx]
+
+    # ── 4. Brightness (L 채널 감마 보정) ──
+    if abs(brightness) >= 0.01:
+        l_norm = np.clip(l_ch / 255.0, 0.0, 1.0)
+        gamma = 1.0 / (1.0 + brightness) if brightness >= 0 else 1.0 - brightness * 1.5
+        gamma = max(0.2, min(5.0, gamma))
+        l_ch = np.power(l_norm, gamma) * 255.0
+
+    # ── 5. Contrast (L 채널) ──
+    if abs(contrast) >= 0.01:
+        mean_l = np.mean(l_ch)
+        l_ch = mean_l + (l_ch - mean_l) * (1.0 + contrast)
+
+    # ── 6. Clarity (L 채널 로컬 대비) ──
+    if abs(clarity) >= 0.01:
+        h_img, w_img = l_ch.shape[:2]
+        ksize_cl = max(31, int(min(h_img, w_img) * 0.05)) | 1
+        l_blur = cv2.GaussianBlur(l_ch, (ksize_cl, ksize_cl), 0)
+        detail = l_ch - l_blur
+        midtone_mask = 1.0 - np.abs(l_ch - 128.0) / 128.0
+        midtone_mask = np.clip(midtone_mask * 1.5, 0.0, 1.0)
+        l_ch = l_ch + detail * clarity * 1.5 * midtone_mask
+
+    # ── 7. Dehaze 음수 (안개 추가 — LAB 기반) ──
+    if dehaze < -0.01:
+        haze_amount = abs(dehaze)
+        l_ch = l_ch * (1.0 - haze_amount * 0.4) + 200.0 * haze_amount * 0.4
+        a_ch = a_ch * (1.0 - haze_amount * 0.3) + 128.0 * haze_amount * 0.3
+        b_ch = b_ch * (1.0 - haze_amount * 0.3) + 128.0 * haze_amount * 0.3
+
+    # ── 8. Temperature (B 채널 + A 채널 미세 조정) ──
+    if abs(temperature) >= 0.01:
+        shift = temperature * 15.0
+        b_ch = b_ch + shift
+        a_ch = a_ch + shift * 0.3
+
+    # ── 9. Saturation (A, B 채널) ──
+    if abs(saturation) >= 0.01:
+        a_ch = 128.0 + (a_ch - 128.0) * (1.0 + saturation)
+        b_ch = 128.0 + (b_ch - 128.0) * (1.0 + saturation)
+
+    # ── LAB → BGR → RGB 1회 역변환 ──
+    lab[:, :, 0] = np.clip(l_ch, 0, 255)
+    lab[:, :, 1] = np.clip(a_ch, 0, 255)
+    lab[:, :, 2] = np.clip(b_ch, 0, 255)
+
+    bgr_out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    rgb_out = cv2.cvtColor(bgr_out, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb_out)
 
 
 # ── 통합 변형 ──
@@ -1642,6 +2118,8 @@ def apply_all_transforms(
     leg_stretch: float = 0.0,
     shoulder_width: float = 0.0,
     waist_slim: float = 0.0,
+    preview: bool = False,
+    cache: MediaPipeCache | None = None,
 ) -> Image.Image:
     """모든 변형을 순서대로 적용.
 
@@ -1660,27 +2138,130 @@ def apply_all_transforms(
     - 스플릿 토닝은 색온도/채도 뒤에 적용하여 기본 색감 위에 색조를 입힘
     - 모든 밝기/대비/하이라이트/쉐도우는 LAB L채널에서 처리하여 색상 보존
     - 그레인은 최종 단계 (선명도 보정에 의해 노이즈가 강조되지 않도록)
+
+    cache가 제공되면 MediaPipe 모델/결과를 재사용한다.
+    제공되지 않으면 내부에서 자동 생성하여 요청 내 중복 호출을 제거한다.
+    """
+    # MediaPipe가 필요한 변형이 있는지 판단
+    # reshape은 preview 모드에서도 적용하므로 preview 조건 제거
+    # blemish_removal만 preview 시 스킵 (비용이 높으므로)
+    needs_mp = (
+        face_slim >= 0.01
+        or jaw_sharpen >= 0.01
+        or eye_enlarge >= 0.01
+        or leg_stretch >= 0.01
+        or abs(shoulder_width) >= 0.01
+        or waist_slim >= 0.01
+        or (not preview and blemish_removal >= 0.01)
+    )
+
+    if needs_mp and cache is None:
+        # 캐시가 없으면 자동 생성하여 함수 내에서 모델/결과 재사용
+        with MediaPipeCache() as auto_cache:
+            return _apply_all_transforms_impl(
+                img, brightness, contrast, clarity, dehaze, highlights, shadows,
+                saturation, temperature, blemish_removal, skin_smoothing, vignette,
+                sharpness, grain, tone_curve_preset, tone_curve_strength,
+                split_shadow_hue, split_shadow_strength, split_highlight_hue,
+                split_highlight_strength, hsl_adjust, face_slim, jaw_sharpen,
+                eye_enlarge, leg_stretch, shoulder_width, waist_slim, preview,
+                auto_cache,
+            )
+    else:
+        return _apply_all_transforms_impl(
+            img, brightness, contrast, clarity, dehaze, highlights, shadows,
+            saturation, temperature, blemish_removal, skin_smoothing, vignette,
+            sharpness, grain, tone_curve_preset, tone_curve_strength,
+            split_shadow_hue, split_shadow_strength, split_highlight_hue,
+            split_highlight_strength, hsl_adjust, face_slim, jaw_sharpen,
+            eye_enlarge, leg_stretch, shoulder_width, waist_slim, preview,
+            cache,
+        )
+
+
+def _apply_all_transforms_impl(
+    img: Image.Image,
+    brightness: float,
+    contrast: float,
+    clarity: float,
+    dehaze: float,
+    highlights: float,
+    shadows: float,
+    saturation: float,
+    temperature: float,
+    blemish_removal: float,
+    skin_smoothing: float,
+    vignette: float,
+    sharpness: float,
+    grain: float,
+    tone_curve_preset: str,
+    tone_curve_strength: float,
+    split_shadow_hue: float,
+    split_shadow_strength: float,
+    split_highlight_hue: float,
+    split_highlight_strength: float,
+    hsl_adjust: dict[str, dict[str, float]] | None,
+    face_slim: float,
+    jaw_sharpen: float,
+    eye_enlarge: float,
+    leg_stretch: float,
+    shoulder_width: float,
+    waist_slim: float,
+    preview: bool,
+    cache: MediaPipeCache | None,
+) -> Image.Image:
+    """apply_all_transforms의 내부 구현. cache를 전달받아 MediaPipe 재사용.
+
+    파이프라인 단계:
+      Phase 1: 기하학적 변형 (RGB/PIL 기반 — 기존대로)
+      Phase 2: LAB 색감 보정 (float32 LAB에서 한 번에 처리)
+      Phase 3: HSL 선택적 색상 (HSV 기반)
+      Phase 4: 스플릿 토닝 (LAB 기반 — 별도)
+      Phase 5: 텍스처/디테일 (RGB/PIL 기반)
     """
     result = img
-    # ── 기하학적 변형(reshape)이 색감 보정보다 먼저 ──
-    result = apply_face_reshape(result, face_slim, jaw_sharpen, eye_enlarge)
-    result = apply_body_reshape(result, leg_stretch, shoulder_width, waist_slim)
-    # ── 색감 보정 ──
-    result = adjust_highlights(result, highlights)
-    result = adjust_shadows(result, shadows)
-    result = apply_tone_curve(result, tone_curve_preset, tone_curve_strength)
-    result = adjust_brightness(result, brightness)
-    result = adjust_contrast(result, contrast)
-    result = adjust_clarity(result, clarity)
-    result = apply_dehaze(result, dehaze)
-    result = adjust_color_temperature(result, temperature)
-    result = adjust_saturation(result, saturation)
+
+    # ── Phase 1: 기하학적 변형 (RGB/PIL 기반) ──
+    # preview 모드에서도 reshape 파라미터가 0이 아니면 적용한다.
+    # (슬라이더 미리보기에서 얼굴/체형 보정 결과를 즉시 확인할 수 있도록)
+    needs_face = face_slim >= 0.01 or jaw_sharpen >= 0.01 or eye_enlarge >= 0.01
+    needs_body = leg_stretch >= 0.01 or abs(shoulder_width) >= 0.01 or waist_slim >= 0.01
+    if needs_face:
+        result = apply_face_reshape(result, face_slim, jaw_sharpen, eye_enlarge, cache=cache)
+    if needs_body:
+        result = apply_body_reshape(result, leg_stretch, shoulder_width, waist_slim, cache=cache)
+
+    # ── Phase 2: LAB 색감 보정 (float32 LAB에서 한 번에 처리) ──
+    # highlights, shadows, tone_curve, brightness, contrast, clarity,
+    # dehaze, temperature, saturation을 1회 색 공간 변환으로 통합
+    result = _apply_lab_adjustments(
+        result,
+        highlights=highlights,
+        shadows=shadows,
+        tone_curve_preset=tone_curve_preset,
+        tone_curve_strength=tone_curve_strength,
+        brightness=brightness,
+        contrast=contrast,
+        clarity=clarity,
+        dehaze=dehaze,
+        temperature=temperature,
+        saturation=saturation,
+    )
+
+    # ── Phase 3: HSL 선택적 색상 (HSV 기반) ──
     result = apply_hsl_adjust(result, hsl_adjust)
+
+    # ── Phase 4: 스플릿 토닝 (LAB 기반 — 별도) ──
     result = apply_split_toning(
         result, split_shadow_hue, split_shadow_strength,
         split_highlight_hue, split_highlight_strength,
     )
-    result = apply_blemish_removal(result, blemish_removal)
+
+    # ── Phase 5: 텍스처/디테일 (RGB/PIL 기반) ──
+    if not preview:
+        # 잡티 제거는 MediaPipe 재호출이 필요하므로 미리보기에서 스킵
+        result = apply_blemish_removal(result, blemish_removal, cache=cache)
+
     result = apply_skin_smoothing(result, skin_smoothing)
     result = apply_vignette(result, vignette)
     result = apply_sharpness(result, sharpness)
