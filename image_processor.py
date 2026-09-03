@@ -3055,21 +3055,30 @@ _SOFT_KNEE = 24.0
 
 
 def _soft_limit(x: np.ndarray, knee: float = _SOFT_KNEE) -> np.ndarray:
-    """0~255 밖으로 나가려는 값을 끝에서 접어 넣는다 (하드 클립 대신).
+    """0~255를 넘으려는 값을 끝에서 접어 넣는다 (하드 클립 대신).
 
-    tanh로 접으므로 순서가 뒤바뀌지 않고(단조), 넘친 만큼 점점 눌린다.
-    필름의 숄더·토우와 같은 역할이다.
+    범위를 벗어난 값이 없으면 아무것도 하지 않는다. 무조건 무릎을 적용하면
+    원래 255였던 순백이 249로 내려가 흰 배경이 회색으로 보인다.
+    넘친 값이 있을 때만, 넘친 폭에 맞춰 위쪽 [255-knee, 최댓값]을
+    [255-knee, 255]로 부드럽게 눌러 담는다. 순서는 유지된다(단조).
     """
     y = np.array(x, dtype=np.float32, copy=True)
-    hi_edge = 255.0 - knee
-    up = y > hi_edge
-    if up.any():
-        y[up] = hi_edge + knee * np.tanh((y[up] - hi_edge) / knee)
-    lo_edge = knee
-    dn = y < lo_edge
-    if dn.any():
-        y[dn] = lo_edge - knee * np.tanh((lo_edge - y[dn]) / knee)
-    return y
+
+    peak = float(y.max()) if y.size else 0.0
+    if peak > 255.0:
+        edge = 255.0 - knee
+        up = y > edge
+        t = (y[up] - edge) / (peak - edge)
+        y[up] = edge + knee * (1.0 - (1.0 - t) ** 2)
+
+    floor = float(y.min()) if y.size else 0.0
+    if floor < 0.0:
+        edge = knee
+        dn = y < edge
+        t = (edge - y[dn]) / (edge - floor)
+        y[dn] = edge - knee * (1.0 - (1.0 - t) ** 2)
+
+    return np.clip(y, 0.0, 255.0)
 
 
 def _apply_lab_adjustments(

@@ -469,6 +469,17 @@ def build_params_with_comment(
         + float(subject_recipe.get("temperature", 0.0)), _STYLE_BAND)
     contrast = _band(contrast + float(subject_recipe.get("contrast", 0.0)), _STYLE_BAND)
 
+    # 흰 영역이 넓으면 "대비가 너무 높다"는 측정도 믿을 수 없다.
+    #
+    # contrast는 p95-p5로 재는데, 흰 배경이 p95를 1.0에 고정시키므로 흰 배경
+    # 사진은 무조건 대비가 높게 나온다. 그걸 목표로 끌어내리면 배경의 흰색이
+    # 회색으로 눌린다 — 노출을 고친 게 아니라 배경을 더럽힌 것이다.
+    # 실측: 흰 배경 인물 사진에서 contrast -0.41이 걸려 배경이 회베이지가 됐다.
+    if contrast < 0 and stats["highlight_clip"] > 0:
+        contrast = round(contrast * max(
+            _WHITE_TEMPERATURE_FLOOR,
+            1.0 - stats["highlight_clip"] / _WHITE_TEMPERATURE_TOLERANCE), 3)
+
     # 흰 영역이 넓은 사진에서는 색온도를 덜 얹는다.
     #
     # 흰 배경 스튜디오 사진·흰 벽·흰 옷은 그 자체가 기준 백색이다. 그 위에 취향의
@@ -532,6 +543,13 @@ def build_params_with_comment(
     clarity = pick("clarity")
     sharpness = pick("sharpness")
     vignette = pick("vignette")
+
+    # 흰 배경 사진에 비네팅을 얹으면 모서리의 흰색이 회색으로 죽는다.
+    # 스튜디오 흰 배경·흰 벽에서는 스타일이 아니라 렌즈 결함처럼 보인다.
+    if stats["highlight_clip"] > 0:
+        vignette = round(vignette * max(
+            _WHITE_TEMPERATURE_FLOOR,
+            1.0 - stats["highlight_clip"] / _WHITE_TEMPERATURE_TOLERANCE), 3)
 
     # 이미 흐린 사진이면 선명도를 올리고, 충분히 선명하면 건드리지 않는다
     if stats["sharpness"] < 0.25:

@@ -390,9 +390,17 @@ def _call_claude(
     log.info("Calling claude CLI (model=%s, prompt length=%d, images=%d, tools=%s)",
              MODEL, len(prompt), len(image_paths or []), tools or "all")
 
-    # 중첩 세션 환경변수 + 만료된 API 키 제거 → CLI 자체 인증(OAuth) 사용
-    blocked = {"CLAUDECODE", "CLAUDE_CODE_ENTRY_POINT", "CLAUDE_CODE_SESSION", "ANTHROPIC_API_KEY"}
-    env = {k: v for k, v in os.environ.items() if k not in blocked}
+    # 중첩 세션 환경변수 + 만료된 API 키 제거 → CLI 자체 인증(OAuth) 사용.
+    #
+    # 이름을 하나라도 틀리면 조용히 통과한다. 실제로 CLAUDE_CODE_ENTRY_POINT와
+    # CLAUDE_CODE_SESSION은 존재하지 않는 이름이라(각각 ENTRYPOINT, SESSION_ID)
+    # 아무것도 지우지 못하고 있었다. 접두어로 걸러 오타 여지를 없앤다.
+    blocked_exact = {"CLAUDECODE", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in blocked_exact and not k.startswith(("CLAUDE_CODE_", "CLAUDE_"))
+    }
 
     result = subprocess.run(
         cmd,
