@@ -2521,6 +2521,25 @@ _JAW_LEFT = [172, 136, 150, 149, 176, 148]
 _JAW_RIGHT = [397, 365, 379, 378, 400, 377]
 _JAW_TIP = [152]
 
+# 코 고정점 — 움직이지 않는 제어점으로 넣는다.
+#
+# 얼굴 보정은 윤곽·턱·눈만 옮기고 코에는 손대지 않는데, 그래서 오히려
+# 코가 망가졌다. 워프는 제어점 사이를 보간하므로, 코처럼 제어점이 하나도
+# 없는 영역은 주변 볼이 끌고 가는 대로 딸려간다. face_slim은 dx만 주고
+# dy는 0이라 그 결과가 "가로로만 눌리기"다 — 실측: face_slim 0.7에서
+# 코 야코비안 가로 1.105 / 세로 1.000 (비등방 0.105). 세로는 그대로인데
+# 가로만 10% 좁아지니 콧대가 각지게 선다.
+#
+# 코 위에 변위 0인 점을 박아 두면 압축이 코를 비켜 볼로 몰린다.
+# 실측: 코 비등방 0.105 → 0.018, 볼 0.101 → 0.148 (슬림이 일어나야 할 곳).
+#
+# 인덱스는 MediaPipe FaceLandmarksConnections.FACE_LANDMARKS_NOSE 원본.
+# 윤곽·턱·눈 인덱스와 겹치지 않는다 (test_face_reshape_nose.py에서 검증).
+_NOSE_ANCHORS = [
+    1, 2, 4, 5, 6, 19, 45, 48, 64, 94, 97, 98, 115, 168, 195, 197,
+    220, 275, 278, 294, 326, 327, 344, 440,
+]
+
 # 눈 인덱스 (방사형 확대용)
 # 눈 확대는 눈 중심에서 바깥으로 밀어내는 변형이라, 윤곽과 중심이 반드시
 # 같은 눈이어야 한다. 예전에는 왼눈 윤곽에 오른눈 홍채 중심이 짝지어져 있어
@@ -2655,6 +2674,109 @@ def _warp_with_mask(
     return result
 
 
+def _build_reshape_controls(
+    pt,
+    n_landmarks: int,
+    face_slim: float,
+    jaw_sharpen: float,
+    eye_enlarge: float,
+) -> tuple[list[list[float]], list[list[float]]]:
+    """얼굴 한 개의 워프 제어점 (src, dst)을 만든다.
+
+    pt(idx) -> (x, y): 랜드마크 인덱스를 픽셀 좌표로 바꾸는 함수.
+    MediaPipe에 의존하지 않아 합성 좌표로 단독 검증할 수 있다.
+    """
+    src_all: list[list[float]] = []
+    dst_all: list[list[float]] = []
+
+    # 얼굴 중심축.
+    # 코끝(1)을 쓰면 얼굴이 조금만 돌아가도 축이 한쪽으로 치우쳐
+    # 볼 슬림·턱선 이동량이 좌우로 달라진다. 광대 양끝(234, 454)의
+    # 중점은 고개 방향에 훨씬 덜 흔들린다.
+    left_cheek = pt(234)
+    right_cheek = pt(454)
+    cx = (left_cheek[0] + right_cheek[0]) / 2.0
+
+    # ── face_slim: 볼 양쪽을 중심 방향으로 ──
+    if face_slim >= 0.01:
+        strength = face_slim * 0.14  # 최대 14% 이동
+        for idx in _FACE_CONTOUR_LEFT:
+            px, py = pt(idx)
+            dx = (cx - px) * strength
+            src_all.append([px, py])
+            dst_all.append([px + dx, py])
+        for idx in _FACE_CONTOUR_RIGHT:
+            if idx == 152:
+                continue  # 턱 끝은 중복
+            px, py = pt(idx)
+            dx = (cx - px) * strength
+            src_all.append([px, py])
+            dst_all.append([px + dx, py])
+
+    # ── jaw_sharpen: 턱선을 V자로 ──
+    if jaw_sharpen >= 0.01:
+        strength_x = jaw_sharpen * 0.10
+        strength_y = jaw_sharpen * 0.05
+        jaw_tip_x, jaw_tip_y = pt(152)
+        for idx in _JAW_LEFT:
+            px, py = pt(idx)
+            dx = (cx - px) * strength_x
+            dy = (jaw_tip_y - py) * strength_y
+            src_all.append([px, py])
+            dst_all.append([px + dx, py + dy])
+        for idx in _JAW_RIGHT:
+            px, py = pt(idx)
+            dx = (cx - px) * strength_x
+            dy = (jaw_tip_y - py) * strength_y
+            src_all.append([px, py])
+            dst_all.append([px + dx, py + dy])
+
+    # ── eye_enlarge: 눈 윤곽 방사형 확대 ──
+    if eye_enlarge >= 0.01:
+        strength = eye_enlarge * 0.18  # 최대 18% 확대
+        # 왼쪽 눈
+        if n_landmarks > _LEFT_EYE_CENTER:
+            ecx, ecy = pt(_LEFT_EYE_CENTER)
+        else:
+            # iris 랜드마크 없으면 눈 중앙 계산
+            pts = [pt(i) for i in _LEFT_EYE_CONTOUR]
+            ecx = sum(p[0] for p in pts) / len(pts)
+            ecy = sum(p[1] for p in pts) / len(pts)
+        for idx in _LEFT_EYE_CONTOUR:
+            px, py = pt(idx)
+            dx = (px - ecx) * strength
+            dy = (py - ecy) * strength
+            src_all.append([px, py])
+            dst_all.append([px + dx, py + dy])
+
+        # 오른쪽 눈
+        if n_landmarks > _RIGHT_EYE_CENTER:
+            ecx, ecy = pt(_RIGHT_EYE_CENTER)
+        else:
+            pts = [pt(i) for i in _RIGHT_EYE_CONTOUR]
+            ecx = sum(p[0] for p in pts) / len(pts)
+            ecy = sum(p[1] for p in pts) / len(pts)
+        for idx in _RIGHT_EYE_CONTOUR:
+            px, py = pt(idx)
+            dx = (px - ecx) * strength
+            dy = (py - ecy) * strength
+            src_all.append([px, py])
+            dst_all.append([px + dx, py + dy])
+
+
+    # 코는 옮기지 않지만 "옮기지 않는다"를 명시해야 한다. 제어점이 없으면
+    # 주변 볼의 변위가 그대로 보간돼 코가 가로로 눌린다.
+    if src_all:
+        for idx in _NOSE_ANCHORS:
+            if idx >= n_landmarks:
+                continue
+            px, py = pt(idx)
+            src_all.append([px, py])
+            dst_all.append([px, py])
+
+    return src_all, dst_all
+
+
 def apply_face_reshape(
     img: Image.Image,
     face_slim: float = 0.0,
@@ -2710,82 +2832,9 @@ def apply_face_reshape(
             lm = face_lms[idx]
             return lm.x * w, lm.y * h
 
-        src_all: list[list[float]] = []
-        dst_all: list[list[float]] = []
-
-        # 얼굴 중심축.
-        # 코끝(1)을 쓰면 얼굴이 조금만 돌아가도 축이 한쪽으로 치우쳐
-        # 볼 슬림·턱선 이동량이 좌우로 달라진다. 광대 양끝(234, 454)의
-        # 중점은 고개 방향에 훨씬 덜 흔들린다.
-        left_cheek = _pt(234)
-        right_cheek = _pt(454)
-        cx = (left_cheek[0] + right_cheek[0]) / 2.0
-
-        # ── face_slim: 볼 양쪽을 중심 방향으로 ──
-        if face_slim >= 0.01:
-            strength = face_slim * 0.14  # 최대 14% 이동
-            for idx in _FACE_CONTOUR_LEFT:
-                px, py = _pt(idx)
-                dx = (cx - px) * strength
-                src_all.append([px, py])
-                dst_all.append([px + dx, py])
-            for idx in _FACE_CONTOUR_RIGHT:
-                if idx == 152:
-                    continue  # 턱 끝은 중복
-                px, py = _pt(idx)
-                dx = (cx - px) * strength
-                src_all.append([px, py])
-                dst_all.append([px + dx, py])
-
-        # ── jaw_sharpen: 턱선을 V자로 ──
-        if jaw_sharpen >= 0.01:
-            strength_x = jaw_sharpen * 0.10
-            strength_y = jaw_sharpen * 0.05
-            jaw_tip_x, jaw_tip_y = _pt(152)
-            for idx in _JAW_LEFT:
-                px, py = _pt(idx)
-                dx = (cx - px) * strength_x
-                dy = (jaw_tip_y - py) * strength_y
-                src_all.append([px, py])
-                dst_all.append([px + dx, py + dy])
-            for idx in _JAW_RIGHT:
-                px, py = _pt(idx)
-                dx = (cx - px) * strength_x
-                dy = (jaw_tip_y - py) * strength_y
-                src_all.append([px, py])
-                dst_all.append([px + dx, py + dy])
-
-        # ── eye_enlarge: 눈 윤곽 방사형 확대 ──
-        if eye_enlarge >= 0.01:
-            strength = eye_enlarge * 0.18  # 최대 18% 확대
-            # 왼쪽 눈
-            if len(face_lms) > _LEFT_EYE_CENTER:
-                ecx, ecy = _pt(_LEFT_EYE_CENTER)
-            else:
-                # iris 랜드마크 없으면 눈 중앙 계산
-                pts = [_pt(i) for i in _LEFT_EYE_CONTOUR]
-                ecx = sum(p[0] for p in pts) / len(pts)
-                ecy = sum(p[1] for p in pts) / len(pts)
-            for idx in _LEFT_EYE_CONTOUR:
-                px, py = _pt(idx)
-                dx = (px - ecx) * strength
-                dy = (py - ecy) * strength
-                src_all.append([px, py])
-                dst_all.append([px + dx, py + dy])
-
-            # 오른쪽 눈
-            if len(face_lms) > _RIGHT_EYE_CENTER:
-                ecx, ecy = _pt(_RIGHT_EYE_CENTER)
-            else:
-                pts = [_pt(i) for i in _RIGHT_EYE_CONTOUR]
-                ecx = sum(p[0] for p in pts) / len(pts)
-                ecy = sum(p[1] for p in pts) / len(pts)
-            for idx in _RIGHT_EYE_CONTOUR:
-                px, py = _pt(idx)
-                dx = (px - ecx) * strength
-                dy = (py - ecy) * strength
-                src_all.append([px, py])
-                dst_all.append([px + dx, py + dy])
+        src_all, dst_all = _build_reshape_controls(
+            _pt, len(face_lms), face_slim, jaw_sharpen, eye_enlarge
+        )
 
         if not src_all:
             continue
