@@ -6,6 +6,7 @@ import base64
 import hashlib
 import io
 import logging
+import math
 import os
 import tempfile
 from typing import Any
@@ -374,10 +375,38 @@ class MediaPipeCache:
 # ── Base64 ↔ PIL Image 변환 ──
 
 
+# 디코딩 전에 거절할 픽셀 수. 헤더만 읽고 판단하므로 압축 폭탄(작은 파일이
+# 수억 화소로 풀리는 PNG 등)을 메모리에 올리기 전에 막는다. Pillow 기본 경고선
+# (약 89MP)보다 낮게 둔다 — 파이프라인은 한 장에 원본의 수십 배를 쓴다.
+_MAX_DECODE_PIXELS = 50_000_000
+
+# 처리 해상도 상한. 앱(flutter_image_compress minWidth/minHeight=2560)은 짧은 변을
+# 2560 이하로 맞춰 보내고 긴 변은 비율대로 둔다 (4:3 → 3413x2560).
+# 짧은 변 상한은 그 계약과 같게 두어 앱 사진은 건드리지 않는다.
+# 픽셀 상한은 2560 기준 약 2.4:1 비율까지 원본 그대로 통과시키고,
+# 그보다 긴 파노라마만 줄인다 (2560px 한 장 피크 ~1.1GB, 동시 3장).
+_MAX_SHORT_EDGE = 2560
+_MAX_PROCESS_PIXELS = 16_000_000
+
+
 def decode_base64_image(b64: str) -> Image.Image:
-    """Base64 문자열을 PIL Image로 디코딩."""
+    """Base64 문자열을 PIL Image로 디코딩.
+
+    앱 밖에서 들어온 요청은 해상도 제한이 없으므로 서버에서도 막는다.
+    """
     data = base64.b64decode(b64)
-    return Image.open(io.BytesIO(data)).convert("RGB")
+    img = Image.open(io.BytesIO(data))
+    w, h = img.size
+    if w <= 0 or h <= 0 or w * h > _MAX_DECODE_PIXELS:
+        raise ValueError(f"처리할 수 없는 이미지 크기입니다 ({w}x{h})")
+    img = img.convert("RGB")
+
+    scale = min(1.0, _MAX_SHORT_EDGE / min(w, h), (_MAX_PROCESS_PIXELS / (w * h)) ** 0.5)
+    if scale < 1.0:
+        new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+        log.info("decode: %dx%d → %dx%d (해상도 상한)", w, h, *new_size)
+        img = img.resize(new_size, Image.LANCZOS)
+    return img
 
 
 def encode_image_base64(img: Image.Image, fmt: str = "JPEG", quality: int = 92) -> str:
@@ -1723,6 +1752,10 @@ def apply_smart_crop(
         ch = max(_CROP_MIN_SIDE, min(1.0, float(crop.get("height", 1))))
         if not allow_vertical_crop:
             y, ch = 0.0, 1.0
+        # 시작점을 안쪽으로 당긴다. 폭만 하한으로 올리고 x를 두면 오른쪽이
+        # 프레임 끝에서 잘려 하한이 무력해진다 (x=0.9, w=0.1 → 1000px가 100px).
+        x = min(x, 1.0 - cw)
+        y = min(y, 1.0 - ch)
 
         left = int(x * w)
         top = int(y * h)
@@ -2262,6 +2295,10 @@ def build_local_regions(
         except (TypeError, ValueError):
             log.info("local region %s: area 좌표를 읽을 수 없음 — 버림", name)
             continue
+        if not all(math.isfinite(v) for v in (ax, ay, aw, ah)):
+            # NaN은 min/max를 그대로 통과해 면적 검사도 빠져나간다
+            log.info("local region %s: area 좌표가 유한하지 않음 — 버림", name)
+            continue
 
         ax = min(max(ax, 0.0), 1.0)
         ay = min(max(ay, 0.0), 1.0)
@@ -2448,6 +2485,9 @@ def apply_regional_transforms(
             try:
                 value = float(raw)
             except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                # np.clip은 NaN을 그대로 돌려줘 상한을 통과한다
                 continue
 
             limited = _limit_region_value(region_name, param_name, value)
@@ -3503,6 +3543,62 @@ def _apply_all_transforms_impl(
 # ── AI 분석 → 변형 파라미터 자동 계산 ──
 
 
+def _finite_float(raw: Any, default: float = 0.0) -> float:
+    """숫자로 읽되 NaN·무한은 default로 본다.
+
+    min/max는 NaN을 만나면 다른 쪽 인자를 돌려준다 — min(1.0, nan)은 1.0이다.
+    클램핑만으로는 NaN이 버려지지 않고 **최대 보정**이 된다. json.loads가 표준
+    밖의 NaN·Infinity 리터럴을 받아들이므로 클라이언트 JSON에서 실제로 닿는다.
+    """
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if math.isfinite(val) else default
+
+
+def sanitize_tone_curve_points(raw: Any) -> list[tuple[float, float]] | None:
+    """톤 커브 제어점을 [(x, y), ...] 오름차순으로 정리한다. 쓸 수 없으면 None.
+
+    np.interp는 x가 오름차순이라고 가정하고 검사하지 않는다 — 뒤섞인 점은
+    오류 없이 엉뚱한 곡선을 만든다. 숫자가 아니거나 NaN인 점은 버린다.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return None
+    pts: list[tuple[float, float]] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return None
+        try:
+            px, py = float(item[0]), float(item[1])
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(px) and math.isfinite(py)):
+            return None
+        pts.append((px, py))
+    if len(pts) < 2:
+        return None
+    return sorted(pts)
+
+
+def sanitize_hsl_adjust(raw: Any) -> dict[str, dict[str, float]] | None:
+    """HSL 조절값을 알려진 채널·키만 남기고 -1~1로 자른다. 비면 None."""
+    if not isinstance(raw, dict):
+        return None
+    valid_channels = set(_HSL_CHANNELS.keys())
+    hsl_parsed: dict[str, dict[str, float]] = {}
+    for ch_name, ch_adj in raw.items():
+        if ch_name not in valid_channels or not isinstance(ch_adj, dict):
+            continue
+        parsed_adj: dict[str, float] = {}
+        for k in ("hue", "saturation", "lightness"):
+            v = _finite_float(ch_adj.get(k, 0.0))
+            parsed_adj[k] = round(max(-1.0, min(1.0, v)), 3)
+        if any(abs(v) >= 0.01 for v in parsed_adj.values()):
+            hsl_parsed[ch_name] = parsed_adj
+    return hsl_parsed if hsl_parsed else None
+
+
 def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
     """AI 분석 JSON의 recommendedParams를 슬라이더 초기값으로 사용한다.
 
@@ -3547,11 +3643,7 @@ def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
 
     params: dict[str, Any] = {}
     for key, default in default_params.items():
-        raw = recommended.get(key, default)
-        try:
-            val = float(raw)
-        except (TypeError, ValueError):
-            val = default
+        val = _finite_float(recommended.get(key, default), default)
         # 범위 클램핑
         if key in ("blemish_removal", "skin_smoothing", "auto_wb", "denoise",
                    "background_blur"):
@@ -3567,20 +3659,9 @@ def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
         if preset not in TONE_CURVE_PRESETS:
             preset = "linear"
         params["tone_curve_preset"] = preset
-        try:
-            strength = float(tone_curve.get("strength", 0.0))
-        except (TypeError, ValueError):
-            strength = 0.0
+        strength = _finite_float(tone_curve.get("strength", 0.0))
         params["tone_curve_strength"] = round(max(0.0, min(1.0, strength)), 3)
-        raw_points = tone_curve.get("points")
-        if isinstance(raw_points, list) and len(raw_points) >= 2:
-            try:
-                pts = [(float(x), float(y)) for x, y in raw_points]
-                params["tone_curve_points"] = sorted(pts)
-            except (TypeError, ValueError):
-                params["tone_curve_points"] = None
-        else:
-            params["tone_curve_points"] = None
+        params["tone_curve_points"] = sanitize_tone_curve_points(tone_curve.get("points"))
     else:
         params["tone_curve_preset"] = "linear"
         params["tone_curve_strength"] = 0.0
@@ -3592,26 +3673,18 @@ def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
         shadow = split_toning.get("shadow", {})
         highlight = split_toning.get("highlight", {})
         if isinstance(shadow, dict):
-            try:
-                params["split_shadow_hue"] = round(float(shadow.get("hue", 0.0)) % 360.0, 1)
-            except (TypeError, ValueError):
-                params["split_shadow_hue"] = 0.0
-            try:
-                params["split_shadow_strength"] = round(max(0.0, min(1.0, float(shadow.get("strength", 0.0)))), 3)
-            except (TypeError, ValueError):
-                params["split_shadow_strength"] = 0.0
+            params["split_shadow_hue"] = round(_finite_float(shadow.get("hue", 0.0)) % 360.0, 1)
+            params["split_shadow_strength"] = round(
+                max(0.0, min(1.0, _finite_float(shadow.get("strength", 0.0)))), 3
+            )
         else:
             params["split_shadow_hue"] = 0.0
             params["split_shadow_strength"] = 0.0
         if isinstance(highlight, dict):
-            try:
-                params["split_highlight_hue"] = round(float(highlight.get("hue", 0.0)) % 360.0, 1)
-            except (TypeError, ValueError):
-                params["split_highlight_hue"] = 0.0
-            try:
-                params["split_highlight_strength"] = round(max(0.0, min(1.0, float(highlight.get("strength", 0.0)))), 3)
-            except (TypeError, ValueError):
-                params["split_highlight_strength"] = 0.0
+            params["split_highlight_hue"] = round(_finite_float(highlight.get("hue", 0.0)) % 360.0, 1)
+            params["split_highlight_strength"] = round(
+                max(0.0, min(1.0, _finite_float(highlight.get("strength", 0.0)))), 3
+            )
         else:
             params["split_highlight_hue"] = 0.0
             params["split_highlight_strength"] = 0.0
@@ -3619,25 +3692,7 @@ def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
         params.update(_split_defaults)
 
     # HSL 선택적 색상 파싱
-    hsl_raw = recommended.get("hslAdjust")
-    if isinstance(hsl_raw, dict):
-        valid_channels = set(_HSL_CHANNELS.keys())
-        hsl_parsed: dict[str, dict[str, float]] = {}
-        for ch_name, ch_adj in hsl_raw.items():
-            if ch_name not in valid_channels or not isinstance(ch_adj, dict):
-                continue
-            parsed_adj: dict[str, float] = {}
-            for k in ("hue", "saturation", "lightness"):
-                try:
-                    v = float(ch_adj.get(k, 0.0))
-                except (TypeError, ValueError):
-                    v = 0.0
-                parsed_adj[k] = round(max(-1.0, min(1.0, v)), 3)
-            if any(abs(v) >= 0.01 for v in parsed_adj.values()):
-                hsl_parsed[ch_name] = parsed_adj
-        params["hsl_adjust"] = hsl_parsed if hsl_parsed else None
-    else:
-        params["hsl_adjust"] = None
+    params["hsl_adjust"] = sanitize_hsl_adjust(recommended.get("hslAdjust"))
 
     # 얼굴/체형 보정 파싱
     reshape = recommended.get("reshapeParams", {})
@@ -3649,17 +3704,11 @@ def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
             ("leg_stretch", (0.0, 1.0)),
             ("waist_slim", (0.0, 1.0)),
         ]:
-            try:
-                rv = float(reshape.get(rkey, 0.0))
-            except (TypeError, ValueError):
-                rv = 0.0
+            rv = _finite_float(reshape.get(rkey, 0.0))
             params[rkey] = round(max(rrange[0], min(rrange[1], rv)), 3)
 
         # shoulder_width: -1.0 ~ 1.0
-        try:
-            sw = float(reshape.get("shoulder_width", 0.0))
-        except (TypeError, ValueError):
-            sw = 0.0
+        sw = _finite_float(reshape.get("shoulder_width", 0.0))
         params["shoulder_width"] = round(max(-1.0, min(1.0, sw)), 3)
     else:
         params["face_slim"] = 0.0
