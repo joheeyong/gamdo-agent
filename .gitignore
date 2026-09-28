@@ -13,3 +13,6 @@ build/
 reference_images/
 
 .DS_Store
+
+# 서버 실행 로그
+server.log
