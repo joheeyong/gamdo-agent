@@ -2,18 +2,23 @@
 
 import base64
 import logging
+import math
 import os
-import secrets
+import re
 import threading
+from dataclasses import dataclass
+from urllib.parse import urlencode
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import httpx
 
+import auth
 from models import (
     AnalyzeAndTransformRequest,
     AnalyzeAndTransformResponse,
@@ -23,6 +28,7 @@ from models import (
     ApplyTransformResponse,
     AutoTransformRequest,
     AutoTransformResponse,
+    FirebaseTokenResponse,
     InstagramExchangeTokenRequest,
     InstagramExchangeTokenResponse,
     InstagramMediaRequest,
@@ -30,6 +36,8 @@ from models import (
     InstagramStoriesRequest,
     InstagramStoriesResponse,
     ReferenceImagesResponse,
+    SessionRequest,
+    SessionResponse,
     TransformPhotoRequest,
     TransformPhotoResponse,
 )
@@ -54,12 +62,32 @@ from image_processor import (
     decode_base64_image,
     detect_regions,
     encode_image_base64,
+    sanitize_hsl_adjust,
+    sanitize_tone_curve_points,
 )
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
+# httpx는 INFO에서 요청 URL을 쿼리째 남긴다. Instagram 호출은 access_token과
+# client_secret을 쿼리로 보내므로 그대로 두면 비밀값이 로그에 찍힌다.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("gamdo-agent")
+
+# 쿼리·본문에 실리는 비밀값. httpx 예외 메시지에 요청 URL이 통째로 들어간다.
+# 인가 code는 쿼리(code=...) 형태만 가린다. Instagram 에러 JSON의 "code": 400은
+# 에러 번호라 남겨 둔다.
+_SECRET_PARAM_RE = re.compile(
+    r"((?:access_token|client_secret|refresh_token|session_token|firebase_token)[\"']?\s*[=:]\s*[\"']?|\bcode=)"
+    r"[^&\s\"',}]+",
+    re.IGNORECASE,
+)
+
+
+def _redact(text: object) -> str:
+    """로그·에러 응답에 남기기 전에 토큰류 값을 가린다."""
+    return _SECRET_PARAM_RE.sub(r"\1***", str(text))
 
 app = FastAPI(title="GAMDO Agent", version="0.1.0")
 
@@ -74,6 +102,59 @@ app.add_middleware(
 # CORSMiddleware 뒤에 추가하여 CORS 헤더가 먼저 설정된 후 압축 적용
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
+
+# 요청 본문 상한. 가장 큰 정상 요청은 앱이 보내는 사진 한 장(최대 5MB JPEG →
+# base64 약 6.7MB)이라 넉넉히 잡는다. 상한이 없으면 수백 MB짜리 본문 하나가
+# JSON 파싱과 base64 디코딩에서 메모리를 몇 배로 부풀린다.
+_MAX_BODY_BYTES = int(float(os.getenv("GAMDO_MAX_BODY_MB", "50")) * 1024 * 1024)
+
+
+class _BodySizeLimitMiddleware:
+    """Content-Length가 상한을 넘으면 읽기 전에 413. 길이를 속이거나 chunked로
+    보내는 경우를 위해 실제로 읽은 바이트도 센다."""
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = 0
+                if declared > self.max_bytes:
+                    response = JSONResponse(
+                        {"detail": "Request body too large"}, status_code=413
+                    )
+                    await response(scope, receive, send)
+                    return
+
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    # FastAPI는 본문 읽기 중 난 HTTPException을 그대로 올려 보낸다
+                    raise StarletteHTTPException(
+                        status_code=413, detail="Request body too large"
+                    )
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
+# 마지막에 추가한 미들웨어가 가장 바깥이다 — 본문을 읽기 전에 거른다.
+app.add_middleware(_BodySizeLimitMiddleware, max_bytes=_MAX_BODY_BYTES)
+
 # 이미지 처리는 메모리를 많이 쓴다 (2560px 한 장에 피크 ~1.1GB).
 # FastAPI는 동기 엔드포인트를 기본 40개 스레드까지 동시에 돌리므로,
 # 제한이 없으면 동시 요청 몇 건에 프로세스가 죽는다.
@@ -85,21 +166,92 @@ INSTAGRAM_CLIENT_ID = os.getenv("INSTAGRAM_CLIENT_ID", "")
 INSTAGRAM_CLIENT_SECRET = os.getenv("INSTAGRAM_CLIENT_SECRET", "")
 
 
-def _verify_token(authorization: str | None = Header(None)):
-    """Bearer 토큰 검증.
+# ── 인증 ──
+#
+# 규칙 (앱과의 계약, scratchpad/auth_contract.md):
+# - APP_TOKEN과 일치하는 Bearer는 서비스 토큰 — 항상 통과, uid 제한 없음.
+# - 유효한 세션 토큰이면 uid를 얻고, 요청의 user_id가 그와 다르면 403.
+# - 세션이 없거나 무효면: GAMDO_AUTH_REQUIRED가 켜져 있으면 401,
+#   아니면(과도기) 예전 동작 — APP_TOKEN이 설정돼 있으면 401, 없으면 통과.
+#   과도기 통과를 막지 않는 이유는 헤더를 보내지 않는 기존 앱 빌드 때문이다.
 
-    removeprefix를 쓰는 이유: replace("Bearer ", "")는 문자열 어디서나 치환해
-    토큰 안에 그 문자열이 들어 있으면 값을 망친다.
+
+class AuthError(Exception):
+    """인증·인가 실패. 전용 핸들러가 {"success", "error", "error_code"} 형식으로 답한다."""
+
+    def __init__(self, status_code: int, error_code: str, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+        self.message = message
+
+
+@app.exception_handler(AuthError)
+async def _auth_error_handler(_request: Request, exc: AuthError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"success": False, "error": exc.message, "error_code": exc.error_code},
+    )
+
+
+@dataclass(frozen=True)
+class AuthContext:
+    uid: str | None = None   # 유효한 세션의 Instagram user_id
+    service: bool = False    # APP_TOKEN(서비스 토큰)으로 들어온 요청
+
+
+def _session_invalid() -> AuthError:
+    return AuthError(401, "session_invalid", "세션이 없거나 만료되었습니다")
+
+
+def _authenticate(authorization: str | None, path: str = "") -> AuthContext:
+    """Authorization 헤더를 해석한다. 토큰 값은 로그에 남기지 않는다.
+
     compare_digest를 쓰는 이유: ==는 앞에서부터 비교하다 처음 다른 곳에서
     멈춰, 응답 시간으로 토큰을 한 글자씩 알아낼 여지를 준다.
     """
-    if not APP_TOKEN:
+    token = auth.parse_bearer(authorization)
+
+    if token and APP_TOKEN and auth.tokens_equal(token, APP_TOKEN):
+        return AuthContext(service=True)
+
+    uid = auth.verify_session(token) if token else None
+    if uid:
+        return AuthContext(uid=uid)
+
+    if auth.auth_required():
+        raise _session_invalid()
+
+    # 과도기: 기존 앱 빌드 호환
+    if APP_TOKEN:
+        raise _session_invalid()
+    log.warning("auth: 세션 없는 요청을 과도기 규칙으로 통과시킴 (%s)", path or "-")
+    return AuthContext()
+
+
+def require_auth(request: Request, authorization: str | None = Header(None)) -> AuthContext:
+    """FastAPI 의존성 — 인증 면제가 아닌 엔드포인트에 붙인다."""
+    return _authenticate(authorization, request.url.path)
+
+
+def require_session(authorization: str | None = Header(None)) -> AuthContext:
+    """세션이 반드시 있어야 하는 엔드포인트용 (과도기에도). 서비스 토큰도 안 된다 — uid가 없다."""
+    uid = auth.verify_session(auth.parse_bearer(authorization))
+    if not uid:
+        raise _session_invalid()
+    return AuthContext(uid=uid)
+
+
+def _check_user(ctx: AuthContext | None, user_id: str | None) -> None:
+    """요청의 user_id가 세션 uid와 다르면 403. 세션이 없는 요청(서비스·과도기)은 검사하지 않는다.
+
+    ctx가 AuthContext가 아니면(테스트가 엔드포인트 함수를 직접 부른 경우) 건너뛴다 —
+    HTTP로 들어온 요청에는 FastAPI가 항상 require_auth 결과를 넣는다.
+    """
+    if not isinstance(ctx, AuthContext):
         return
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header required")
-    token = authorization.removeprefix("Bearer ").strip()
-    if not secrets.compare_digest(token, APP_TOKEN):
-        raise HTTPException(status_code=401, detail="Invalid token")
+    if ctx.uid and user_id and user_id != ctx.uid:
+        raise AuthError(403, "forbidden_user", "다른 사용자의 데이터에는 접근할 수 없습니다")
 
 
 @app.get("/health")
@@ -110,10 +262,10 @@ def health():
 @app.post("/api/analyze-user", response_model=AnalyzeUserResponse)
 def api_analyze_user(
     req: AnalyzeUserRequest,
-    authorization: str | None = Header(None),
+    ctx: AuthContext = Depends(require_auth),
 ):
     """사용자의 게시글/피드/스토리를 분석하여 스타일 프로필을 반환합니다."""
-    _verify_token(authorization)
+    _check_user(ctx, req.user_id)
 
     try:
         log.info(
@@ -139,11 +291,9 @@ def api_analyze_user(
 @app.post("/api/transform-photo", response_model=TransformPhotoResponse)
 def api_transform_photo(
     req: TransformPhotoRequest,
-    authorization: str | None = Header(None),
+    ctx: AuthContext = Depends(require_auth),
 ):
     """사용자 스타일 프로필에 맞춰 사진 보정 가이드를 반환합니다."""
-    _verify_token(authorization)
-
     try:
         log.info("transform-photo: style=%s", req.style_profile.get("primaryStyle", "unknown"))
 
@@ -167,10 +317,10 @@ def api_transform_photo(
 @app.post("/api/analyze-and-transform", response_model=AnalyzeAndTransformResponse)
 def api_analyze_and_transform(
     req: AnalyzeAndTransformRequest,
-    authorization: str | None = Header(None),
+    ctx: AuthContext = Depends(require_auth),
 ):
     """사진 분석 + 변형을 한 번에 수행. Claude가 사진을 분석하고, 결과를 바탕으로 즉시 변형."""
-    _verify_token(authorization)
+    _check_user(ctx, req.user_id)
 
     try:
         # 1. Claude가 사진 분석 (Vision)
@@ -204,6 +354,10 @@ def api_analyze_and_transform(
             reference = measure_reference_target(
                 get_reference_image_paths(req.user_id) if req.user_id else []
             )
+            # 적합도 '이전' 값은 손대기 전의 사진으로 잰다. 아래에서 img가 영역
+            # 보정·기하 보정 결과로 바뀌므로 지금 재 두지 않으면 before에
+            # 보정이 섞인다.
+            before_stats = measure_image_stats(img) if reference else None
 
             # 보정 파라미터: 히스토그램 측정 + 목표값으로 산출.
             # 왜 그 값이 나왔는지 설명도 함께 만든다 (모델 호출 없음).
@@ -224,7 +378,9 @@ def api_analyze_and_transform(
             # 수직 원근(키스톤)은 건축물용 변형이다. 한쪽 끝을 가로로 늘리므로
             # 인물에 적용하면 몸이 옆으로 퍼지고 다리 비율이 무너진다.
             # 사람이 주인공인 사진에서는 건드리지 않는다.
-            subject = str(analysis.get("subjectType") or "")
+            # param_engine(build_params_with_comment)과 같은 기준 — 공백이 붙은
+            # "인물 "을 한쪽은 인물로, 한쪽은 아니라고 보면 결정이 갈린다.
+            subject = str(analysis.get("subjectType") or "").strip()
             keystone = 0.0 if subject == "인물" else estimate_keystone(img)
             if abs(keystone) >= 0.02:
                 auto_edits["keystone"] = keystone
@@ -237,7 +393,11 @@ def api_analyze_and_transform(
             elif auto_edits.get("straighten") is not None:
                 # 측정이 확신하지 못하면 모델의 판단을 쓰되 안전 범위로 묶는다
                 try:
-                    llm_tilt = max(-8.0, min(8.0, float(auto_edits["straighten"])))
+                    llm_tilt = float(auto_edits["straighten"])
+                    if not math.isfinite(llm_tilt):
+                        # min/max는 NaN을 만나면 다른 쪽 인자를 돌려준다 — 8°가 된다
+                        raise ValueError("non-finite tilt")
+                    llm_tilt = max(-8.0, min(8.0, llm_tilt))
                     auto_edits["straighten"] = llm_tilt
                     measured_tilt = llm_tilt
                     log.info("analyze-and-transform: using model tilt %.2f°", llm_tilt)
@@ -290,7 +450,7 @@ def api_analyze_and_transform(
 
             # 피드 적합도: 모델의 추측이 아니라 대표 사진과의 실제 거리
             if reference:
-                before = feed_compatibility(measure_image_stats(img), reference)
+                before = feed_compatibility(before_stats, reference)
                 after = feed_compatibility(measure_image_stats(transformed), reference)
                 analysis["feedCompatibility"] = after
                 analysis["feedCompatibilityBefore"] = before
@@ -316,11 +476,9 @@ def api_analyze_and_transform(
 @app.post("/api/auto-transform", response_model=AutoTransformResponse)
 def api_auto_transform(
     req: AutoTransformRequest,
-    authorization: str | None = Header(None),
+    ctx: AuthContext = Depends(require_auth),
 ):
     """AI 분석 기반 자동 변형. 분석 결과와 스타일 프로필로 파라미터를 계산하여 변형."""
-    _verify_token(authorization)
-
     try:
         log.info("auto-transform: computing params from analysis")
 
@@ -367,11 +525,9 @@ def api_auto_transform(
 @app.post("/api/apply-transform", response_model=ApplyTransformResponse)
 def api_apply_transform(
     req: ApplyTransformRequest,
-    authorization: str | None = Header(None),
+    ctx: AuthContext = Depends(require_auth),
 ):
     """슬라이더 값으로 수동 변형. 원본에서 항상 새로 적용 (누적 열화 방지)."""
-    _verify_token(authorization)
-
     try:
         params = {
             "brightness": req.brightness,
@@ -392,12 +548,14 @@ def api_apply_transform(
             "background_blur": req.background_blur,
             "tone_curve_preset": req.tone_curve_preset,
             "tone_curve_strength": req.tone_curve_strength,
-            "tone_curve_points": req.tone_curve_points,
+            # 분석 경로와 같은 정리를 거친다. 뒤섞인 점은 np.interp가 검사 없이
+            # 엉뚱한 곡선을 만들고, 문자열 값은 변환 중 TypeError가 난다.
+            "tone_curve_points": sanitize_tone_curve_points(req.tone_curve_points),
             "split_shadow_hue": req.split_shadow_hue,
             "split_shadow_strength": req.split_shadow_strength,
             "split_highlight_hue": req.split_highlight_hue,
             "split_highlight_strength": req.split_highlight_strength,
-            "hsl_adjust": req.hsl_adjust,
+            "hsl_adjust": sanitize_hsl_adjust(req.hsl_adjust),
             "face_slim": req.face_slim,
             "jaw_sharpen": req.jaw_sharpen,
             "eye_enlarge": req.eye_enlarge,
@@ -458,10 +616,10 @@ def api_apply_transform(
 @app.get("/api/reference-images/{user_id}", response_model=ReferenceImagesResponse)
 def api_reference_images(
     user_id: str,
-    authorization: str | None = Header(None),
+    ctx: AuthContext = Depends(require_auth),
 ):
     """사용자의 대표 사진 3장을 base64로 반환합니다."""
-    _verify_token(authorization)
+    _check_user(ctx, user_id)
 
     try:
         paths = get_reference_image_paths(user_id)
@@ -492,20 +650,19 @@ INSTAGRAM_APP_REDIRECT = "gamdo://oauth/instagram"
 def api_instagram_callback(code: str = Query(...), state: str = Query(default="")):
     """Instagram OAuth 콜백 → 앱 커스텀 스킴으로 리디렉션."""
     log.info("instagram/callback: received code, redirecting to app")
-    redirect_url = f"{INSTAGRAM_APP_REDIRECT}?code={code}"
+    # 값을 그대로 이어 붙이면 '&'·'#'이 든 값이 쿼리를 깨거나 파라미터를 끼워 넣는다
+    query = {"code": code}
     if state:
-        redirect_url += f"&state={state}"
-    return RedirectResponse(url=redirect_url)
+        query["state"] = state
+    return RedirectResponse(url=f"{INSTAGRAM_APP_REDIRECT}?{urlencode(query)}")
 
 
 @app.post("/api/instagram/exchange-token", response_model=InstagramExchangeTokenResponse)
-def api_instagram_exchange_token(
-    req: InstagramExchangeTokenRequest,
-    authorization: str | None = Header(None),
-):
-    """Authorization code → short-lived access_token 교환 (client_secret 보호)."""
-    _verify_token(authorization)
+def api_instagram_exchange_token(req: InstagramExchangeTokenRequest):
+    """Authorization code → short-lived access_token 교환 (client_secret 보호).
 
+    인증 면제 — 앱은 아직 세션이 없는 상태로 부른다. 성공하면 감도 세션도 함께 발급한다.
+    """
     if not INSTAGRAM_CLIENT_ID or not INSTAGRAM_CLIENT_SECRET:
         return InstagramExchangeTokenResponse(
             success=False,
@@ -536,7 +693,7 @@ def api_instagram_exchange_token(
         if not access_token:
             return InstagramExchangeTokenResponse(
                 success=False,
-                error=f"No access_token in response: {token_data}",
+                error=f"No access_token in response: {_redact(token_data)}",
             )
 
         # Long-lived token 교환
@@ -555,33 +712,34 @@ def api_instagram_exchange_token(
                 access_token = ll_data.get("access_token", access_token)
                 log.info("instagram/exchange-token: upgraded to long-lived token")
         except Exception as e:
-            log.warning("Long-lived token exchange failed, using short-lived: %s", e)
+            log.warning("Long-lived token exchange failed, using short-lived: %s", _redact(e))
 
         log.info("instagram/exchange-token: success, user_id=%s", user_id)
-        return InstagramExchangeTokenResponse(
-            success=True,
-            data={"access_token": access_token, "user_id": str(user_id)},
-        )
+        data = {"access_token": access_token, "user_id": str(user_id)}
+        # user_id는 client_secret으로 서버가 직접 받은 값이라 믿을 수 있다.
+        # 세션 미설정 서버면 두 필드를 null로 둔다 (앱은 예전처럼 동작).
+        data["session_token"], data["session_expires_at"] = _try_issue_session(str(user_id))
+        return InstagramExchangeTokenResponse(success=True, data=data)
 
     except httpx.HTTPStatusError as e:
-        log.exception("instagram/exchange-token HTTP error")
-        body = e.response.text
+        # 예외 메시지에 요청 URL(access_token·client_secret 쿼리 포함)이 들어가므로
+        # 트레이스백 대신 가린 메시지만 남긴다
+        log.error("instagram/exchange-token HTTP error: %s", _redact(e))
+        body = _redact(e.response.text)
         return InstagramExchangeTokenResponse(
             success=False, error=f"Instagram API error: {body}"
         )
     except Exception as e:
         log.exception("instagram/exchange-token failed")
-        return InstagramExchangeTokenResponse(success=False, error=str(e))
+        return InstagramExchangeTokenResponse(success=False, error=_redact(e))
 
 
 @app.post("/api/instagram/media", response_model=InstagramMediaResponse)
-def api_instagram_media(
-    req: InstagramMediaRequest,
-    authorization: str | None = Header(None),
-):
-    """Instagram 미디어 목록을 프록시 조회 (페이지네이션 포함)."""
-    _verify_token(authorization)
+def api_instagram_media(req: InstagramMediaRequest):
+    """Instagram 미디어 목록을 프록시 조회 (페이지네이션 포함).
 
+    인증 면제 — 요청의 IG access_token 자체가 자격증명이다.
+    """
     try:
         log.info("instagram/media: fetching media list")
 
@@ -618,24 +776,21 @@ def api_instagram_media(
         return InstagramMediaResponse(success=True, data=all_items)
 
     except httpx.HTTPStatusError as e:
-        log.exception("instagram/media HTTP error")
-        body = e.response.text
+        # 예외 메시지에 요청 URL(access_token·client_secret 쿼리 포함)이 들어가므로
+        # 트레이스백 대신 가린 메시지만 남긴다
+        log.error("instagram/media HTTP error: %s", _redact(e))
+        body = _redact(e.response.text)
         return InstagramMediaResponse(
             success=False, error=f"Instagram API error: {body}"
         )
     except Exception as e:
         log.exception("instagram/media failed")
-        return InstagramMediaResponse(success=False, error=str(e))
+        return InstagramMediaResponse(success=False, error=_redact(e))
 
 
 @app.post("/api/instagram/stories", response_model=InstagramStoriesResponse)
-def api_instagram_stories(
-    req: InstagramStoriesRequest,
-    authorization: str | None = Header(None),
-):
-    """Instagram 스토리 목록을 프록시 조회."""
-    _verify_token(authorization)
-
+def api_instagram_stories(req: InstagramStoriesRequest):
+    """Instagram 스토리 목록을 프록시 조회. 인증 면제 (IG access_token이 자격증명)."""
     try:
         log.info("instagram/stories: fetching stories")
 
@@ -658,14 +813,114 @@ def api_instagram_stories(
         return InstagramStoriesResponse(success=True, data=story_items)
 
     except httpx.HTTPStatusError as e:
-        log.exception("instagram/stories HTTP error")
-        body = e.response.text
+        # 예외 메시지에 요청 URL(access_token·client_secret 쿼리 포함)이 들어가므로
+        # 트레이스백 대신 가린 메시지만 남긴다
+        log.error("instagram/stories HTTP error: %s", _redact(e))
+        body = _redact(e.response.text)
         return InstagramStoriesResponse(
             success=False, error=f"Instagram API error: {body}"
         )
     except Exception as e:
         log.exception("instagram/stories failed")
-        return InstagramStoriesResponse(success=False, error=str(e))
+        return InstagramStoriesResponse(success=False, error=_redact(e))
+
+
+# ── 세션 API ──
+
+
+def _try_issue_session(uid: str) -> tuple[str | None, int | None]:
+    """세션 발급. 비밀키가 없거나 uid가 비었으면 (None, None)."""
+    if not uid:
+        return None, None
+    try:
+        return auth.issue_session(uid)
+    except (auth.SessionNotConfigured, ValueError):
+        return None, None
+
+
+@app.post("/api/session", response_model=SessionResponse)
+def api_session(req: SessionRequest):
+    """Instagram long-lived 토큰을 확인하고 감도 세션을 발급한다. 인증 면제.
+
+    앱은 로그인 복원 시(세션이 없거나 만료 7일 이내)와 API가 session_invalid로
+    401을 줬을 때 부른다.
+    """
+    if not auth.session_configured():
+        raise AuthError(503, "session_not_configured", "서버에 세션 비밀키가 설정되지 않았습니다")
+
+    access_token = (req.access_token or "").strip()
+    if not access_token:
+        raise AuthError(401, "instagram_token_invalid", "Instagram 토큰이 유효하지 않습니다")
+
+    try:
+        with httpx.Client(timeout=15) as client:
+            # 토큰은 쿼리 대신 헤더로 — URL은 프록시·예외 메시지에 그대로 남는다
+            resp = client.get(
+                f"{INSTAGRAM_GRAPH_URL}/me",
+                params={"fields": "id,user_id,username"},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+    except httpx.HTTPError as e:
+        log.error("session: Instagram 호출 실패: %s", _redact(e))
+        raise AuthError(502, "instagram_unavailable", "Instagram에 연결할 수 없습니다")
+
+    # Instagram은 무효·만료 토큰에 400(OAuthException code 190)을 준다
+    if resp.status_code in (400, 401, 403):
+        log.info("session: Instagram 토큰 거부 (HTTP %d)", resp.status_code)
+        raise AuthError(401, "instagram_token_invalid", "Instagram 토큰이 유효하지 않습니다")
+    if resp.status_code != 200:
+        log.error("session: Instagram HTTP %d: %s", resp.status_code, _redact(resp.text[:300]))
+        raise AuthError(502, "instagram_unavailable", "Instagram 응답이 올바르지 않습니다")
+
+    try:
+        me = resp.json()
+    except ValueError:
+        me = None
+    # exchange-token이 준 user_id(토큰 교환 응답)와 /me의 user_id가 서로 다른 ID
+    # 체계일 수 있다. 앱이 저장해 둔 값이 이 토큰의 id·user_id 중 하나와 맞으면
+    # 그 값으로 발급해, 로그인 때 세션·RTDB 경로(users/{userId})와 uid를 일치시킨다.
+    candidates: list[str] = []
+    if isinstance(me, dict):
+        for key in ("user_id", "id"):
+            v = str(me.get(key) or "").strip()
+            if v and v not in candidates:
+                candidates.append(v)
+    if not candidates:
+        log.error("session: Instagram 응답에 user_id가 없음")
+        raise AuthError(502, "instagram_unavailable", "Instagram 응답에 사용자 ID가 없습니다")
+
+    claimed = (req.user_id or "").strip()
+    if claimed:
+        if claimed not in candidates:
+            log.warning("session: 요청 user_id가 토큰 소유자와 다름")
+            raise AuthError(403, "forbidden_user", "다른 사용자의 세션은 발급할 수 없습니다")
+        uid = claimed
+    else:
+        uid = candidates[0]
+
+    token, exp = auth.issue_session(uid)
+    log.info("session: issued for user %s", uid)
+    return SessionResponse(
+        success=True,
+        data={"session_token": token, "session_expires_at": exp, "user_id": uid},
+    )
+
+
+@app.post("/api/firebase-token", response_model=FirebaseTokenResponse)
+def api_firebase_token(ctx: AuthContext = Depends(require_session)):
+    """세션 uid로 Firebase 커스텀 토큰을 만든다 (RTDB 규칙의 auth.uid = Instagram user_id).
+
+    서비스 계정이 없거나 firebase-admin이 없으면 503 — 앱은 Firebase Auth 없이 진행한다.
+    """
+    try:
+        token = auth.create_firebase_token(ctx.uid)
+    except Exception as e:
+        log.error("firebase-token: 발급 실패: %s", type(e).__name__)
+        token = None
+    if not token:
+        raise AuthError(503, "firebase_not_configured", "서버에 Firebase가 설정되지 않았습니다")
+    log.info("firebase-token: issued for user %s", ctx.uid)
+    return FirebaseTokenResponse(success=True, data={"firebase_token": token})
 
 
 if __name__ == "__main__":

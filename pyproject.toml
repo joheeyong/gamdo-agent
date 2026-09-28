@@ -22,7 +22,16 @@ test = [
     "pytest>=8.0.0",
     "httpx",
 ]
+firebase = [
+    "firebase-admin>=6",
+]
 
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.pytest.ini_options]
+# 테스트가 루트의 모듈(image_processor 등)을 바로 import한다.
+# `pytest`로 실행하면 rootdir이 sys.path에 들어가지 않아 수집 단계에서 실패한다.
+pythonpath = ["."]
+testpaths = ["tests"]

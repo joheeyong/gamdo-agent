@@ -176,3 +176,30 @@ class ReferenceImagesResponse(BaseModel):
     success: bool
     images: list[str] = Field(default_factory=list, description="base64 인코딩된 대표 사진 목록")
     error: str | None = None
+
+
+# ── 세션 API ──
+
+class SessionRequest(BaseModel):
+    """Instagram long-lived 토큰으로 감도 세션 발급 요청."""
+    access_token: str = Field(..., description="Instagram long-lived access token")
+    user_id: str = Field(
+        "",
+        description="앱이 로그인 때 저장한 user_id. /me의 id·user_id 중 하나와 맞으면 이 값으로 발급",
+    )
+
+
+class SessionResponse(BaseModel):
+    success: bool
+    data: dict | None = Field(
+        None, description="{session_token, session_expires_at, user_id}"
+    )
+    error: str | None = None
+    error_code: str | None = None
+
+
+class FirebaseTokenResponse(BaseModel):
+    success: bool
+    data: dict | None = Field(None, description="{firebase_token}")
+    error: str | None = None
+    error_code: str | None = None
