@@ -379,17 +379,7 @@ def _call_claude(
     log.info("Calling claude CLI (model=%s, prompt length=%d, images=%d, tools=%s)",
              MODEL, len(prompt), len(image_paths or []), tools or "all")
 
-    # 중첩 세션 환경변수 + 만료된 API 키 제거 → CLI 자체 인증(OAuth) 사용.
-    #
-    # 이름을 하나라도 틀리면 조용히 통과한다. 실제로 CLAUDE_CODE_ENTRY_POINT와
-    # CLAUDE_CODE_SESSION은 존재하지 않는 이름이라(각각 ENTRYPOINT, SESSION_ID)
-    # 아무것도 지우지 못하고 있었다. 접두어로 걸러 오타 여지를 없앤다.
-    blocked_exact = {"CLAUDECODE", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in blocked_exact and not k.startswith(("CLAUDE_CODE_", "CLAUDE_"))
-    }
+    env = child_env(os.environ)
 
     result = subprocess.run(
         cmd,
@@ -414,6 +404,29 @@ def _call_claude(
         log.error("claude CLI returned empty response. stderr: %s", result.stderr)
         raise RuntimeError("claude CLI returned empty response")
     return result.stdout
+
+
+# 자식 CLI에 넘길 환경변수. 중첩 세션 흔적은 지우되 인증 수단은 남긴다.
+#
+# CLAUDE_CODE_OAUTH_TOKEN이 곧 로그인 자격증명이다. "CLAUDE_CODE_ 접두어를
+# 전부 지운다"로 바꿨다가 이걸 같이 날려 서버 전체가 인증 실패했다.
+# 접두어 차단은 오타를 막아 주지만, 지우면 안 되는 것을 명시해야 안전하다.
+_ENV_KEEP = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
+
+# 중첩 세션 표시 + 만료된 API 키. 후자는 .env에 남아 있는 옛 키가
+# CLI의 OAuth 경로를 가로채지 않도록 지운다.
+_ENV_BLOCK_EXACT = frozenset({"CLAUDECODE", "ANTHROPIC_API_KEY"})
+_ENV_BLOCK_PREFIX = ("CLAUDE_CODE_", "CLAUDE_")
+
+
+def child_env(source: "os._Environ[str] | dict[str, str]") -> dict[str, str]:
+    """claude CLI 자식 프로세스에 넘길 환경을 만든다."""
+    return {
+        k: v
+        for k, v in source.items()
+        if k in _ENV_KEEP
+        or (k not in _ENV_BLOCK_EXACT and not k.startswith(_ENV_BLOCK_PREFIX))
+    }
 
 
 def _cleanup_files(paths: list[str]) -> None:
