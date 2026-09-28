@@ -40,7 +40,7 @@ def _analysis(with_geometry: bool) -> dict:
         "compositionAnalysis": {"primaryTechnique": "x", "balanceScore": 0.5,
                                 "strengths": [], "improvements": []},
         "toneReport": {"overallMood": "x", "styleCategory": "x", "narrative": "x"},
-        "shootingTips": [], "editingTips": [], "overallScore": 50,
+        "shootingTips": [], "editingTips": [],
         "autoEdits": auto,
         "regionParams": {
             "local_0": {"area": dict(WINDOW), "shape": "rect", "feather": 0.3,

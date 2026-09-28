@@ -80,31 +80,20 @@ _REQUIRED_SHAPE: dict[str, tuple[type, ...] | dict[str, tuple[type, ...]]] = {
     "compositionAnalysis": {
         "primaryTechnique": (str,),
         "balanceScore": (int, float),
-        "strengths": (list,),
-        "improvements": (list,),
     },
     "toneReport": {
         "overallMood": (str,),
         "styleCategory": (str,),
         "narrative": (str,),
     },
-    "shootingTips": (list,),
-    "editingTips": (list,),
-    "overallScore": (int, float),
 }
 
 # 복구도 실패했을 때 채워 넣는 값. 사진 변형은 서버가 계산하므로 영향이 없고,
 # 분석 화면만 비어 보인다 — 응답의 warnings로 그 사실을 알린다.
 _ANALYSIS_FALLBACKS: dict[str, Any] = {
     "colorAnalysis": {"colorHarmony": "분석 불가", "paletteDescription": ""},
-    "compositionAnalysis": {
-        "primaryTechnique": "분석 불가", "balanceScore": 0.5,
-        "strengths": [], "improvements": [],
-    },
+    "compositionAnalysis": {"primaryTechnique": "분석 불가", "balanceScore": 0.5},
     "toneReport": {"overallMood": "", "styleCategory": "", "narrative": ""},
-    "shootingTips": [],
-    "editingTips": [],
-    "overallScore": 0,
 }
 
 

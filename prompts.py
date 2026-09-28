@@ -163,10 +163,10 @@ TRANSFORM_PHOTO_PROMPT = """\
 - autoEdits: 구도·기울기·거슬리는 요소는 눈으로 봐야 아는 판단입니다.
 - regionParams: 하늘/얼굴/배경, 그리고 좌표로 짚는 국소 보정(local_*).
 - hslAdjust: 색계열별 조정. 히스토그램 평균으로는 절대 나오지 않는 값입니다.
-- toneReport·팁·구도 분석: 이 사용자의 스타일(primaryStyle, trendCategory,
+- toneReport·구도 분석: 이 사용자의 스타일(primaryStyle, trendCategory,
   moodKeywords)에 비추어 설명하세요.
 - feedCohesion.coreColors가 있으면, 이 사진이 그 색들과 어울리는지를
-  toneReport와 팁에 반영하세요.
+  toneReport에 반영하세요.
 
 === autoEdits (AI 자동 편집) 가이드 ===
 사진을 관찰하여 다음 자동 편집을 판단하세요.
@@ -247,9 +247,7 @@ TRANSFORM_PHOTO_PROMPT = """\
   }},
   "compositionAnalysis": {{
     "primaryTechnique": "삼분법 | 중앙배치 | 대각선 등",
-    "balanceScore": 0.0~1.0,
-    "strengths": ["구도의 장점 1", "구도의 장점 2"],
-    "improvements": ["개선할 점 1", "개선할 점 2"]
+    "balanceScore": 0.0~1.0
   }},
   "toneReport": {{
     "overallMood": "2~3단어로 분위기 (예: 따뜻한 감성)",
@@ -257,15 +255,6 @@ TRANSFORM_PHOTO_PROMPT = """\
     "narrative": "한 문장으로 톤앤매너 설명 (20자 이내)"
   }},
   "subjectType": "인물 | 풍경 | 음식 | 카페/일상 | 사물 | 동물 | 혼합",
-  "shootingTips": [
-    "10자 이내 핵심 팁 1",
-    "10자 이내 핵심 팁 2"
-  ],
-  "editingTips": [
-    "10자 이내 핵심 팁 1",
-    "10자 이내 핵심 팁 2"
-  ],
-  "overallScore": 0~100,
   "autoEdits": {{
     "straighten": -8.0~+8.0 | null,
     "crop": {{"x": 0.0~1.0, "y": 0.0~1.0, "width": 0.3~1.0, "height": 0.3~1.0}} | null,
