@@ -6,11 +6,15 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
+import threading
 import time
+import uuid
 from collections import OrderedDict
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 from PIL import Image
 
@@ -48,26 +52,61 @@ def _loads_strict(text: str) -> dict:
     return json.loads(text, parse_constant=lambda _name: None)
 
 
-def _parse_json_response(text: str) -> dict:
-    """응답 텍스트에서 JSON을 추출한다."""
-    text = text.strip()
+# 코드블록(```json ... ``` 또는 태그 없는 ``` ... ```) 안쪽을 꺼낸다
+_FENCE_RE = re.compile(r"```[ \t]*(?:json)?[ \t]*\r?\n?(.*?)```", re.DOTALL | re.IGNORECASE)
 
-    # 코드블록 제거
-    if "```json" in text:
-        text = text.split("```json", 1)[1]
-    if "```" in text:
-        text = text.split("```")[0]
-    text = text.strip()
+
+def _try_parse_object(text: str) -> dict | None:
+    """text에서 JSON 객체 하나를 찾아 돌려준다. 못 찾으면 None."""
+    try:
+        value = _loads_strict(text)
+        if isinstance(value, dict):
+            return value
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    # 첫 번째 { 에서 객체 하나만 읽는다 — 뒤에 붙은 설명문은 무시된다
+    decoder = json.JSONDecoder(parse_constant=lambda _name: None)
+    try:
+        value, _ = decoder.raw_decode(text, start)
+        if isinstance(value, dict):
+            return value
+    except json.JSONDecodeError:
+        pass
 
     # 그래도 안 되면 첫 번째 { 부터 마지막 } 까지 추출
-    try:
-        return _loads_strict(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return _loads_strict(text[start : end + 1])
-        raise
+    end = text.rfind("}")
+    if end > start:
+        try:
+            value = _loads_strict(text[start : end + 1])
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def _parse_json_response(text: str) -> dict:
+    """응답 텍스트에서 JSON 객체를 추출한다.
+
+    예전에는 ``` 로 split해서 [0]을 취했다. 태그 없는 ``` 앞에 설명문이
+    있으면 JSON이 아니라 그 설명문을 파싱하다 실패했다. 코드블록 안쪽을
+    먼저 보고, 없으면 전체 텍스트에서 찾는다. 호출부가 전부 .get()을 쓰므로
+    객체(dict)가 아니면 실패로 본다.
+    """
+    text = text.strip()
+
+    candidates = [m.group(1).strip() for m in _FENCE_RE.finditer(text)]
+    candidates.append(text)
+    for candidate in candidates:
+        parsed = _try_parse_object(candidate)
+        if parsed is not None:
+            return parsed
+    raise ValueError(f"응답에서 JSON 객체를 찾지 못함: {text[:200]!r}")
 
 
 # Flutter의 PhotoAnalysisResponse가 파싱에 반드시 필요로 하는 필드.
@@ -242,6 +281,27 @@ def _format_items(items: list[dict]) -> str:
     return "\n".join(parts)
 
 
+# image_url은 클라이언트가 보낸 값이라 서버가 대신 요청을 날리는 통로가 된다
+# (내부망·메타데이터 주소 접근, 거대 파일로 메모리 고갈). 앱이 보내는 것은
+# Instagram Graph API의 media_url/thumbnail_url뿐이므로 그 CDN만 허용한다.
+_ALLOWED_IMAGE_HOST_SUFFIXES = ("cdninstagram.com", "fbcdn.net")
+_DOWNLOAD_MAX_BYTES = 15 * 1024 * 1024
+_DOWNLOAD_MAX_REDIRECTS = 3
+
+
+def _is_allowed_image_url(url: str) -> bool:
+    """https + Instagram/Facebook CDN 호스트인지 검사한다."""
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower().rstrip(".")
+        port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme != "https" or not host or port not in (None, 443):
+        return False
+    return any(host == s or host.endswith("." + s) for s in _ALLOWED_IMAGE_HOST_SUFFIXES)
+
+
 def _download_temp_image(url: str) -> str | None:
     """이미지 URL을 받아 임시 파일로 저장한다. 이미지가 아니거나 실패하면 None.
 
@@ -250,26 +310,59 @@ def _download_temp_image(url: str) -> str | None:
     까먹고는 나중에 조용히 버려진다. 게다가 그 빈자리 때문에 뒤따르는
     사진들의 인덱스가 밀린다.
     """
+    path: str | None = None
     try:
         import httpx
 
-        resp = httpx.get(url, timeout=15, follow_redirects=True)
-        resp.raise_for_status()
-
-        content_type = resp.headers.get("content-type", "image/jpeg")
-        if not content_type.startswith("image/"):
-            log.warning("Not an image (%s): %s", content_type, url[:80])
+        if not _is_allowed_image_url(url):
+            log.warning("Image URL not allowed (Instagram CDN https만 허용): %s", url[:80])
             return None
 
-        ext = ".jpg"
-        if "png" in content_type:
-            ext = ".png"
-        elif "webp" in content_type:
-            ext = ".webp"
+        # 리다이렉트는 직접 따라가며 매 hop마다 호스트를 다시 검사한다.
+        # follow_redirects=True면 허용 도메인이 내부 주소로 튕겨도 그대로 따라간다.
+        with httpx.Client(timeout=15, follow_redirects=False) as client:
+            current = url
+            for _ in range(_DOWNLOAD_MAX_REDIRECTS + 1):
+                with client.stream("GET", current) as resp:
+                    if resp.is_redirect:
+                        location = resp.headers.get("location", "")
+                        current = urljoin(current, location)
+                        if not _is_allowed_image_url(current):
+                            log.warning("Redirect target not allowed: %s", current[:80])
+                            return None
+                        continue
 
-        fd, path = tempfile.mkstemp(suffix=ext, dir=_TEMP_DIR)
-        with os.fdopen(fd, "wb") as f:
-            f.write(resp.content)
+                    resp.raise_for_status()
+
+                    content_type = resp.headers.get("content-type", "image/jpeg")
+                    if not content_type.startswith("image/"):
+                        log.warning("Not an image (%s): %s", content_type, url[:80])
+                        return None
+
+                    declared = resp.headers.get("content-length")
+                    if declared and declared.isdigit() and int(declared) > _DOWNLOAD_MAX_BYTES:
+                        log.warning("Image too large (%s bytes): %s", declared, url[:80])
+                        return None
+
+                    ext = ".jpg"
+                    if "png" in content_type:
+                        ext = ".png"
+                    elif "webp" in content_type:
+                        ext = ".webp"
+
+                    # 헤더의 길이를 믿지 않고 받으면서 센다
+                    size = 0
+                    fd, path = tempfile.mkstemp(suffix=ext, dir=_TEMP_DIR)
+                    with os.fdopen(fd, "wb") as f:
+                        for chunk in resp.iter_bytes():
+                            size += len(chunk)
+                            if size > _DOWNLOAD_MAX_BYTES:
+                                raise ValueError(f"image exceeds {_DOWNLOAD_MAX_BYTES} bytes")
+                            f.write(chunk)
+                    break
+            else:
+                log.warning("Too many redirects: %s", url[:80])
+                return None
 
         # 헤더를 믿지 않고 실제로 열어 본다
         try:
@@ -280,10 +373,15 @@ def _download_temp_image(url: str) -> str | None:
             os.unlink(path)
             return None
 
-        log.info("Downloaded image from %s → %s (%d bytes)", url[:80], path, len(resp.content))
+        log.info("Downloaded image from %s → %s (%d bytes)", url[:80], path, size)
         return path
     except Exception as exc:
         log.warning("Failed to download image %s: %s", url[:80], exc)
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
         return None
 
 
@@ -360,13 +458,21 @@ def _call_claude(
         "--output-format", "text",
         "--model", MODEL,
         "--dangerously-skip-permissions",
+        # 사용자 설정의 MCP 서버를 불러오지 않는다 — 분석에 필요 없고,
+        # 권한 확인을 건너뛰는 상태라 그대로 쓸 수 있게 된다.
+        "--strict-mcp-config",
     ]
 
     if system_prompt:
         cmd.extend(["--system-prompt", system_prompt])
 
-    # 도구 제한 (Read만 허용하면 불필요한 도구 사용 방지)
+    # 도구 제한. --allowedTools는 "묻지 않고 허용"일 뿐 나머지 도구를 없애지
+    # 않는다. --dangerously-skip-permissions와 함께면 Bash·Write·WebFetch까지
+    # 전부 쓸 수 있어, 게시글 텍스트나 이미지에 심은 지시(프롬프트 인젝션)가
+    # 명령 실행으로 이어질 수 있었다. --tools가 실제로 쓸 수 있는 도구 목록을
+    # 정한다 ("" = 도구 없음).
     if tools is not None:
+        cmd.extend(["--tools", tools])
         cmd.extend(["--allowedTools", tools])
 
     # 이미지 파일이 있으면 해당 디렉토리에 접근 허용
@@ -574,11 +680,17 @@ def analyze_user(
 
         # 대표 사진 3장을 영구 저장
         ref_indices = parsed.get("referenceImageIndices", [])
+        # 모델이 [2] 대신 2나 null을 주는 경우 — 순회하다 TypeError가 난다
+        if isinstance(ref_indices, int) and not isinstance(ref_indices, bool):
+            ref_indices = [ref_indices]
+        elif not isinstance(ref_indices, list):
+            ref_indices = []
         # 모델은 그리드 위치로 답한다 — 원본 인덱스로 되돌려서 넘긴다
         source_indices = [
             grid_to_source[i]
             for i in ref_indices
-            if isinstance(i, int) and 0 <= i < len(grid_to_source)
+            if isinstance(i, int) and not isinstance(i, bool)
+            and 0 <= i < len(grid_to_source)
         ]
         # 열거형 검증 — 어긋난 값은 중립값으로 되돌리고 기록한다
         style_profile = parsed.get("styleProfile")
@@ -601,6 +713,27 @@ def analyze_user(
         _cleanup_files(temp_files)
 
 
+# user_id는 요청 본문·URL 경로에서 검증 없이 들어온다. 그대로 경로에 붙이면
+# "../.." 같은 값으로 _REF_DIR 밖을 읽거나 rmtree로 지울 수 있다.
+# 실제 값은 Instagram 숫자 ID다 — 넉넉히 영숫자·_.- 만 허용한다.
+_USER_ID_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def _user_ref_dir(user_id: str) -> str | None:
+    """user_id의 대표 사진 디렉토리. 안전하지 않은 값이면 None."""
+    if not isinstance(user_id, str) or not _USER_ID_RE.fullmatch(user_id):
+        return None
+    if user_id in (".", ".."):
+        return None
+    base = os.path.realpath(_REF_DIR)
+    user_dir = os.path.join(base, user_id)
+    # 심볼릭 링크로 밖을 가리키는 경우까지 막는다
+    real = os.path.realpath(user_dir)
+    if os.path.dirname(real) != base:
+        return None
+    return user_dir
+
+
 def _save_reference_images(
     user_id: str,
     indices: list[int],
@@ -612,33 +745,68 @@ def _save_reference_images(
     if not user_id or not indices or not downloaded_paths:
         return []
 
-    user_dir = os.path.join(_REF_DIR, user_id)
-    # 기존 대표 사진 삭제 후 새로 저장
-    if os.path.exists(user_dir):
-        shutil.rmtree(user_dir)
-    os.makedirs(user_dir, exist_ok=True)
+    user_dir = _user_ref_dir(user_id)
+    if user_dir is None:
+        log.warning("Invalid user_id for reference images: %r", user_id[:80])
+        return []
+
+    # 새 사진은 옆 임시 디렉토리에 먼저 쓰고, 다 되면 바꿔 끼운다.
+    # 예전에는 기존 디렉토리를 지운 뒤 복사해, 복사가 실패하면 대표 사진이
+    # 하나도 남지 않았다. '~'는 _USER_ID_RE가 허용하지 않는 문자라 임시·백업
+    # 디렉토리를 user_id로 가리킬 수 없다.
+    base = os.path.dirname(user_dir)
+    os.makedirs(base, exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix=f"{user_id}~tmp-", dir=base)
 
     saved: list[str] = []
-    for i, idx in enumerate(indices[:3]):
-        if not isinstance(idx, int) or idx < 0 or idx >= len(downloaded_paths):
-            continue
-        src = downloaded_paths[idx]
-        ext = os.path.splitext(src)[1] or ".jpg"
-        dst = os.path.join(user_dir, f"ref_{i}{ext}")
-        try:
-            shutil.copy2(src, dst)
-            saved.append(f"ref_{i}{ext}")
-            log.info("Saved reference image: %s", dst)
-        except Exception as exc:
-            log.warning("Failed to save reference image: %s", exc)
+    try:
+        for i, idx in enumerate(indices[:3]):
+            if not isinstance(idx, int) or idx < 0 or idx >= len(downloaded_paths):
+                continue
+            src = downloaded_paths[idx]
+            ext = os.path.splitext(src)[1] or ".jpg"
+            name = f"ref_{i}{ext}"
+            try:
+                shutil.copy2(src, os.path.join(tmp_dir, name))
+                saved.append(name)
+            except Exception as exc:
+                log.warning("Failed to save reference image: %s", exc)
 
-    return saved
+        if not saved:
+            # 하나도 못 썼으면 기존 대표 사진을 그대로 둔다
+            log.warning("No reference images saved for user %s — keeping previous", user_id)
+            return []
+
+        # 디렉토리끼리는 비어 있지 않은 대상에 os.replace가 안 된다 —
+        # 기존 것을 옆으로 치우고, 새 것을 제자리에 놓고, 치운 것을 지운다.
+        old_dir = None
+        if os.path.lexists(user_dir):
+            old_dir = f"{user_dir}~old-{uuid.uuid4().hex[:8]}"
+            os.rename(user_dir, old_dir)
+        try:
+            os.rename(tmp_dir, user_dir)
+        except Exception:
+            if old_dir is not None:
+                os.rename(old_dir, user_dir)  # 원상 복구
+            raise
+        tmp_dir = None
+        if old_dir is not None:
+            shutil.rmtree(old_dir, ignore_errors=True)
+        for name in saved:
+            log.info("Saved reference image: %s", os.path.join(user_dir, name))
+        return saved
+    except Exception as exc:
+        log.warning("Failed to replace reference images for user %s: %s", user_id, exc)
+        return []
+    finally:
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def get_reference_image_paths(user_id: str) -> list[str]:
     """사용자의 대표 사진 파일 경로 목록을 반환한다."""
-    user_dir = os.path.join(_REF_DIR, user_id)
-    if not os.path.isdir(user_dir):
+    user_dir = _user_ref_dir(user_id)
+    if user_dir is None or not os.path.isdir(user_dir):
         return []
     paths = sorted(
         os.path.join(user_dir, f)
@@ -657,34 +825,64 @@ def get_reference_image_paths(user_id: str) -> list[str]:
 _ANALYSIS_CACHE_MAX = 32
 _ANALYSIS_CACHE_TTL = 60 * 30  # 30분
 _analysis_cache: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+# FastAPI 동기 엔드포인트는 스레드풀에서 동시에 돈다. 잠금 없이 get/put이
+# 겹치면 pop 직후 move_to_end가 KeyError를 내거나 순서가 깨진다.
+_analysis_cache_lock = threading.Lock()
+
+
+def _reference_fingerprint(user_id: str) -> list:
+    """대표 사진 파일들의 지문 — 재분석으로 사진이 바뀌면 달라진다.
+
+    copy2는 원본의 mtime을 그대로 옮기므로 mtime만으로는 부족할 수 있다.
+    ctime·inode는 복사할 때마다 새로 정해진다.
+    """
+    if not user_id:
+        return []
+    fp = []
+    for path in get_reference_image_paths(user_id):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        fp.append([os.path.basename(path), st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino])
+    return fp
 
 
 def _analysis_cache_key(image_base64: str, style_profile: dict, user_id: str) -> str:
-    """같은 사진 + 같은 프로필 + 같은 사용자면 같은 결과가 나온다."""
+    """같은 사진 + 같은 프로필 + 같은 사용자 + 같은 대표 사진이면 같은 결과가 나온다.
+
+    대표 사진은 분석 프롬프트에 함께 들어간다. 키에서 빼면 재분석으로 대표
+    사진이 바뀐 뒤에도 30분 동안 옛 사진 기준 결과가 나간다.
+    """
     h = hashlib.sha256()
     h.update(image_base64.encode())
     h.update(json.dumps(style_profile, sort_keys=True, ensure_ascii=False).encode())
     h.update(user_id.encode())
+    h.update(json.dumps(_reference_fingerprint(user_id)).encode())
     return h.hexdigest()
 
 
 def _analysis_cache_get(key: str) -> dict | None:
-    entry = _analysis_cache.get(key)
-    if entry is None:
-        return None
-    stored_at, value = entry
-    if time.time() - stored_at > _ANALYSIS_CACHE_TTL:
-        _analysis_cache.pop(key, None)
-        return None
-    _analysis_cache.move_to_end(key)
+    with _analysis_cache_lock:
+        entry = _analysis_cache.get(key)
+        if entry is None:
+            return None
+        stored_at, value = entry
+        if time.time() - stored_at > _ANALYSIS_CACHE_TTL:
+            _analysis_cache.pop(key, None)
+            return None
+        _analysis_cache.move_to_end(key)
+    # 저장된 값은 수정되지 않으므로 복사는 잠금 밖에서 한다
     return copy.deepcopy(value)
 
 
 def _analysis_cache_put(key: str, value: dict) -> None:
-    _analysis_cache[key] = (time.time(), copy.deepcopy(value))
-    _analysis_cache.move_to_end(key)
-    while len(_analysis_cache) > _ANALYSIS_CACHE_MAX:
-        _analysis_cache.popitem(last=False)
+    stored = copy.deepcopy(value)
+    with _analysis_cache_lock:
+        _analysis_cache[key] = (time.time(), stored)
+        _analysis_cache.move_to_end(key)
+        while len(_analysis_cache) > _ANALYSIS_CACHE_MAX:
+            _analysis_cache.popitem(last=False)
 
 
 def transform_photo(
