@@ -351,10 +351,12 @@ def build_recommended_params(
     analysis: dict[str, Any] | None = None,
     reference: dict[str, Any] | None = None,
     reshape_enabled: bool = False,
+    skin_retouch_enabled: bool = True,
 ) -> dict[str, Any]:
     """[build_params_with_comment]에서 파라미터만 꺼내는 단축 함수."""
     params, _ = build_params_with_comment(
-        img, style_profile, analysis, reference, reshape_enabled
+        img, style_profile, analysis, reference, reshape_enabled,
+        skin_retouch_enabled=skin_retouch_enabled,
     )
     return params
 
@@ -365,8 +367,14 @@ def build_params_with_comment(
     analysis: dict[str, Any] | None = None,
     reference: dict[str, Any] | None = None,
     reshape_enabled: bool = False,
+    skin_retouch_enabled: bool = True,
 ) -> tuple[dict[str, Any], str]:
     """측정값 + 프로필 + 모델의 스타일 방향으로 recommendedParams와 설명을 만든다.
+
+    skin_retouch_enabled가 False면(앱의 '피부 보정' 토글) 전역 잡티·스무딩과
+    analysis["regionParams"]["face"]의 잡티·스무딩을 모두 0으로 만든다.
+    얼굴 영역 보정은 모델이 주고 서버와 앱이 analysis에서 그대로 꺼내 쓰므로
+    analysis 쪽 값도 여기서 고쳐 둔다 (얼굴 밝기 등 톤 보정은 그대로 둔다).
 
     파라미터의 형식은 기존에 모델이 내려주던 recommendedParams와 동일해서
     [analysis_to_transform_params]가 그대로 소비할 수 있다.
@@ -637,6 +645,18 @@ def build_params_with_comment(
         skin_smoothing = 0.0
         dehaze = 0.0
 
+    # 앱의 '피부 보정' 토글이 꺼져 있으면 피부 질감은 건드리지 않는다.
+    if not skin_retouch_enabled:
+        blemish = 0.0
+        skin_smoothing = 0.0
+
+    # 얼굴 영역 보정의 잡티·스무딩을 전역 값 하나로 합친다 (두 번 겹치지 않게).
+    blemish, skin_smoothing = _merge_face_texture(
+        analysis, blemish, skin_smoothing,
+        enabled=skin_retouch_enabled and gain > 0.0 and skin_level != "none",
+        fold=is_portrait,
+    )
+
     params: dict[str, Any] = {
         # 게인이 걸리는 항목 — 보정 강도 성향에 비례해 세진다
         "brightness": _clamp(brightness * gain),
@@ -749,6 +769,61 @@ def _clamp_reshape(reshape: dict[str, Any]) -> dict[str, float]:
         lo = -_RESHAPE_MAX if key == "shoulder_width" else 0.0
         out[key] = _clamp(float(raw), lo, _RESHAPE_MAX)
     return out
+
+
+# 얼굴 영역 보정(regionParams.face)의 잡티·스무딩을 전역 값에 합칠 때의 상한.
+# 두 패스는 같은 피부 마스크에 차례로 걸린다 — 따로 두면 모델이 준 face 값이
+# 기본 레시피 위에 한 번 더 얹혀 효과가 두 배가 됐다.
+_FACE_MERGED_SMOOTHING_MAX = 0.45
+_FACE_MERGED_BLEMISH_MAX = 0.50
+_FACE_TEXTURE_KEYS = ("blemish_removal", "skin_smoothing")
+
+
+def _merge_face_texture(
+    analysis: dict[str, Any],
+    blemish: float,
+    skin_smoothing: float,
+    enabled: bool,
+    fold: bool,
+) -> tuple[float, float]:
+    """regionParams.face의 잡티·스무딩을 전역 파라미터로 옮기고 영역 쪽은 0으로 둔다.
+
+    - enabled=False (피부 보정 꺼짐·보정 없음): 영역 쪽도 0.
+    - fold=True (인물): 전역 = max(전역, 영역)을 상한으로 자른 값. 합치지 않고
+      더하면 같은 피부에 두 번 걸린다.
+    - fold=False (인물 아님): 전역 피부 보정이 0이라 겹칠 게 없다 — 영역 값을 그대로 둔다.
+
+    analysis["regionParams"]는 새 딕셔너리로 바꿔 넣는다 (요청 원본을 건드리지 않게).
+    """
+    regions = analysis.get("regionParams")
+    face = regions.get("face") if isinstance(regions, dict) else None
+    if not isinstance(face, dict):
+        return blemish, skin_smoothing
+    if enabled and not fold:
+        return blemish, skin_smoothing
+
+    def _num(key: str) -> float:
+        try:
+            v = float(face.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return v if math.isfinite(v) else 0.0
+
+    if enabled:
+        # 영역 값은 상한까지만 전역을 끌어올린다 (사용자가 고른 강도를 낮추지는 않는다)
+        blemish = max(blemish, min(_num("blemish_removal"), _FACE_MERGED_BLEMISH_MAX))
+        skin_smoothing = max(
+            skin_smoothing, min(_num("skin_smoothing"), _FACE_MERGED_SMOOTHING_MAX)
+        )
+
+    new_face = dict(face)
+    for key in _FACE_TEXTURE_KEYS:
+        if key in new_face:
+            new_face[key] = 0.0
+    new_regions = dict(regions)
+    new_regions["face"] = new_face
+    analysis["regionParams"] = new_regions
+    return blemish, skin_smoothing
 
 
 # ── 적용된 변형 코멘트 ──

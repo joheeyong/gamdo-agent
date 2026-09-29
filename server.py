@@ -380,6 +380,7 @@ def _run_analyze_and_transform(
             analysis["recommendedParams"], params_comment = build_params_with_comment(
                 img, req.style_profile, analysis,
                 reference=reference, reshape_enabled=req.reshape_enabled,
+                skin_retouch_enabled=req.skin_retouch_enabled,
             )
             params = analysis_to_transform_params(analysis)
             log.info("analyze-and-transform: params=%s", params)
@@ -541,7 +542,7 @@ def api_start_analyze_job(
     # 합쳐지면 조회가 404가 되기 때문이다.
     key = jobs.dedupe_key(
         req.image_base64, req.style_profile, req.user_id,
-        req.media_type, req.reshape_enabled, owner,
+        req.media_type, req.reshape_enabled, owner, req.skin_retouch_enabled,
     )
     try:
         snap = _job_store.submit(key, owner, _analyze_job_fn(req))

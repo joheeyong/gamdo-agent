@@ -40,90 +40,74 @@ def _face_mask() -> np.ndarray:
     return mask
 
 
+def _fake_face(mask: np.ndarray, face_w: float = 450.0) -> "ip._SkinFace":
+    """사진 전체를 ROI로 쓰는 가짜 얼굴. 윤곽 = 피부 = mask, 금지 구역 없음."""
+    return ip._SkinFace(0, 0, mask.shape[1], mask.shape[0], mask.copy(), mask.copy(),
+                        np.zeros_like(mask), face_w)
+
+
 @pytest.fixture
 def fake_skin(monkeypatch):
     mask = _face_mask()
-    monkeypatch.setattr(ip, "_get_skin_mask", lambda *a, **k: mask.copy())
+    monkeypatch.setattr(ip, "_get_skin_faces", lambda *a, **k: [_fake_face(mask)])
     return mask
 
 
-# ── 예전 구현 (전체 사진 처리) — 비교 기준 ──
-
-
-def _old_skin_smoothing(arr: np.ndarray, skin_mask: np.ndarray, intensity: float) -> np.ndarray:
-    arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    xs, ys = np.where(skin_mask > 0)[1], np.where(skin_mask > 0)[0]
-    face_size = max(max(1, int(xs.max() - xs.min())), max(1, int(ys.max() - ys.min())))
-    d = int(np.clip(face_size * 0.020 * (0.6 + intensity), 3, 15))
-    sigma_color = 18 + intensity * 26
-    sigma_space = float(np.clip(face_size * 0.035, 8, 60))
-    smoothed = cv2.bilateralFilter(arr_bgr, d, sigma_color, sigma_space)
-    feather = max(5, int(face_size * 0.03)) | 1
-    alpha = cv2.GaussianBlur(skin_mask, (feather, feather), 0)
-    alpha = (alpha.astype(np.float32) / 255.0 * intensity)[:, :, np.newaxis]
-    blended = arr_bgr.astype(np.float32) * (1.0 - alpha) + smoothed.astype(np.float32) * alpha
-    return cv2.cvtColor(np.clip(blended, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
-
-
-def _old_blemish_removal(arr: np.ndarray, skin_mask: np.ndarray, intensity: float) -> np.ndarray:
-    arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    blemish = ip._detect_blemishes(arr_bgr, skin_mask, intensity)
-    if cv2.countNonZero(blemish) == 0:
-        return arr
-    inpainted = ip._inpaint_blemishes(arr_bgr, blemish)
-    short_side = min(arr_bgr.shape[:2])
-    feather = max(5, int(short_side * 0.004)) | 1
-    blend = cv2.GaussianBlur(blemish, (feather, feather), 0)
-    fill = min(1.0, 0.6 + intensity * 0.4)
-    alpha = (blend.astype(np.float32) / 255.0 * fill)[:, :, np.newaxis]
-    out = arr_bgr.astype(np.float32) * (1.0 - alpha) + inpainted.astype(np.float32) * alpha
-    return cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
-
-
 # ── 테스트 ──
+#
+# 예전에는 여기서 ROI 처리 결과가 "예전 전체 처리(양방향 필터 / 짧은 변 기준
+# 잡티 탐지)"와 화소 단위로 같은지 봤다. 그 알고리즘 자체가 헤어라인 덧칠·
+# 밀랍 피부의 원인이라 주파수 분리·얼굴 폭 기준 탐지로 바꿨고, 기준 구현과의
+# 비트 일치 대신 "마스크 밖은 한 화소도 안 바뀐다"는 ROI 처리의 핵심 성질을 본다.
+# (새 동작의 품질 검증은 tests/test_skin_retouch.py)
 
 
 @pytest.mark.parametrize("intensity", [0.2, 0.45, 1.0])
-def test_피부_스무딩_ROI_처리가_전체_처리와_같다(fake_skin, intensity):
+def test_피부_스무딩은_피부_마스크_밖을_건드리지_않는다(fake_skin, intensity):
     arr = _skin_image()
     out = np.array(ip.apply_skin_smoothing(Image.fromarray(arr), intensity))
-    ref = _old_skin_smoothing(arr, fake_skin, intensity)
-    assert np.array_equal(out, ref)
-    # 얼굴 밖은 한 화소도 건드리지 않는다
-    far = cv2.dilate(fake_skin, np.ones((61, 61), np.uint8)) == 0
-    assert np.array_equal(out[far], arr[far])
+    assert not np.array_equal(out, arr)
+    outside = fake_skin == 0
+    assert np.array_equal(out[outside], arr[outside])
 
 
-def test_피부_스무딩_얼굴이_가장자리에_걸려도_같다(monkeypatch):
-    """마스크 상자가 사진 경계에 닿으면 필터 패딩이 잘린다 — 경계 처리도 같아야 한다."""
+def test_피부_스무딩_얼굴이_가장자리에_걸려도_마스크_밖은_그대로(monkeypatch):
+    """마스크 상자가 사진 경계에 닿아도 (패딩이 잘려도) 문제없어야 한다."""
     mask = np.zeros((H, W), np.uint8)
     cv2.ellipse(mask, (40, 30), (120, 150), 0, 0, 360, 255, -1)
-    monkeypatch.setattr(ip, "_get_skin_mask", lambda *a, **k: mask.copy())
+    monkeypatch.setattr(ip, "_get_skin_faces", lambda *a, **k: [_fake_face(mask)])
     arr = _skin_image(1)
     out = np.array(ip.apply_skin_smoothing(Image.fromarray(arr), 0.6))
-    assert np.array_equal(out, _old_skin_smoothing(arr, mask, 0.6))
+    assert not np.array_equal(out, arr)
+    assert np.array_equal(out[mask == 0], arr[mask == 0])
 
 
 @pytest.mark.parametrize("intensity", [0.35, 1.0])
-def test_잡티_제거_ROI_처리가_전체_처리와_같다(fake_skin, intensity):
+def test_잡티_제거는_붉은_점만_지우고_피부_밖은_그대로(fake_skin, intensity):
     arr = _skin_image()
-    ref = _old_blemish_removal(arr, fake_skin, intensity)
-    assert not np.array_equal(ref, arr), "합성 잡티가 감지되지 않아 비교가 무의미하다"
     out = np.array(ip.apply_blemish_removal(Image.fromarray(arr), intensity))
-    assert np.array_equal(out, ref)
+    assert np.array_equal(out[fake_skin == 0], arr[fake_skin == 0])
+    # 합성 잡티(붉은 원)의 붉은 기가 주변 피부 쪽으로 돌아와야 한다
+    for cx, cy in [(430, 300), (520, 360), (470, 420), (560, 280)]:
+        before = arr[cy, cx].astype(int)
+        after = out[cy, cx].astype(int)
+        assert after[1] - before[1] > 25, f"({cx},{cy}) 잡티가 남음: {before} → {after}"
 
 
-def test_잡티_판정_크기는_잘라낸_조각이_아니라_원본_기준이다():
-    """short_side를 넘기면 잘린 조각에서도 원본과 같은 크기 기준을 쓴다."""
-    arr_bgr = cv2.cvtColor(_skin_image(), cv2.COLOR_RGB2BGR)
+def test_잡티_크기_기준은_사진이_아니라_얼굴_폭이다():
+    """같은 점(지름 11px)이라도 얼굴이 크면 잡티, 얼굴이 작으면(점이 얼굴 폭의
+    7%면) 잡티가 아니다.
+
+    예전에는 사진 짧은 변 기준이라 3413x2560 사진의 폭 450px 얼굴에서
+    지름 90px 덩어리(앞머리 끝)까지 잡티로 봤다.
+    """
+    arr = _skin_image()
     mask = _face_mask()
-    full = ip._detect_blemishes(arr_bgr, mask, 0.6)
-    m = ip._blemish_margin(min(H, W))
-    x, y, w, h = cv2.boundingRect(mask)
-    y1, y2, x1, x2 = max(0, y - m), min(H, y + h + m), max(0, x - m), min(W, x + w + m)
-    crop = ip._detect_blemishes(arr_bgr[y1:y2, x1:x2], mask[y1:y2, x1:x2], 0.6,
-                                short_side=min(H, W))
-    assert np.array_equal(crop, full[y1:y2, x1:x2])
+    spots = [(430, 300), (520, 360), (470, 420), (560, 280)]
+    big = ip._detect_blemishes(arr, mask, mask, face_w=450.0, intensity=0.6)
+    small = ip._detect_blemishes(arr, mask, mask, face_w=150.0, intensity=0.6)
+    assert all(big[y, x] for x, y in spots)
+    assert not any(small[y, x] for x, y in spots)
 
 
 def test_알파_블렌딩이_numpy_계산과_비트_단위로_같다():

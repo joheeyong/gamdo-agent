@@ -88,6 +88,9 @@ class AnalyzeAndTransformRequest(BaseModel):
     # 앱의 '얼굴/체형 보정' 토글. 기본은 꺼짐 — 몸을 건드리는 변형은
     # 사용자가 명시적으로 켰을 때만 한다.
     reshape_enabled: bool = Field(False, description="얼굴/체형 보정 허용 여부")
+    # 앱의 '피부 보정' 토글. 기본은 켜짐 — 이 필드를 모르는 옛 앱 빌드는
+    # 예전처럼 피부 보정을 받는다. 끄면 잡티 제거·피부 스무딩(전역·얼굴 영역)이 0.
+    skin_retouch_enabled: bool = Field(True, description="피부 보정(잡티·스무딩) 허용 여부")
 
 
 class AnalyzeAndTransformResponse(BaseModel):

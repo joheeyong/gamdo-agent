@@ -1480,61 +1480,117 @@ def apply_skin_smoothing(
     intensity: float,
     cache: MediaPipeCache | None = None,
 ) -> Image.Image:
-    """피부 보정 (bilateral filter). intensity: 0.0 ~ 1.0.
+    """피부 보정 (주파수 분리). intensity: 0.0 ~ 1.0.
 
-    피부 마스크 안에서만 섞는다 — 예전에는 이미지 전체에 블렌딩해서
-    머리카락·눈동자·배경 디테일까지 같이 뭉개졌다.
-    얼굴 미감지 시에는 뭉갤 피부가 없으므로 원본을 그대로 반환한다.
+    예전에는 양방향 필터 결과를 intensity만큼 섞었다. 모공·주근깨 같은 질감이
+    얼룩과 같은 비율로 지워져 강도를 조금만 올려도 밀랍처럼 보였다.
 
-    cache가 제공되면 MediaPipe 모델/결과 캐시를 재사용한다.
+    이제 피부를 세 층으로 나눈다 (가우시안 차이, 피부 화소만으로 평균).
+      - 저주파 (얼굴 폭의 4.5% 이상): 얼굴 입체감·조명 — 그대로 둔다.
+      - 중주파 (1%~4.5%): 붉은 기·얼룩·울퉁불퉁함 — intensity만큼 줄인다.
+        진폭이 큰 성분(콧방울·팔자 음영처럼 구조적인 그림자)은 덜 줄인다.
+      - 고주파 (1% 미만): 모공·주근깨·잔털 — 대부분 남긴다
+        (intensity 1.0에서도 65%, 기본값 0.2대에서는 90% 이상).
+
+    마스크는 [_get_skin_faces]의 피부 확정 영역이고, 경계는 안쪽으로 물려
+    부드럽게 푼다 — 머리카락·눈썹·입술에는 닿지 않는다.
+    얼굴 미감지·너무 작은 얼굴은 원본을 그대로 반환한다.
     """
     if intensity < 0.01:
         return img
 
     arr = np.array(img)
-
-    skin_mask = _get_skin_mask(arr, cache=cache)
-    if skin_mask is None or cv2.countNonZero(skin_mask) == 0:
+    faces = _get_skin_faces(arr, cache=cache)
+    if not faces:
         return img
 
-    # 커널 크기는 얼굴 크기에 맞춘다. 픽셀 고정값을 쓰면 클로즈업에서는
-    # 효과가 거의 없고 얼굴이 작게 찍힌 사진에서는 뭉개진다 — 같은 설정인데
-    # 결과가 달라 보이는 원인이었다.
-    # 마스크 상자 폭 - 1 = 가장 왼쪽·오른쪽 피부 화소 사이 거리 (예전 xs.max() - xs.min())
-    _, _, mw, mh = cv2.boundingRect(skin_mask)
-    face_size = max(1, mw - 1, mh - 1)
+    changed = False
+    for face in faces:
+        changed |= _smooth_face(arr, face, min(1.0, intensity))
+    return Image.fromarray(arr) if changed else img
 
-    d = int(np.clip(face_size * 0.020 * (0.6 + intensity), 3, 15))
-    sigma_color = 18 + intensity * 26     # 색상 병합 범위 — 얼굴 크기와 무관
-    sigma_space = float(np.clip(face_size * 0.035, 8, 60))
 
-    # 피부 안에서만, 마스크 경계는 부드럽게 — 얼굴 윤곽에 선이 생기지 않게.
-    # 페더 폭도 얼굴 기준이라야 경계가 늘 비슷하게 자연스럽다.
-    feather = max(5, int(face_size * 0.03)) | 1
-    alpha_u8 = cv2.GaussianBlur(skin_mask, (feather, feather), 0)
+# 주파수 분리 스무딩 계수 (얼굴 폭 대비 / intensity 1.0 기준).
+_SMOOTH_FINE_SIGMA = 0.010    # 고주파/중주파 경계
+_SMOOTH_BASE_SIGMA = 0.045    # 중주파/저주파 경계
+_SMOOTH_MID_REDUCE = 1.2      # 중주파(얼룩) 감쇠 = intensity × 이 값 (최대 1)
+_SMOOTH_FINE_REDUCE = 0.35    # 고주파(질감) 최대 감쇠 — 1.0에서도 65%는 남긴다
+_SMOOTH_MID_KNEE = 12.0       # 이보다 진폭이 큰 중주파는 구조(음영)로 보고 덜 줄인다
 
-    # 알파가 0인 곳은 결과가 원본 그대로다. 양방향 필터와 블렌딩을 알파가 닿는
-    # 상자 안에서만 한다 — 예전에는 사진 전체(3413x2560)를 필터링해 얼굴이
-    # 작을수록 헛일이 컸다. 필터 반경(d/2)만큼 더 잘라 두면 상자 안의 결과는
-    # 전체를 필터링한 것과 화소 단위로 같다 (tests/test_portrait_roi.py).
-    ax, ay, aw, ah = cv2.boundingRect(alpha_u8)
-    if aw == 0 or ah == 0:
-        return img
-    h, w = arr.shape[:2]
-    pad = d // 2 + 1
-    px1, py1 = max(0, ax - pad), max(0, ay - pad)
-    px2, py2 = min(w, ax + aw + pad), min(h, ay + ah + pad)
 
-    # 양방향 필터의 색 거리는 채널 합이라 RGB/BGR 순서와 무관하다 — 변환 없이 RGB로 돌린다.
-    smoothed = cv2.bilateralFilter(arr[py1:py2, px1:px2], d, sigma_color, sigma_space)
-    smoothed = smoothed[ay - py1:ay - py1 + ah, ax - px1:ax - px1 + aw]
+def _masked_blur(img: np.ndarray, weights: np.ndarray, sigma: float) -> np.ndarray:
+    """가중치(피부=1)가 있는 화소만으로 평균한 가우시안 블러.
 
-    roi = arr[ay:ay + ah, ax:ax + aw]
-    alpha = (alpha_u8[ay:ay + ah, ax:ax + aw].astype(np.float32) / 255.0 * intensity)[:, :, np.newaxis]
-    blended = roi.astype(np.float32) * (1.0 - alpha) + smoothed.astype(np.float32) * alpha
-    arr[ay:ay + ah, ax:ax + aw] = np.clip(blended, 0, 255).astype(np.uint8)
+    그냥 흐리면 피부 가장자리에 머리카락·눈썹 색이 섞여 들어와 경계에 후광이 생긴다.
+    시그마가 크면 줄여서 흐린 뒤 되돌린다 — 결과가 저주파라 차이가 없고 훨씬 빠르다.
+    """
+    h, w = img.shape[:2]
+    num = img * weights[:, :, np.newaxis]
+    scale = 1.0 if sigma <= 3.0 else 2.5 / sigma
+    if scale < 1.0:
+        sw, sh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+        num = cv2.resize(num, (sw, sh), interpolation=cv2.INTER_AREA)
+        den = cv2.resize(weights, (sw, sh), interpolation=cv2.INTER_AREA)
+    else:
+        den = weights
+    s = sigma * scale
+    num = cv2.GaussianBlur(num, (0, 0), s)
+    den = cv2.GaussianBlur(den, (0, 0), s)
+    out = num / np.maximum(den, 1e-3)[:, :, np.newaxis]
+    if scale < 1.0:
+        out = cv2.resize(out, (w, h), interpolation=cv2.INTER_LINEAR)
+    return out
 
-    return Image.fromarray(arr)
+
+def _skin_alpha(face: "_SkinFace") -> np.ndarray:
+    """피부 확정 영역을 블렌딩 알파(0~1, float32)로 푼다.
+
+    먼저 안쪽으로 2.5σ 깎고 σ로 흐린다 — 알파의 꼬리가 확정 영역 밖으로 거의
+    나가지 않는다(1% 미만). 마지막에 얼굴 윤곽으로 한 번 더 잘라 둔다.
+    """
+    sigma = max(1.0, face.face_w * 0.012)
+    grow = max(1, int(round(sigma * 2.5)))
+    core = _shrink(face.core, grow)
+    alpha = cv2.GaussianBlur(core.astype(np.float32) / 255.0, (0, 0), sigma)
+    alpha *= face.oval.astype(np.float32) / 255.0
+    return alpha
+
+
+def _smooth_face(arr: np.ndarray, face: "_SkinFace", intensity: float) -> bool:
+    """얼굴 하나의 피부를 제자리에서 주파수 분리로 정리한다. 바뀌었으면 True."""
+    if cv2.countNonZero(face.core) == 0:
+        return False
+    alpha = _skin_alpha(face)
+    ys, xs = np.nonzero(alpha > 1e-3)
+    if ys.size == 0:
+        return False
+    # 알파가 닿는 상자 + 블러 반경만큼만 계산한다
+    fw = face.face_w
+    s_fine = max(0.8, fw * _SMOOTH_FINE_SIGMA)
+    s_base = max(3.0, fw * _SMOOTH_BASE_SIGMA)
+    pad = int(math.ceil(s_base * 3)) + 2
+    rh, rw = face.core.shape[:2]
+    by1, by2 = max(0, ys.min() - pad), min(rh, ys.max() + 1 + pad)
+    bx1, bx2 = max(0, xs.min() - pad), min(rw, xs.max() + 1 + pad)
+
+    y0, x0 = face.y0 + by1, face.x0 + bx1
+    y1, x1 = face.y0 + by2, face.x0 + bx2
+    roi = arr[y0:y1, x0:x1].astype(np.float32)
+    weights = face.core[by1:by2, bx1:bx2].astype(np.float32) / 255.0
+    a = alpha[by1:by2, bx1:bx2][:, :, np.newaxis]
+
+    low_fine = _masked_blur(roi, weights, s_fine)
+    low_base = _masked_blur(roi, weights, s_base)
+    mid = low_fine - low_base
+    fine = roi - low_fine
+
+    amp = np.abs(mid).mean(axis=2, keepdims=True)
+    mid_gain = min(1.0, _SMOOTH_MID_REDUCE * intensity) / (1.0 + (amp / _SMOOTH_MID_KNEE) ** 2)
+    fine_gain = _SMOOTH_FINE_REDUCE * intensity
+
+    out = roi - a * (mid_gain * mid + fine_gain * fine)
+    arr[y0:y1, x0:x1] = np.clip(out + 0.5, 0, 255).astype(np.uint8)
+    return True
 
 
 def apply_sharpness(img: Image.Image, factor: float) -> Image.Image:
@@ -1578,61 +1634,6 @@ _LIPS = [
 ]
 _LEFT_EYEBROW = [70, 63, 105, 66, 107, 55, 65, 52, 53, 46]
 _RIGHT_EYEBROW = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276]
-
-
-def _get_skin_mask(
-    img_rgb: np.ndarray,
-    cache: MediaPipeCache | None = None,
-    for_blemish: bool = False,
-    mode: str = "texture",
-) -> np.ndarray | None:
-    """MediaPipe FaceLandmarker로 피부 영역 마스크를 생성한다.
-
-    반환: 얼굴 경계에서 충분히 안쪽으로 침식된 피부 마스크, 얼굴 미감지 시 None.
-    다중 얼굴이면 모든 얼굴의 마스크를 합친다.
-
-    cache가 제공되면 모델 인스턴스와 감지 결과를 캐시에서 재사용한다.
-    """
-    model_path = face_model_path()
-    if model_path is None:
-        return None
-
-    h, w = img_rgb.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-
-    if cache is not None:
-        results = cache.get_face_landmarks(img_rgb)
-        if results is None:
-            return None
-    else:
-        base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
-        options = mp.tasks.vision.FaceLandmarkerOptions(
-            base_options=base_options,
-            num_faces=5,
-            min_face_detection_confidence=0.5,
-            min_face_presence_confidence=0.5,
-        )
-        landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
-        try:
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
-            results = landmarker.detect(mp_image)
-        finally:
-            landmarker.close()
-
-        if not results.face_landmarks:
-            return None
-
-    for face_lms in results.face_landmarks:
-        def _idx_to_pt(idx: int) -> tuple[int, int]:
-            lm = face_lms[idx]
-            return int(lm.x * w), int(lm.y * h)
-
-        mask = cv2.bitwise_or(
-            mask,
-            build_face_skin_mask(_idx_to_pt, h, w, for_blemish=for_blemish, mode=mode),
-        )
-
-    return mask
 
 
 def build_face_skin_mask(
@@ -1702,106 +1703,467 @@ def build_face_skin_mask(
     return cv2.bitwise_and(face_mask, cv2.bitwise_not(features))
 
 
-def _detect_blemishes(
-    img_bgr: np.ndarray,
-    skin_mask: np.ndarray,
-    intensity: float,
-    short_side: int | None = None,
-) -> np.ndarray:
-    """LAB A·B 채널 밴드패스로 잡티를 탐지한다.
+# 콧방울·콧구멍 — 자연스러운 음영이 잡티로 오감지된다 (잡티 탐지에서만 뺀다)
+_NOSE_WINGS = [1, 2, 98, 327, 64, 294, 48, 278, 4]
 
-    밝기(L) 편차는 음영·조명이므로 무시하고,
-    A·B 채널(빨강-녹색, 노랑-파랑)만으로 색상 이상 점을 탐지한다.
+# 이 폭(px)보다 작은 얼굴은 질감 보정을 하지 않는다. 피부가 몇십 화소뿐이라
+# 결과가 보이지 않고, 랜드마크 오차가 마스크 폭과 비슷해 머리카락을 건드리기 쉽다.
+_SKIN_MIN_FACE_PX = 64
 
-    잡티 크기의 성분만 남기려면 고주파(피부 노이즈)와 저주파(조명 그라데이션)를
-    함께 걷어내야 한다. 예전에는 잡티와 비슷한 크기(짧은 변 2%)의 로컬 평균만
-    빼서, 평균이 잡티를 같이 포함해 편차가 스스로 상쇄되고 픽셀 노이즈는 그대로
-    통과했다 — 합성 피부 테스트에서 검출이 0이던 원인이다.
 
-    short_side: 크기 기준이 되는 원본 사진의 짧은 변. 잘라낸 영역을 넘길 때
-    지정한다 — 잘린 조각의 짧은 변을 쓰면 임계 크기가 달라진다.
+class _SkinFace:
+    """얼굴 하나의 질감 보정용 마스크 (얼굴 상자 ROI 좌표)."""
 
-    반환: 잡티 영역이 255인 단채널 마스크.
+    __slots__ = ("x0", "y0", "x1", "y1", "core", "oval", "guard", "face_w")
+
+    def __init__(self, x0, y0, x1, y1, core, oval, guard, face_w):
+        self.x0, self.y0, self.x1, self.y1 = x0, y0, x1, y1
+        self.core = core      # uint8 0/255 — 피부로 확정된 영역
+        self.oval = oval      # uint8 0/255 — 얼굴 윤곽 (이 밖으로는 절대 나가지 않는다)
+        self.guard = guard    # uint8 0/255 — 이목구비·콧방울 주변 (잡티 탐지 제외)
+        self.face_w = face_w  # 얼굴 폭(px) — 모든 크기 기준
+
+
+def _face_point_sets(
+    img_rgb: np.ndarray,
+    cache: MediaPipeCache | None = None,
+) -> list | None:
+    """얼굴마다 랜드마크 인덱스 → (x, y) 픽셀 좌표 함수를 돌려준다. 미감지 시 None."""
+    model_path = face_model_path()
+    if model_path is None:
+        return None
+
+    h, w = img_rgb.shape[:2]
+    if cache is not None:
+        results = cache.get_face_landmarks(img_rgb)
+        if results is None:
+            return None
+    else:
+        base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
+        options = mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            num_faces=5,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+        )
+        landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+        try:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+            results = landmarker.detect(mp_image)
+        finally:
+            landmarker.close()
+
+        if not results.face_landmarks:
+            return None
+
+    point_sets = []
+    for face_lms in results.face_landmarks:
+        def _idx_to_pt(idx: int, _lms=face_lms) -> tuple[int, int]:
+            lm = _lms[idx]
+            return int(lm.x * w), int(lm.y * h)
+        point_sets.append(_idx_to_pt)
+    return point_sets
+
+
+def _get_skin_mask(
+    img_rgb: np.ndarray,
+    cache: MediaPipeCache | None = None,
+    for_blemish: bool = False,
+    mode: str = "texture",
+) -> np.ndarray | None:
+    """얼굴 마스크를 사진 크기로 돌려준다. 얼굴 미감지 시 None.
+
+    - mode="tone": 영역별 톤 보정(detect_regions)용 — 얼굴 윤곽 전체.
+    - mode="texture": 질감 보정이 실제로 건드리는 피부 확정 영역
+      ([_get_skin_faces]와 같다. for_blemish면 잡티 탐지 영역 — 경계에서 더 물린다).
+    다중 얼굴이면 모든 얼굴의 마스크를 합친다.
     """
-    if short_side is None:
-        short_side = min(img_bgr.shape[:2])
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    h, w = img_rgb.shape[:2]
+    if mode == "tone":
+        point_sets = _face_point_sets(img_rgb, cache=cache)
+        if point_sets is None:
+            return None
+        mask = np.zeros((h, w), dtype=np.uint8)
+        for pt in point_sets:
+            mask = cv2.bitwise_or(mask, build_face_skin_mask(pt, h, w, mode="tone"))
+        return mask
 
-    # A·B 채널만 사용 (L 채널 제외 → 음영·조명 무시)
-    a_ch = lab[:, :, 1].astype(np.float32)
-    b_ch = lab[:, :, 2].astype(np.float32)
+    faces = _get_skin_faces(img_rgb, cache=cache)
+    if faces is None:
+        return None
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for face in faces:
+        part = _blemish_search_mask(face) if for_blemish else face.core
+        region = mask[face.y0:face.y1, face.x0:face.x1]
+        np.maximum(region, part, out=region)
+    return mask
 
-    # 신호: 잡티 크기 정도로만 살짝 평활 → 픽셀 노이즈·필름 그레인을 걷어낸다
-    sig_sigma = max(1.0, short_side * 0.004)
-    a_sig = cv2.GaussianBlur(a_ch, (0, 0), sig_sigma)
-    b_sig = cv2.GaussianBlur(b_ch, (0, 0), sig_sigma)
 
-    # 배경: 잡티보다 훨씬 넓은 창 → 얼굴 전체의 색조·조명 그라데이션
-    bg_ksize = max(31, int(short_side * 0.08)) | 1
-    a_bg = cv2.GaussianBlur(a_ch, (bg_ksize, bg_ksize), 0)
-    b_bg = cv2.GaussianBlur(b_ch, (bg_ksize, bg_ksize), 0)
+def _get_skin_faces(
+    img_rgb: np.ndarray,
+    cache: MediaPipeCache | None = None,
+) -> list[_SkinFace] | None:
+    """질감 보정(스무딩·잡티)이 쓸 얼굴별 피부 마스크. 얼굴 미감지 시 None.
 
-    # 색상 편차 (A·B 밴드패스)
-    diff = np.sqrt((a_sig - a_bg) ** 2 + (b_sig - b_bg) ** 2)
+    얼굴 상자만 잘라 [refine_skin_mask]로 만든다. 너무 작은 얼굴은 뺀다.
+    """
+    point_sets = _face_point_sets(img_rgb, cache=cache)
+    if point_sets is None:
+        return None
 
-    # 밴드패스 후 스케일: 정상 피부는 1 이하, 눈에 보이는 잡티가 3~7이다.
-    # intensity 0.35(자동 기본) → 3.95(뚜렷한 것만), 1.0 → 2.0(옅은 것까지)
-    threshold = max(2.0, 5.0 - intensity * 3.0)
+    h, w = img_rgb.shape[:2]
+    faces: list[_SkinFace] = []
+    for pt in point_sets:
+        oval_pts = np.array([pt(i) for i in _SKIN_FACE_OVAL], dtype=np.int32)
+        face_w = float(abs(pt(454)[0] - pt(234)[0]))
+        ox, oy, ow, oh = cv2.boundingRect(oval_pts)
+        if min(face_w, ow) < _SKIN_MIN_FACE_PX:
+            log.info("skin: 얼굴 폭 %dpx — 너무 작아 질감 보정 생략", int(face_w))
+            continue
+        pad = max(4, int(face_w * 0.05))
+        x0, y0 = max(0, ox - pad), max(0, oy - pad)
+        x1, y1 = min(w, ox + ow + pad), min(h, oy + oh + pad)
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            continue
 
-    blemish_mask = (diff > threshold).astype(np.uint8) * 255
-    blemish_mask = cv2.bitwise_and(blemish_mask, skin_mask)
+        def _roi_pt(idx: int, _pt=pt, _x0=x0, _y0=y0) -> tuple[int, int]:
+            x, y = _pt(idx)
+            return x - _x0, y - _y0
 
-    # 모폴로지로 노이즈 제거
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    blemish_mask = cv2.morphologyEx(blemish_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        core, oval, guard = refine_skin_mask(img_rgb[y0:y1, x0:x1], _roi_pt, face_w)
+        if cv2.countNonZero(core) == 0:
+            continue
+        faces.append(_SkinFace(x0, y0, x1, y1, core, oval, guard, face_w))
+    return faces
 
-    # 개별 잡티 크기 필터 — 작은 점만 (점·여드름 크기)
-    min_area = max(4, int((short_side * 0.002) ** 2))
-    max_area = int((short_side * 0.035) ** 2)  # 점·여드름 크기 상한
-    contours, _ = cv2.findContours(blemish_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    filtered_mask = np.zeros_like(blemish_mask)
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if min_area <= area <= max_area:
-            cv2.drawContours(filtered_mask, [cnt], -1, 255, cv2.FILLED)
 
-    # 임계값을 넘는 건 잡티의 코어뿐이고 번진 테두리는 남는다. 그대로 인페인팅하면
-    # 그 테두리 색을 다시 안쪽으로 끌어와 잡티가 옅게 남는다 — 코어를 넓혀
-    # 잡티 전체를 덮는다. (크기 필터 뒤에 해야 max_area에 걸리지 않는다.)
-    dilate_px = max(3, int(short_side * 0.01)) | 1
-    filtered_mask = cv2.dilate(
-        filtered_mask,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px, dilate_px)),
+def _hull_mask(pt, ids, h: int, w: int) -> np.ndarray:
+    m = np.zeros((h, w), dtype=np.uint8)
+    hull = cv2.convexHull(np.array([pt(i) for i in ids], dtype=np.int32))
+    cv2.fillPoly(m, [hull], 255)
+    return m
+
+
+def _grow(mask: np.ndarray, radius: float) -> np.ndarray:
+    """원판 팽창과 같은 결과를 거리 변환으로 — 반지름이 커도 비용이 같다.
+
+    얼굴 폭의 10%(큰 얼굴이면 100px 넘는 원판)로 cv2.dilate를 돌리면 수십 ms씩 걸린다.
+    """
+    if radius <= 0:
+        return mask.copy()
+    dist = cv2.distanceTransform(cv2.bitwise_not(mask), cv2.DIST_L2, 5)
+    return ((dist <= radius) * 255).astype(np.uint8)
+
+
+def _shrink(mask: np.ndarray, radius: float) -> np.ndarray:
+    """원판 침식과 같은 결과를 거리 변환으로."""
+    if radius <= 0:
+        return mask.copy()
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    return ((dist > radius) * 255).astype(np.uint8)
+
+
+def _disk(radius: int) -> np.ndarray:
+    radius = max(1, int(radius))
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1,) * 2)
+
+
+def refine_skin_mask(
+    roi_rgb: np.ndarray,
+    pt,
+    face_w: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """랜드마크 얼굴 윤곽 ∩ 피부색 ∩ '얼굴 가운데서 이어지는 영역'.
+
+    [build_face_skin_mask]의 윤곽은 이마 위쪽이 머리카락 속까지 올라간다
+    (랜드마크 10번은 두개골 윤곽이라 앞머리가 있으면 그 위에 찍힌다).
+    예전에는 이 윤곽을 그대로 피부로 보고 잡티를 찾아, 앞머리 끝·관자놀이의
+    머리카락을 잡티로 판정해 피부색으로 덧칠했다.
+
+    1. 피부색 모델: 눈 아래~입 사이(머리카락이 거의 없는 볼·코)에서 LAB 중앙값과
+       편차를 잰다. 밝은 쪽 편차(하이라이트)는 관대하게, 어두운 쪽은 엄격하게.
+    2. 피부가 아닌 화소가 얼굴 가운데(콧대)에서 바깥으로 뻗는 광선 위에 일정 길이
+       (얼굴 폭 3%) 이상 쌓이면, 그 너머는 피부색이어도 뺀다 — 앞머리 사이로
+       비치는 금발 하이라이트가 피부색과 거의 같아 색만으로는 못 거른다.
+       눈·눈썹·입술·코는 광선을 막지 않는다 (이목구비 너머 이마·볼을 살린다).
+
+    pt는 ROI 좌표를 돌려줘야 한다. 반환: (core, oval, guard) — ROI 크기 uint8 0/255.
+    guard는 잡티 탐지 금지 구역(이목구비·콧방울 주변)이다.
+    """
+    h, w = roi_rgb.shape[:2]
+    geo = build_face_skin_mask(pt, h, w, mode="texture")
+    oval = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(oval, [np.array([pt(i) for i in _SKIN_FACE_OVAL], dtype=np.int32)], 255)
+    # 잡티 탐지 금지 구역: 눈(눈물샘 쪽 붉은 살)·눈썹·입술·콧방울 주변
+    # 눈꼬리는 속눈썹·아이라인·붉은 살이 랜드마크 밖으로 나와 있어 더 넓게 막는다.
+    guard = _hull_mask(pt, _NOSE_WINGS, h, w)
+    for region in (_LIPS, _LEFT_EYEBROW, _RIGHT_EYEBROW):
+        guard |= _hull_mask(pt, region, h, w)
+    guard = _grow(guard, face_w * 0.06)
+    eyes = _hull_mask(pt, _LEFT_EYE, h, w) | _hull_mask(pt, _RIGHT_EYE, h, w)
+    guard |= _grow(eyes, face_w * 0.10)
+    if cv2.countNonZero(geo) == 0:
+        return geo, oval, guard
+
+    lab = cv2.cvtColor(roi_rgb.astype(np.float32) * (1.0 / 255.0), cv2.COLOR_RGB2Lab)
+
+    # 1. 피부색 표본 — 눈 아래 ~ 입꼬리 위
+    eye_y = (pt(145)[1] + pt(374)[1]) // 2
+    mouth_y = (pt(61)[1] + pt(291)[1]) // 2
+    sample = geo.copy()
+    if mouth_y - eye_y > 4:
+        sample[:max(0, eye_y)] = 0
+        sample[max(0, mouth_y):] = 0
+    if cv2.countNonZero(sample) < 50:
+        sample = geo
+    px = lab[sample > 0]
+    med = np.median(px, axis=0)
+    mad = np.median(np.abs(px - med), axis=0) * 1.4826
+    spread = np.maximum(mad, np.array([6.0, 1.5, 1.5], dtype=np.float32))
+
+    dl = (lab[:, :, 0] - med[0]) / spread[0]
+    dl_w = np.where(dl < 0, 0.5, 0.12).astype(np.float32)
+    da = (lab[:, :, 1] - med[1]) / spread[1]
+    db = (lab[:, :, 2] - med[2]) / spread[2]
+    dist_raw = np.sqrt(dl_w * dl * dl + da * da + db * db)
+    # 주근깨·모공 한 점이 아니라 넓은 영역의 색으로 판정한다
+    dist = cv2.GaussianBlur(dist_raw, (0, 0), max(1.0, face_w * 0.012))
+    non_skin = dist > 3.0
+
+    # 이마로 흘러내린 가는 머리카락은 넓게 흐린 색으로는 안 잡힌다. 좁게 흐린 색으로
+    # 튀는 성분 중 크거나(머리카락 덩어리에 붙은 가닥) 길쭉한 것만 뺀다.
+    # 주근깨·점은 작고 둥글어 남는다 — 이것까지 빼면 주근깨마다 보정 구멍이 난다.
+    strand_mask = np.zeros((h, w), dtype=np.uint8)
+    # 반사광(밝고 채도가 빠진 곳)은 가닥이 아니다 — 피부보다 어두운 곳만 본다.
+    fine_sigma = max(0.7, face_w * 0.003)
+    strands = (cv2.GaussianBlur(dist_raw, (0, 0), fine_sigma) > 4.0) & (
+        cv2.GaussianBlur(dl, (0, 0), fine_sigma) < -0.5
     )
-    # 확장분이 입술·눈 경계로 새지 않도록 피부 영역으로 다시 자른다
-    return cv2.bitwise_and(filtered_mask, skin_mask)
+    strands = strands.astype(np.uint8) * 255
+    s_count, s_labels, s_stats, _ = cv2.connectedComponentsWithStats(strands, connectivity=8)
+    if s_count > 1:
+        min_len = max(4.0, face_w * 0.03)
+        excl = np.zeros(s_count, dtype=bool)
+        long_side = np.maximum(s_stats[:, cv2.CC_STAT_WIDTH], s_stats[:, cv2.CC_STAT_HEIGHT])
+        for i in np.nonzero(long_side >= min_len)[0]:
+            if i == 0:
+                continue
+            if s_stats[i, cv2.CC_STAT_AREA] >= min_len * min_len:
+                excl[i] = True
+                continue
+            x, y, bw, bh = s_stats[i, :4]
+            m = cv2.moments((s_labels[y:y + bh, x:x + bw] == i).astype(np.uint8), binaryImage=True)
+            if m["m00"] <= 0:
+                continue
+            mu20, mu02, mu11 = m["mu20"] / m["m00"], m["mu02"] / m["m00"], m["mu11"] / m["m00"]
+            common = math.sqrt(max(0.0, ((mu20 - mu02) / 2) ** 2 + mu11 ** 2))
+            l1 = (mu20 + mu02) / 2 + common
+            l2 = max(1e-6, (mu20 + mu02) / 2 - common)
+            excl[i] = math.sqrt(l1 / l2) > 3.0
+        excl[0] = False
+        strand_mask = cv2.dilate((excl[s_labels] * 255).astype(np.uint8), _disk(2))
+        non_skin |= strand_mask > 0
+
+    # 2. 광선 차단 — 이목구비와 얼굴 가운데는 중립
+    features = np.zeros((h, w), dtype=np.uint8)
+    for region in (_LEFT_EYE, _RIGHT_EYE, _LIPS, _LEFT_EYEBROW, _RIGHT_EYEBROW):
+        features |= _hull_mask(pt, region, h, w)
+    features = _grow(features, face_w * 0.04)
+    central = _hull_mask(
+        pt, _LEFT_EYE + _RIGHT_EYE + _LIPS + _LEFT_EYEBROW + _RIGHT_EYEBROW + _NOSE_WINGS + [6],
+        h, w,
+    )
+    neutral = features | _grow(central, face_w * 0.03)
+    blockers = (non_skin & (neutral == 0)).astype(np.uint8) * 255
+
+    cx, cy = pt(6)  # 콧대 (두 눈 사이)
+    cx = float(min(max(cx, 0), w - 1))
+    cy = float(min(max(cy, 0), h - 1))
+    radius = int(math.hypot(max(cx, w - cx), max(cy, h - cy))) + 2
+    n_ang = int(np.clip(2 * math.pi * radius / 3, 360, 1440))
+    polar = cv2.warpPolar(blockers, (radius, n_ang), (cx, cy), radius,
+                          cv2.WARP_POLAR_LINEAR | cv2.INTER_NEAREST)
+    run = np.cumsum(polar > 127, axis=1, dtype=np.int32)
+    blocked = ((run > max(2.0, face_w * 0.03)) * 255).astype(np.uint8)
+    blocked = cv2.warpPolar(blocked, (w, h), (cx, cy), radius,
+                            cv2.WARP_POLAR_LINEAR | cv2.WARP_INVERSE_MAP | cv2.INTER_NEAREST)
+    # 역변환은 광선 사이 틈을 남길 수 있다 — 살짝 넓혀 메운다
+    blocked = cv2.dilate(blocked, _disk(max(1, face_w * 0.005)))
+
+    allowed = geo & (blocked == 0).astype(np.uint8) * 255
+    core = allowed & (~non_skin).astype(np.uint8) * 255
+    # 하이라이트·작은 점 때문에 생긴 구멍은 메우고(허용 영역 안에서만), 부스러기는 버린다
+    # 가닥 자리는 닫기로 다시 메우지 않는다
+    allowed_close = allowed & cv2.bitwise_not(strand_mask)
+    core = cv2.morphologyEx(core, cv2.MORPH_CLOSE, _disk(face_w * 0.02)) & allowed_close
+    core = cv2.morphologyEx(core, cv2.MORPH_OPEN, _disk(max(1, face_w * 0.006)))
+
+    # 볼·이마의 반사광(하이라이트)은 채도가 빠져 피부색 모델 밖으로 나간다.
+    # 피부에 완전히 둘러싸인 '밝은' 구멍만 메운다 — 어두운 구멍(콧구멍·점)과
+    # 허용 영역 경계에 닿은 구멍(머리카락)은 그대로 둔다.
+    holes = cv2.bitwise_and(allowed_close, cv2.bitwise_not(core))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(holes, connectivity=8)
+    if count > 1:
+        outside = cv2.dilate(cv2.bitwise_not(allowed_close), _disk(1)) > 0
+        touching = np.unique(labels[outside])
+        fill = np.zeros(count, dtype=bool)
+        mean_l = np.bincount(labels.ravel(), weights=lab[:, :, 0].ravel(), minlength=count)
+        mean_l /= np.maximum(stats[:, cv2.CC_STAT_AREA], 1)
+        fill[1:] = mean_l[1:] > med[0]
+        fill[touching] = False
+        fill[0] = False
+        core = cv2.bitwise_or(core, (fill[labels] * 255).astype(np.uint8))
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+    if count > 1:
+        min_area = max(16, int(cv2.countNonZero(geo) * 0.02))
+        keep = np.zeros(count, dtype=bool)
+        keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_area
+        core = (keep[labels] * 255).astype(np.uint8)
+    return core, oval, guard
 
 
-def _blemish_margin(short_side: int) -> int:
-    """잡티 처리 결과가 피부 마스크 밖으로 영향을 미치는 최대 거리 (px).
+# ── 잡티 제거 ──
 
-    배경 가우시안 반경, 신호 가우시안 반경(float는 4σ), 인페인팅 반경,
-    블렌딩 페더 반경 중 가장 큰 것에 여유를 더한다. 피부 마스크 상자를 이만큼
-    넓혀 잘라 처리하면 결과가 사진 전체를 처리한 것과 같다.
+_BLEMISH_MAX_COUNT = 15        # 얼굴 하나에서 지우는 최대 개수 (강한 것부터)
+_BLEMISH_MAX_AREA_RATIO = 0.01  # 얼굴 피부 면적 대비 총 상한
+_BLEMISH_FIELD_NEIGHBORS = 4    # 이만큼 이웃이 붙어 있으면 주근깨 밭으로 보고 남긴다
+
+
+def _blemish_search_mask(face: _SkinFace) -> np.ndarray:
+    """잡티를 찾는 영역 — 피부 확정 영역에서 얼굴 폭 4%만큼 더 안쪽.
+
+    헤어라인·눈썹·입술·콧방울 경계에서 떨어뜨려 두면, 경계의 머리카락 끝이나
+    음영이 잡티 후보로 들어오지 않는다.
     """
-    bg_ksize = max(31, int(short_side * 0.08)) | 1
-    sig_radius = int(math.ceil(max(1.0, short_side * 0.004) * 4)) + 1
-    inpaint_radius = max(3, int(short_side * 0.004))
-    feather = max(5, int(short_side * 0.004)) | 1
-    return max(bg_ksize // 2, sig_radius, inpaint_radius * 2, feather // 2) + 4
+    strict = _shrink(face.core, max(2, face.face_w * 0.04))
+    return cv2.bitwise_and(strict, cv2.bitwise_not(face.guard))
 
 
-def _inpaint_blemishes(
-    img_bgr: np.ndarray,
-    blemish_mask: np.ndarray,
-    short_side: int | None = None,
+def _detect_blemishes(
+    roi_rgb: np.ndarray,
+    core: np.ndarray,
+    search: np.ndarray,
+    face_w: float,
+    intensity: float,
 ) -> np.ndarray:
-    """OpenCV INPAINT_NS(Navier-Stokes)로 잡티 영역을 복원한다."""
-    if short_side is None:
-        short_side = min(img_bgr.shape[:2])
-    # 반경이 잡티보다 작으면 가운데가 덜 채워진다 — 해상도에 맞춰 키운다
-    radius = max(3, int(short_side * 0.004))
-    return cv2.inpaint(img_bgr, blemish_mask, inpaintRadius=radius, flags=cv2.INPAINT_NS)
+    """작고 둥글고 떨어져 있는 붉은/어두운 점만 잡티로 고른다.
+
+    - 크기 기준은 얼굴 폭이다. 예전에는 사진 짧은 변 기준이라(최대 지름 3.5%)
+      3413x2560 사진에서 폭 450px 얼굴이면 얼굴 폭 5분의 1짜리 덩어리까지
+      '잡티'였다 — 앞머리 끝이 통째로 덧칠된 원인.
+    - 길쭉한 성분(머리카락·주름)은 뺀다 (2차 모멘트 장단축비 > 2).
+    - 이웃이 많은 점은 주근깨 밭이다 — 자연스러운 개성이라 남긴다.
+    - 배경(국소 평균)은 피부 화소만으로 잰다. 머리카락이 섞이면 경계의
+      피부가 통째로 튀는 값이 된다.
+
+    반환: 지울 영역(코어, 확장 전) uint8 0/255.
+    """
+    empty = np.zeros(core.shape, dtype=np.uint8)
+    if cv2.countNonZero(search) == 0:
+        return empty
+
+    lab = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    weights = core.astype(np.float32) / 255.0
+    bg = _masked_blur(lab, weights, max(3.0, face_w * 0.04))
+    sig = cv2.GaussianBlur(lab, (0, 0), max(0.7, face_w * 0.0035))
+    d_l = sig[:, :, 0] - bg[:, :, 0]
+    d_a = sig[:, :, 1] - bg[:, :, 1]
+    d_b = sig[:, :, 2] - bg[:, :, 2]
+    # 붉은 기(a+)가 주 신호. 갈색(b+)·어두움은 주근깨와 겹치므로 약하게만 본다.
+    score = np.sqrt(np.maximum(d_a, 0) ** 2 + 0.4 * d_b ** 2) + 0.15 * np.maximum(-d_l, 0)
+    score[search == 0] = 0
+
+    # intensity 0.3 → 4.6(뚜렷한 것만), 1.0 → 2.5(옅은 것까지)
+    threshold = max(2.5, 5.5 - intensity * 3.0)
+    min_d = max(2.0, face_w * 0.006)
+    max_d = max(4.0, face_w * 0.035)
+    cand = (score > threshold).astype(np.uint8) * 255
+    # 잡티보다 작은 부스러기(화소 노이즈·그레인)를 먼저 걷어낸다. 그대로 두면
+    # 잡티에 달라붙어 모양이 일그러지고 이웃 수도 부풀린다.
+    cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, _disk(max(1, int(min_d / 2))))
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    if count <= 1:
+        return empty
+
+    min_area = max(3, int(math.pi / 4 * min_d * min_d))
+    max_area = int(math.pi / 4 * max_d * max_d)
+
+    field_r2 = (face_w * 0.06) ** 2
+    # 성분별 최대 점수
+    peaks = np.zeros(count, dtype=np.float32)
+    np.maximum.at(peaks, labels.ravel(), score.ravel())
+    # 이웃으로 셀 점: 잡티 크기 이상인 것만 (화소 노이즈·그레인 부스러기는 빼고)
+    sized = stats[:, cv2.CC_STAT_AREA] >= min_area
+    sized[0] = False
+    chosen: list[tuple[float, int]] = []
+    for i in range(1, count):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if not (min_area <= area <= max_area):
+            continue
+        x, y, bw, bh = stats[i, :4]
+        comp = labels[y:y + bh, x:x + bw] == i
+        m = cv2.moments(comp.astype(np.uint8), binaryImage=True)
+        if m["m00"] <= 0:
+            continue
+        mu20, mu02, mu11 = m["mu20"] / m["m00"], m["mu02"] / m["m00"], m["mu11"] / m["m00"]
+        common = math.sqrt(max(0.0, ((mu20 - mu02) / 2) ** 2 + mu11 ** 2))
+        l1 = (mu20 + mu02) / 2 + common
+        l2 = (mu20 + mu02) / 2 - common
+        if l2 <= 1e-6 or math.sqrt(l1 / l2) > 2.0:
+            continue  # 길쭉함 — 머리카락·주름
+        if area / float(bw * bh) < 0.4:
+            continue  # 가지 친 모양
+        # 주근깨 밭: 비슷한 세기(절반 이상)의 점이 가까이 여럿 모여 있다.
+        # 노이즈 속에 홀로 튀는 뾰루지는 주변 점들이 훨씬 약하다.
+        peak = float(peaks[i])
+        similar = sized & (peaks >= peak * 0.5)
+        similar[i] = False
+        d2 = ((centroids[similar] - centroids[i]) ** 2).sum(axis=1)
+        if int((d2 < field_r2).sum()) >= _BLEMISH_FIELD_NEIGHBORS:
+            continue
+        chosen.append((peak, i))
+
+    if not chosen:
+        return empty
+    chosen.sort(reverse=True)
+    budget = cv2.countNonZero(core) * _BLEMISH_MAX_AREA_RATIO
+    keep = np.zeros(count, dtype=bool)
+    used = 0
+    for peak, i in chosen[:_BLEMISH_MAX_COUNT]:
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if used + area > budget:
+            continue
+        keep[i] = True
+        used += area
+    return (keep[labels] * 255).astype(np.uint8)
+
+
+def _remove_blemishes_face(arr: np.ndarray, face: _SkinFace, intensity: float) -> bool:
+    """얼굴 하나의 잡티를 제자리에서 지운다. 지운 게 있으면 True."""
+    roi = arr[face.y0:face.y1, face.x0:face.x1]
+    spots = _detect_blemishes(roi, face.core, _blemish_search_mask(face), face.face_w, intensity)
+    if cv2.countNonZero(spots) == 0:
+        return False
+
+    fw = face.face_w
+    # 임계값을 넘는 건 잡티의 코어뿐이다 — 번진 테두리까지 덮게 조금 넓힌다
+    grow = max(1, int(round(fw * 0.006)))
+    fill_mask = cv2.dilate(spots, _disk(grow))
+    radius = max(2, int(round(fw * 0.01)))
+    inpainted = cv2.inpaint(roi, fill_mask, inpaintRadius=radius, flags=cv2.INPAINT_TELEA)
+
+    # 경계는 부드럽게 — 한 번 더 넓힌 마스크를 흐려 알파로 쓴다 (안쪽은 1)
+    soft = cv2.dilate(fill_mask, _disk(grow)).astype(np.float32) / 255.0
+    soft = cv2.GaussianBlur(soft, (0, 0), max(0.8, grow))
+    soft = np.minimum(1.0, soft * 1.5)
+    # 확장분이 피부 밖으로 새지 않게
+    soft *= face.core.astype(np.float32) / 255.0
+    fill = min(1.0, 0.8 + intensity * 0.2)
+    a = (soft * fill)[:, :, np.newaxis]
+    out = roi.astype(np.float32) * (1.0 - a) + inpainted.astype(np.float32) * a
+    roi[:] = np.clip(out + 0.5, 0, 255).astype(np.uint8)
+    return True
 
 
 def apply_blemish_removal(
@@ -1811,61 +2173,25 @@ def apply_blemish_removal(
 ) -> Image.Image:
     """잡티 자동 제거. intensity: 0.0(비활성) ~ 1.0(최대 감도).
 
-    파이프라인:
-      1. MediaPipe Face Mesh로 피부 마스크 (경계 침식)
-      2. LAB A·B 채널 색상 이상치로 잡티 탐지
-      3. OpenCV inpainting으로 잡티 영역만 복원
-      4. 잡티 영역만 마스크 기반 블렌딩
+    파이프라인 (얼굴마다, 얼굴 상자 안에서만):
+      1. 피부 확정 마스크 ([refine_skin_mask]) — 머리카락·이목구비 제외
+      2. 경계에서 얼굴 폭 4% 안쪽에서만, 작고 둥글고 외따로 있는 점을 고른다
+      3. 인페인팅 후 부드러운 알파로 섞는다
 
-    cache가 제공되면 MediaPipe 모델/결과 캐시를 재사용한다.
+    얼굴 미감지·너무 작은 얼굴이면 원본을 그대로 반환한다.
     """
     if intensity < 0.01:
         return img
 
-    arr_rgb = np.array(img)
-
-    # 1. 피부 마스크 (얼굴 미감지 → 원본 반환)
-    skin_mask = _get_skin_mask(arr_rgb, cache=cache, for_blemish=True)
-    if skin_mask is None:
+    arr = np.array(img)
+    faces = _get_skin_faces(arr, cache=cache)
+    if not faces:
         return img
 
-    # 잡티는 피부 마스크 안에서만 찾고 지운다. 예전에는 LAB 변환·가우시안·
-    # 인페인팅을 사진 전체에 돌렸다(3413x2560에서 0.3초 이상). 마스크 상자를
-    # 필터 반경만큼 넓혀 잘라 처리하면 결과는 같다 — 상자 밖은 알파가 0이다.
-    h, w = arr_rgb.shape[:2]
-    short_side = min(h, w)
-    mx, my, mw, mh = cv2.boundingRect(skin_mask)
-    if mw == 0 or mh == 0:
-        return img
-    margin = _blemish_margin(short_side)
-    x1, y1 = max(0, mx - margin), max(0, my - margin)
-    x2, y2 = min(w, mx + mw + margin), min(h, my + mh + margin)
-    arr_bgr = cv2.cvtColor(arr_rgb[y1:y2, x1:x2], cv2.COLOR_RGB2BGR)
-    skin_crop = skin_mask[y1:y2, x1:x2]
-
-    # 2. 잡티 탐지
-    blemish_mask = _detect_blemishes(arr_bgr, skin_crop, intensity, short_side=short_side)
-
-    # 빈 마스크 → 깨끗한 피부, 원본 반환
-    if cv2.countNonZero(blemish_mask) == 0:
-        return img
-
-    # 3. 인페인팅
-    inpainted = _inpaint_blemishes(arr_bgr, blemish_mask, short_side=short_side)
-
-    # 4. 잡티 픽셀만 교체 (마스크 경계를 살짝 블러하여 자연스럽게)
-    #    intensity는 "무엇을 잡티로 볼지"의 감도다. 잡티라고 판정한 뒤에
-    #    절반만 지울 이유는 없으므로 채움 강도는 따로 둔다.
-    feather = max(5, int(short_side * 0.004)) | 1
-    blend_mask = cv2.GaussianBlur(blemish_mask, (feather, feather), 0)
-    fill = min(1.0, 0.6 + intensity * 0.4)
-    alpha = (blend_mask.astype(np.float32) / 255.0 * fill)[:, :, np.newaxis]
-
-    result_bgr = arr_bgr.astype(np.float32) * (1.0 - alpha) + inpainted.astype(np.float32) * alpha
-    result_bgr = np.clip(result_bgr, 0, 255).astype(np.uint8)
-    arr_rgb[y1:y2, x1:x2] = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-
-    return Image.fromarray(arr_rgb)
+    changed = False
+    for face in faces:
+        changed |= _remove_blemishes_face(arr, face, min(1.0, intensity))
+    return Image.fromarray(arr) if changed else img
 
 
 # ── AI 자동 편집 (autoEdits) ──
@@ -2326,8 +2652,10 @@ _REGION_TONE_PARAMS = (
 _FACE_TONE_LIMIT = 0.18
 
 # 얼굴 질감 보정(잡티·스무딩)의 상한. 전역 슬라이더가 같은 픽셀에 한 번 더
-# 적용하므로 두 패스가 겹친다.
-_FACE_TEXTURE_LIMIT = 0.5
+# 적용하므로 두 패스가 겹친다. 분석 경로는 param_engine이 영역 값을 전역에 합치고
+# 영역 쪽을 0으로 보내므로, 여기 걸리는 건 옛 analysis를 들고 있는 앱이 보낸
+# apply-transform 정도다 — 겹쳐도 과하지 않게 낮게 묶는다.
+_FACE_TEXTURE_LIMIT = 0.3
 
 # 국소 보정(local_*)의 파라미터별 상한. 얼굴과 달리 "날아간 창문을 살린다"처럼
 # 의도가 분명한 교정이라 더 크게 허용하되, 한 영역이 사진을 지배하지는 못하게 한다.
