@@ -144,7 +144,7 @@ TRANSFORM_PHOTO_SYSTEM = """\
    - 진정성 있는 보정이 과도한 편집보다 나음
 
 반드시 아래 JSON 형식으로만 응답하세요.
-이미지를 Read로 한 번만 읽고, 설명·서론·코드블록 없이 JSON 하나만 출력하세요.
+설명·서론·코드블록 없이 JSON 하나만, 들여쓰기·줄바꿈 없는 한 줄(minified)로 출력하세요.
 """
 
 TRANSFORM_PHOTO_PROMPT = """\
@@ -239,11 +239,19 @@ TRANSFORM_PHOTO_PROMPT = """\
   * 정면 광각(얼굴이 넓게 퍼져 보임), 아래에서 올려 찍은 각도(다리가 짧아 보임),
     턱선이 묻히는 각도처럼 렌즈·앵글 때문에 왜곡된 사진은 0.4~0.5까지 적극 보정.
 
-다음 JSON 형식으로 응답해 주세요:
+=== 출력 규칙 (응답 속도에 직결됩니다) ===
+- JSON은 공백·줄바꿈 없이 한 줄로 쓰세요.
+- "null로 두세요"는 **키를 아예 쓰지 말라**는 뜻입니다. 값이 null·빈 배열·빈 객체이거나
+  0.0인 키는 생략하세요. 서버가 없는 키를 null·0으로 처리합니다.
+  (예: crop이 없으면 "crop" 키 생략, 하늘이 없으면 "sky" 생략, 인물이 아니면 "reshapeParams" 생략)
+- 단 colorAnalysis·compositionAnalysis·toneReport·subjectType은 항상 넣으세요 (화면에 표시됩니다).
+- 문장은 짧게: paletteDescription 25자 이내, narrative 20자 이내, reason 15자 이내.
+
+다음 JSON 형식으로 응답해 주세요 (보기 좋게 줄을 나눴지만, 실제 응답은 한 줄로):
 {{
   "colorAnalysis": {{
     "colorHarmony": "유사색 조화 | 보색 조화 | 모노톤 등",
-    "paletteDescription": "이 사진의 색감 특징을 설명하는 한국어 문장"
+    "paletteDescription": "이 사진의 색감 특징 (25자 이내)"
   }},
   "compositionAnalysis": {{
     "primaryTechnique": "삼분법 | 중앙배치 | 대각선 등",
@@ -258,7 +266,6 @@ TRANSFORM_PHOTO_PROMPT = """\
   "autoEdits": {{
     "straighten": -8.0~+8.0 | null,
     "crop": {{"x": 0.0~1.0, "y": 0.0~1.0, "width": 0.3~1.0, "height": 0.3~1.0}} | null,
-    "cropReason": "크롭을 추천한 이유 (한국어 한 문장, crop이 null이면 null)",
     "remove_areas": [{{"x": 0.0~1.0, "y": 0.0~1.0, "width": 0.0~1.0, "height": 0.0~1.0}}] | [],
     "instagram_ratio": "4:5" | "1:1" | null
   }},
@@ -278,7 +285,7 @@ TRANSFORM_PHOTO_PROMPT = """\
       "area": {{ "x": 0.0~1.0, "y": 0.0~1.0, "width": 0.0~1.0, "height": 0.0~1.0 }},
       "shape": "ellipse" | "rect",
       "feather": 0.0~1.0,
-      "reason": "이 영역을 짚은 이유 (한국어 한 문장)",
+      "reason": "이 영역을 짚은 이유 (15자 이내)",
       "brightness": -0.5~0.5, "highlights": -0.6~0.6, "shadows": -0.6~0.6,
       "contrast": -0.35~0.35, "saturation": -0.35~0.35,
       "temperature": -0.35~0.35, "sharpness": 0.0~0.5
