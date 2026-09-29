@@ -19,6 +19,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 import httpx
 
 import auth
+import jobs
 from models import (
     AnalyzeAndTransformRequest,
     AnalyzeAndTransformResponse,
@@ -35,6 +36,8 @@ from models import (
     InstagramMediaResponse,
     InstagramStoriesRequest,
     InstagramStoriesResponse,
+    JobStartResponse,
+    JobStatusResponse,
     ReferenceImagesResponse,
     SessionRequest,
     SessionResponse,
@@ -314,17 +317,29 @@ def api_transform_photo(
 # ── 분석 + 변형 통합 API ──
 
 
-@app.post("/api/analyze-and-transform", response_model=AnalyzeAndTransformResponse)
-def api_analyze_and_transform(
+def _run_analyze_and_transform(
     req: AnalyzeAndTransformRequest,
-    ctx: AuthContext = Depends(require_auth),
-):
-    """사진 분석 + 변형을 한 번에 수행. Claude가 사진을 분석하고, 결과를 바탕으로 즉시 변형."""
-    _check_user(ctx, req.user_id)
+    on_stage=None,
+) -> AnalyzeAndTransformResponse:
+    """분석 + 변형 본체. 동기 엔드포인트와 비동기 작업 워커가 함께 쓴다.
+
+    on_stage(stage)는 진행 단계를 알린다: Claude 호출 직전 "analyzing",
+    픽셀 처리(세마포어 대기 포함) 직전 "rendering". 인증·인가는 호출하는 쪽에서 한다.
+    예외는 올리지 않고 success=False 응답으로 돌려준다 (기존 동작 그대로).
+    """
+
+    def stage(name: str) -> None:
+        if on_stage is None:
+            return
+        try:
+            on_stage(name)
+        except Exception:
+            log.warning("analyze-and-transform: stage callback failed (%s)", name)
 
     try:
         # 1. Claude가 사진 분석 (Vision)
         log.info("analyze-and-transform: analyzing photo")
+        stage("analyzing")
         analysis = transform_photo(
             style_profile=req.style_profile,
             image_base64=req.image_base64,
@@ -332,6 +347,7 @@ def api_analyze_and_transform(
             user_id=req.user_id,
         )
         log.info("analyze-and-transform: analysis complete")
+        stage("rendering")
 
         # 메모리 폭증 방지 — 픽셀 처리만 제한한다. Claude 호출(수십 초)까지
         # 함께 묶으면 슬롯이 LLM 대기로 차서, 슬라이더를 움직이는 다른 사용자의
@@ -468,6 +484,95 @@ def api_analyze_and_transform(
     except Exception as e:
         log.exception("analyze-and-transform failed")
         return AnalyzeAndTransformResponse(success=False, error=str(e))
+
+
+@app.post("/api/analyze-and-transform", response_model=AnalyzeAndTransformResponse)
+def api_analyze_and_transform(
+    req: AnalyzeAndTransformRequest,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """사진 분석 + 변형을 한 번에 수행. Claude가 사진을 분석하고, 결과를 바탕으로 즉시 변형."""
+    _check_user(ctx, req.user_id)
+    return _run_analyze_and_transform(req)
+
+
+# ── 비동기 분석 작업 API (scratchpad/jobs_contract.md) ──
+#
+# 30~70초짜리 분석을 긴 연결 하나에 묶지 않는다. 앱이 백그라운드로 가서
+# 소켓이 끊겨도 작업은 계속 돌고, 앱은 돌아와 job_id로 결과를 받는다.
+
+_job_store = jobs.JobStore()
+
+
+def _job_not_found() -> AuthError:
+    # 인증 에러와 같은 본문 형식을 쓰려고 AuthError 핸들러를 빌린다
+    return AuthError(404, "job_not_found", "작업이 없거나 만료되었습니다")
+
+
+def _ctx_uid(ctx) -> str | None:
+    return ctx.uid if isinstance(ctx, AuthContext) else None
+
+
+def _analyze_job_fn(req: AnalyzeAndTransformRequest):
+    def run(on_stage) -> dict:
+        resp = _run_analyze_and_transform(req, on_stage=on_stage)
+        if not resp.success:
+            # 동기 엔드포인트의 error는 str(e) 그대로라 내부 정보가 섞일 수 있다.
+            # 작업 조회에는 사람용 메시지만 싣는다 (원인은 위에서 이미 로그에 남았다).
+            raise jobs.JobFailed()
+        return resp.model_dump()
+
+    return run
+
+
+@app.post(
+    "/api/jobs/analyze-and-transform",
+    response_model=JobStartResponse,
+    status_code=202,
+)
+def api_start_analyze_job(
+    req: AnalyzeAndTransformRequest,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """analyze-and-transform을 백그라운드 작업으로 시작하고 job_id를 돌려준다."""
+    _check_user(ctx, req.user_id)
+    owner = _ctx_uid(ctx)
+    # 세션 uid도 키에 넣는다 — user_id가 빈 요청이 다른 사용자의 작업으로
+    # 합쳐지면 조회가 404가 되기 때문이다.
+    key = jobs.dedupe_key(
+        req.image_base64, req.style_profile, req.user_id,
+        req.media_type, req.reshape_enabled, owner,
+    )
+    try:
+        snap = _job_store.submit(key, owner, _analyze_job_fn(req))
+    except jobs.JobQueueFull:
+        log.warning("jobs: 대기열이 가득 차 거절")
+        raise AuthError(503, "busy", "요청이 많아 잠시 후 다시 시도해 주세요")
+    log.info("jobs: analyze-and-transform job %s (%s)", snap.job_id[:8], snap.status)
+    return JobStartResponse(success=True, job_id=snap.job_id, status=snap.status)
+
+
+@app.get("/api/jobs/{job_id}", response_model=JobStatusResponse)
+def api_get_job(
+    job_id: str,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """작업 상태 조회 (폴링). 없거나 만료됐거나 남의 작업이면 404."""
+    snap = _job_store.get(job_id)
+    if snap is None:
+        raise _job_not_found()
+    # 세션 uid로 만든 작업은 같은 uid만 본다. 존재 여부도 드러내지 않는다.
+    if snap.owner and _ctx_uid(ctx) != snap.owner:
+        raise _job_not_found()
+    return JobStatusResponse(
+        success=True,
+        job_id=snap.job_id,
+        status=snap.status,
+        stage=snap.stage,
+        elapsed_sec=snap.elapsed_sec,
+        result=snap.result if snap.status == jobs.DONE else None,
+        error=snap.error if snap.status == jobs.ERROR else None,
+    )
 
 
 # ── 이미지 자동 변형 API ──

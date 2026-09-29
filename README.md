@@ -37,6 +37,8 @@ python server.py                  # → http://localhost:8000 , 문서: /docs
 | `INSTAGRAM_CLIENT_ID` / `INSTAGRAM_CLIENT_SECRET` | (없음) | Instagram 로그인 OAuth 앱 자격증명 (code → token 교환). |
 | `GAMDO_MAX_BODY_MB` | `50` | 요청 본문 상한(MB). 넘으면 413. |
 | `GAMDO_MAX_CONCURRENT` | `3` | 이미지 처리 동시 실행 수 (메모리 보호). |
+| `GAMDO_MAX_JOBS` | `4` | 비동기 분석 작업(`/api/jobs/...`) 워커 스레드 수. 픽셀 처리는 여전히 `GAMDO_MAX_CONCURRENT`로 묶인다. |
+| `GAMDO_MAX_QUEUED_JOBS` | `20` | 대기 중인 작업 상한. 넘으면 새 작업은 503 `busy`. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | (선택) | 헤드리스 서버에서 `claude` CLI 로그인 대신 쓰는 토큰. |
 | `PORT` | `8000` | `python server.py` 실행 포트. |
 
@@ -82,7 +84,9 @@ HTTP 200 + `success: false`로, 인증 오류는 위의 HTTP 상태 코드로 �
 | GET | `/health` | 면제 | 상태 확인 |
 | POST | `/api/analyze-user` | 필요 | 게시글/피드/스토리 → 스타일 프로필. `user_id`가 있으면 대표 사진 3장을 저장 |
 | POST | `/api/transform-photo` | 필요 | 스타일 프로필 기준 사진 보정 가이드 (분석만) |
-| POST | `/api/analyze-and-transform` | 필요 | 사진 분석 + 보정 이미지 생성. `user_id`의 대표 사진을 목표값으로 사용 |
+| POST | `/api/analyze-and-transform` | 필요 | 사진 분석 + 보정 이미지 생성. `user_id`의 대표 사진을 목표값으로 사용 (동기, 구버전 앱용) |
+| POST | `/api/jobs/analyze-and-transform` | 필요 | 위와 같은 작업을 백그라운드로 시작 → `job_id` (202) |
+| GET | `/api/jobs/{job_id}` | 필요 | 작업 상태·결과 조회 (폴링) |
 | POST | `/api/auto-transform` | 필요 | 분석 결과 JSON으로 보정 이미지 생성 |
 | POST | `/api/apply-transform` | 필요 | 슬라이더 값으로 보정 (미리보기/저장) |
 | GET | `/api/reference-images/{user_id}` | 필요 | 대표 사진 base64 목록 |
@@ -160,3 +164,36 @@ HTTP 200 + `success: false`로, 인증 오류는 위의 HTTP 상태 코드로 �
 
 같은 사진·프로필·사용자·대표 사진 조합의 분석 결과는 30분간 캐시된다 (대표 사진이 바뀌면
 캐시를 쓰지 않는다).
+
+### 비동기 분석 작업 — `POST /api/jobs/analyze-and-transform`, `GET /api/jobs/{job_id}`
+
+분석은 30~70초 걸린다. 앱이 백그라운드로 가서 연결이 끊겨도 서버가 계속 처리하도록
+작업으로 맡기고 폴링한다.
+
+```json
+// POST /api/jobs/analyze-and-transform — 요청 본문은 동기 엔드포인트와 같다. 응답 HTTP 202
+{ "success": true, "job_id": "<32 hex>", "status": "queued" }
+// 대기열이 가득 차면 HTTP 503
+{ "success": false, "error_code": "busy", "error": "..." }
+
+// GET /api/jobs/{job_id} — 응답 200
+{
+  "success": true, "job_id": "...",
+  "status": "queued | running | done | error",
+  "stage": "queued | analyzing | rendering | done | error",
+  "elapsed_sec": 12.3,
+  "result": { ... },   // status == done일 때만 — 동기 응답과 같은 모양 (아니면 null)
+  "error": "..."       // status == error일 때만 — 사람용 메시지 (아니면 null)
+}
+// 없거나 만료됐거나 다른 사용자의 작업이면 HTTP 404
+{ "success": false, "error_code": "job_not_found", "error": "..." }
+```
+
+- 인증·인가는 동기 엔드포인트와 같다 (`user_id`가 세션 uid와 다르면 403). 세션으로 만든
+  작업은 같은 uid의 세션으로만 조회된다 (다르면 404 — 존재 여부를 드러내지 않는다).
+- 같은 요청(사진·프로필·user_id·media_type·reshape_enabled + 세션 uid)이 대기·진행 중이거나
+  성공 후 보관 중이면 새 작업을 만들지 않고 그 `job_id`를 돌려준다. 실패한 작업은 합치지 않는다.
+- 분석이 실패하면(동기 응답의 `success: false`) `status: "error"`. 메시지에는 내부 정보를 싣지 않고
+  원인은 서버 로그에 남긴다.
+- 인메모리 저장이다. 완료/실패 후 30분 보관, 전체 200개를 넘으면 오래된 완료 작업부터 지운다.
+  서버가 재시작되면(reload 포함) 작업이 사라진다 → 앱은 404를 받으면 다시 시작한다.

@@ -99,6 +99,27 @@ class AnalyzeAndTransformResponse(BaseModel):
     error: str | None = None
 
 
+# ── 비동기 분석 작업 API (scratchpad/jobs_contract.md) ──
+# 시작 요청 본문은 AnalyzeAndTransformRequest를 그대로 쓴다.
+
+class JobStartResponse(BaseModel):
+    success: bool = True
+    job_id: str
+    status: str = Field(..., description="queued | running | done | error")
+
+
+class JobStatusResponse(BaseModel):
+    success: bool = True
+    job_id: str
+    status: str = Field(..., description="queued | running | done | error")
+    stage: str = Field(..., description="queued | analyzing | rendering | done | error")
+    elapsed_sec: float
+    # status == done일 때만. AnalyzeAndTransformResponse.model_dump()와 같은 모양
+    result: dict | None = None
+    # status == error일 때만. 사람용 메시지 (내부 정보·비밀값 없음)
+    error: str | None = None
+
+
 # ── 자동 변형 API ──
 
 class AutoTransformRequest(BaseModel):
