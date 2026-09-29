@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import tempfile
+import threading
 from typing import Any
 
 import cv2
@@ -162,6 +163,65 @@ def person_model_path() -> str | None:
     return _resolve_model_path("person")
 
 
+# ── MediaPipe 모델 인스턴스 풀 ──
+#
+# 예전에는 요청마다 모델을 새로 만들고 요청 끝에 close()했다. 만드는 건
+# 10~50ms로 싸지만 close()가 모델 하나에 0.25~0.35초씩 걸린다(내부 그래프
+# 종료 대기 — 실측, M3 Pro). 인물 요청은 얼굴·포즈·분할 모델을 다 쓰므로
+# 요청마다 0.6~0.9초를 정리에만 썼다.
+#
+# 그래서 다 쓴 인스턴스를 닫지 않고 풀에 돌려 두었다가 다음 요청이 다시 쓴다.
+# MediaPipe 태스크 객체는 스레드 안전하지 않으므로 한 인스턴스는 한 번에 한
+# 요청(MediaPipeCache)만 빌려 쓴다. 스레드 로컬로 두지 않는 이유: 서버는
+# 동기 엔드포인트를 anyio 스레드풀(최대 40개)에서 돌리므로, 스레드마다 모델을
+# 붙이면 동시 처리 수(GAMDO_MAX_CONCURRENT)와 무관하게 인스턴스가 스레드 수만큼
+# 쌓인다. 빌려 쓰는 풀이면 동시에 쓰이는 수 이상으로는 늘지 않는다.
+#
+# IMAGE 모드 태스크는 호출 간 상태가 없어 재사용해도 결과가 같다
+# (tests/test_mediapipe_pool.py에서 확인).
+
+# 종류별로 보관할 유휴 인스턴스 수. 동시 처리 상한과 같게 둔다 — 그 이상은
+# 동시에 쓰일 일이 없다. 넘치는 인스턴스는 닫는다.
+_MP_POOL_MAX_IDLE = max(1, int(os.environ.get("GAMDO_MAX_CONCURRENT", "3")))
+
+_mp_pool_lock = threading.Lock()
+_mp_pool: dict[str, list[Any]] = {"face": [], "pose": [], "person": []}
+
+
+def _mp_pool_acquire(kind: str) -> Any | None:
+    """풀에서 유휴 인스턴스를 하나 꺼낸다. 없으면 None."""
+    with _mp_pool_lock:
+        idle = _mp_pool[kind]
+        return idle.pop() if idle else None
+
+
+def _mp_close_quietly(instance: Any) -> None:
+    try:
+        instance.close()
+    except Exception:
+        pass
+
+
+def _mp_pool_release(kind: str, instance: Any) -> None:
+    """다 쓴 인스턴스를 풀에 돌려준다. 풀이 차 있으면 닫는다."""
+    with _mp_pool_lock:
+        idle = _mp_pool[kind]
+        if len(idle) < _MP_POOL_MAX_IDLE:
+            idle.append(instance)
+            return
+    _mp_close_quietly(instance)
+
+
+def _mp_pool_clear() -> None:
+    """풀의 유휴 인스턴스를 모두 닫는다 (테스트·종료용)."""
+    with _mp_pool_lock:
+        items = [inst for lst in _mp_pool.values() for inst in lst]
+        for lst in _mp_pool.values():
+            lst.clear()
+    for inst in items:
+        _mp_close_quietly(inst)
+
+
 # ── 요청 스코프 MediaPipe 캐시 ──
 
 
@@ -174,9 +234,9 @@ class MediaPipeCache:
             face_results = cache.get_face_landmarks(arr_rgb)
             pose_results = cache.get_pose_landmarks(arr_rgb)
 
-    - 모델 인스턴스는 첫 호출 시 생성하고 컨텍스트 종료까지 재사용
+    - 모델 인스턴스는 첫 호출 시 풀에서 빌리고(없으면 생성) 컨텍스트 종료까지 재사용
     - 동일 이미지(바이트 해시 기준)에 대한 감지 결과를 캐시하여 중복 호출 제거
-    - 컨텍스트 종료 시 모든 모델 인스턴스를 close()하여 메모리 누수 방지
+    - 컨텍스트 종료 시 인스턴스를 풀에 돌려준다 (닫는 비용이 커서 닫지 않는다)
     """
 
     def __init__(self) -> None:
@@ -194,37 +254,38 @@ class MediaPipeCache:
         self.close()
 
     def close(self) -> None:
-        """모든 모델 인스턴스를 닫고 캐시를 비운다."""
+        """빌린 모델 인스턴스를 풀에 돌려주고 결과 캐시를 비운다."""
         if self._face_landmarker is not None:
-            try:
-                self._face_landmarker.close()
-            except Exception:
-                pass
+            _mp_pool_release("face", self._face_landmarker)
             self._face_landmarker = None
         if self._pose_landmarker is not None:
-            try:
-                self._pose_landmarker.close()
-            except Exception:
-                pass
+            _mp_pool_release("pose", self._pose_landmarker)
             self._pose_landmarker = None
-        self._close_person_segmenter()
+        if self._person_segmenter is not None:
+            _mp_pool_release("person", self._person_segmenter)
+            self._person_segmenter = None
         self._face_results_cache.clear()
         self._pose_results_cache.clear()
         self._person_mask_cache.clear()
 
     def _close_person_segmenter(self) -> None:
-        """분할기 인스턴스를 닫고 슬롯을 비운다.
+        """분할기 인스턴스를 닫고 슬롯을 비운다 (풀에 돌려주지 않는다).
 
         잘못된 입력을 한 번 먹은 인스턴스는 다음 호출에서 영구히 멈춘다
         (내부 그래프가 에러 상태로 남는다). 그래서 예외가 나면 재사용하지 않고
         버리고 다시 만든다.
         """
         if self._person_segmenter is not None:
-            try:
-                self._person_segmenter.close()
-            except Exception:
-                pass
+            _mp_close_quietly(self._person_segmenter)
             self._person_segmenter = None
+
+    def _discard_landmarker(self, kind: str) -> None:
+        """감지 중 예외가 난 랜드마커를 버린다 — 분할기와 같은 이유로 풀에 돌려주지 않는다."""
+        attr = "_face_landmarker" if kind == "face" else "_pose_landmarker"
+        inst = getattr(self, attr)
+        if inst is not None:
+            _mp_close_quietly(inst)
+            setattr(self, attr, None)
 
     @staticmethod
     def _image_key(arr_rgb: np.ndarray) -> str:
@@ -240,6 +301,8 @@ class MediaPipeCache:
 
     def _get_face_landmarker(self) -> Any:
         """FaceLandmarker 인스턴스를 반환 (없으면 생성)."""
+        if self._face_landmarker is None:
+            self._face_landmarker = _mp_pool_acquire("face")
         if self._face_landmarker is None:
             model_path = face_model_path()
             if model_path is None or mp is None:
@@ -257,6 +320,8 @@ class MediaPipeCache:
     def _get_pose_landmarker(self) -> Any:
         """PoseLandmarker 인스턴스를 반환 (없으면 생성)."""
         if self._pose_landmarker is None:
+            self._pose_landmarker = _mp_pool_acquire("pose")
+        if self._pose_landmarker is None:
             model_path = pose_model_path()
             if model_path is None or mp is None:
                 return None
@@ -272,6 +337,8 @@ class MediaPipeCache:
 
     def _get_person_segmenter(self) -> Any:
         """ImageSegmenter 인스턴스를 반환 (없으면 생성)."""
+        if self._person_segmenter is None:
+            self._person_segmenter = _mp_pool_acquire("person")
         if self._person_segmenter is None:
             model_path = person_model_path()
             if model_path is None or mp is None:
@@ -338,7 +405,11 @@ class MediaPipeCache:
             return None
 
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=arr_rgb)
-        results = landmarker.detect(mp_image)
+        try:
+            results = landmarker.detect(mp_image)
+        except Exception:
+            self._discard_landmarker("face")
+            raise
 
         if not results.face_landmarks:
             self._face_results_cache[key] = None
@@ -362,7 +433,11 @@ class MediaPipeCache:
             return None
 
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=arr_rgb)
-        results = landmarker.detect(mp_image)
+        try:
+            results = landmarker.detect(mp_image)
+        except Exception:
+            self._discard_landmarker("pose")
+            raise
 
         if not results.pose_landmarks:
             self._pose_results_cache[key] = None
@@ -691,6 +766,30 @@ _BLUR_FULL_SUBJECT = 0.18
 _BLUR_SIGMA_RATIO = 0.012
 
 
+def _alpha_blend(fg: np.ndarray, bg: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """fg * alpha + bg * (1 - alpha)를 0~255로 잘라 uint8로 돌려준다.
+
+    fg, bg: (H, W, C) uint8, alpha: (H, W) float32.
+    numpy로 한 번에 쓰면 (H, W, 1) 알파를 브로드캐스트하며 전체 크기 float32 임시
+    배열이 여러 개 생긴다(3413x2560에서 개당 100MB). 행 묶음 단위로 cv2.multiply를
+    쓰면 같은 float32 곱·합이라 결과가 비트 단위로 같고, 임시 메모리는 묶음
+    크기로 줄며 2배 이상 빠르다 (tests/test_portrait_roi.py).
+    """
+    h = fg.shape[0]
+    channels = fg.shape[2]
+    out = np.empty(fg.shape, dtype=np.uint8)
+    step = 256
+    for y in range(0, h, step):
+        a = np.ascontiguousarray(alpha[y:y + step], dtype=np.float32)
+        a3 = cv2.merge([a] * channels)
+        acc = cv2.multiply(fg[y:y + step], a3, dtype=cv2.CV_32F)
+        np.subtract(1.0, a3, out=a3)
+        acc += cv2.multiply(bg[y:y + step], a3, dtype=cv2.CV_32F)
+        np.clip(acc, 0, 255, out=acc)
+        out[y:y + step] = acc
+    return out
+
+
 def _blur_background(
     arr: np.ndarray, alpha: np.ndarray, strength: float
 ) -> np.ndarray:
@@ -709,9 +808,7 @@ def _blur_background(
     else:
         blurred = cv2.GaussianBlur(arr, (0, 0), sigma)
 
-    a = alpha[:, :, np.newaxis]
-    out = arr.astype(np.float32) * a + blurred.astype(np.float32) * (1.0 - a)
-    return np.clip(out, 0, 255).astype(np.uint8)
+    return _alpha_blend(arr, blurred, alpha)
 
 
 def background_blur_scale(coverage: float) -> float:
@@ -1395,7 +1492,6 @@ def apply_skin_smoothing(
         return img
 
     arr = np.array(img)
-    arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
     skin_mask = _get_skin_mask(arr, cache=cache)
     if skin_mask is None or cv2.countNonZero(skin_mask) == 0:
@@ -1404,27 +1500,41 @@ def apply_skin_smoothing(
     # 커널 크기는 얼굴 크기에 맞춘다. 픽셀 고정값을 쓰면 클로즈업에서는
     # 효과가 거의 없고 얼굴이 작게 찍힌 사진에서는 뭉개진다 — 같은 설정인데
     # 결과가 달라 보이는 원인이었다.
-    xs, ys = np.where(skin_mask > 0)[1], np.where(skin_mask > 0)[0]
-    face_w = max(1, int(xs.max() - xs.min()))
-    face_h = max(1, int(ys.max() - ys.min()))
-    face_size = max(face_w, face_h)
+    # 마스크 상자 폭 - 1 = 가장 왼쪽·오른쪽 피부 화소 사이 거리 (예전 xs.max() - xs.min())
+    _, _, mw, mh = cv2.boundingRect(skin_mask)
+    face_size = max(1, mw - 1, mh - 1)
 
     d = int(np.clip(face_size * 0.020 * (0.6 + intensity), 3, 15))
     sigma_color = 18 + intensity * 26     # 색상 병합 범위 — 얼굴 크기와 무관
     sigma_space = float(np.clip(face_size * 0.035, 8, 60))
 
-    smoothed = cv2.bilateralFilter(arr_bgr, d, sigma_color, sigma_space)
-
     # 피부 안에서만, 마스크 경계는 부드럽게 — 얼굴 윤곽에 선이 생기지 않게.
     # 페더 폭도 얼굴 기준이라야 경계가 늘 비슷하게 자연스럽다.
     feather = max(5, int(face_size * 0.03)) | 1
-    alpha = cv2.GaussianBlur(skin_mask, (feather, feather), 0)
-    alpha = (alpha.astype(np.float32) / 255.0 * intensity)[:, :, np.newaxis]
+    alpha_u8 = cv2.GaussianBlur(skin_mask, (feather, feather), 0)
 
-    blended = arr_bgr.astype(np.float32) * (1.0 - alpha) + smoothed.astype(np.float32) * alpha
-    result_rgb = cv2.cvtColor(np.clip(blended, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
+    # 알파가 0인 곳은 결과가 원본 그대로다. 양방향 필터와 블렌딩을 알파가 닿는
+    # 상자 안에서만 한다 — 예전에는 사진 전체(3413x2560)를 필터링해 얼굴이
+    # 작을수록 헛일이 컸다. 필터 반경(d/2)만큼 더 잘라 두면 상자 안의 결과는
+    # 전체를 필터링한 것과 화소 단위로 같다 (tests/test_portrait_roi.py).
+    ax, ay, aw, ah = cv2.boundingRect(alpha_u8)
+    if aw == 0 or ah == 0:
+        return img
+    h, w = arr.shape[:2]
+    pad = d // 2 + 1
+    px1, py1 = max(0, ax - pad), max(0, ay - pad)
+    px2, py2 = min(w, ax + aw + pad), min(h, ay + ah + pad)
 
-    return Image.fromarray(result_rgb)
+    # 양방향 필터의 색 거리는 채널 합이라 RGB/BGR 순서와 무관하다 — 변환 없이 RGB로 돌린다.
+    smoothed = cv2.bilateralFilter(arr[py1:py2, px1:px2], d, sigma_color, sigma_space)
+    smoothed = smoothed[ay - py1:ay - py1 + ah, ax - px1:ax - px1 + aw]
+
+    roi = arr[ay:ay + ah, ax:ax + aw]
+    alpha = (alpha_u8[ay:ay + ah, ax:ax + aw].astype(np.float32) / 255.0 * intensity)[:, :, np.newaxis]
+    blended = roi.astype(np.float32) * (1.0 - alpha) + smoothed.astype(np.float32) * alpha
+    arr[ay:ay + ah, ax:ax + aw] = np.clip(blended, 0, 255).astype(np.uint8)
+
+    return Image.fromarray(arr)
 
 
 def apply_sharpness(img: Image.Image, factor: float) -> Image.Image:
@@ -1596,6 +1706,7 @@ def _detect_blemishes(
     img_bgr: np.ndarray,
     skin_mask: np.ndarray,
     intensity: float,
+    short_side: int | None = None,
 ) -> np.ndarray:
     """LAB A·B 채널 밴드패스로 잡티를 탐지한다.
 
@@ -1607,10 +1718,13 @@ def _detect_blemishes(
     빼서, 평균이 잡티를 같이 포함해 편차가 스스로 상쇄되고 픽셀 노이즈는 그대로
     통과했다 — 합성 피부 테스트에서 검출이 0이던 원인이다.
 
+    short_side: 크기 기준이 되는 원본 사진의 짧은 변. 잘라낸 영역을 넘길 때
+    지정한다 — 잘린 조각의 짧은 변을 쓰면 임계 크기가 달라진다.
+
     반환: 잡티 영역이 255인 단채널 마스크.
     """
-    h, w = img_bgr.shape[:2]
-    short_side = min(h, w)
+    if short_side is None:
+        short_side = min(img_bgr.shape[:2])
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
 
     # A·B 채널만 사용 (L 채널 제외 → 음영·조명 무시)
@@ -1663,10 +1777,30 @@ def _detect_blemishes(
     return cv2.bitwise_and(filtered_mask, skin_mask)
 
 
-def _inpaint_blemishes(img_bgr: np.ndarray, blemish_mask: np.ndarray) -> np.ndarray:
+def _blemish_margin(short_side: int) -> int:
+    """잡티 처리 결과가 피부 마스크 밖으로 영향을 미치는 최대 거리 (px).
+
+    배경 가우시안 반경, 신호 가우시안 반경(float는 4σ), 인페인팅 반경,
+    블렌딩 페더 반경 중 가장 큰 것에 여유를 더한다. 피부 마스크 상자를 이만큼
+    넓혀 잘라 처리하면 결과가 사진 전체를 처리한 것과 같다.
+    """
+    bg_ksize = max(31, int(short_side * 0.08)) | 1
+    sig_radius = int(math.ceil(max(1.0, short_side * 0.004) * 4)) + 1
+    inpaint_radius = max(3, int(short_side * 0.004))
+    feather = max(5, int(short_side * 0.004)) | 1
+    return max(bg_ksize // 2, sig_radius, inpaint_radius * 2, feather // 2) + 4
+
+
+def _inpaint_blemishes(
+    img_bgr: np.ndarray,
+    blemish_mask: np.ndarray,
+    short_side: int | None = None,
+) -> np.ndarray:
     """OpenCV INPAINT_NS(Navier-Stokes)로 잡티 영역을 복원한다."""
+    if short_side is None:
+        short_side = min(img_bgr.shape[:2])
     # 반경이 잡티보다 작으면 가운데가 덜 채워진다 — 해상도에 맞춰 키운다
-    radius = max(3, int(min(img_bgr.shape[:2]) * 0.004))
+    radius = max(3, int(short_side * 0.004))
     return cv2.inpaint(img_bgr, blemish_mask, inpaintRadius=radius, flags=cv2.INPAINT_NS)
 
 
@@ -1689,27 +1823,39 @@ def apply_blemish_removal(
         return img
 
     arr_rgb = np.array(img)
-    arr_bgr = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2BGR)
 
     # 1. 피부 마스크 (얼굴 미감지 → 원본 반환)
     skin_mask = _get_skin_mask(arr_rgb, cache=cache, for_blemish=True)
     if skin_mask is None:
         return img
 
+    # 잡티는 피부 마스크 안에서만 찾고 지운다. 예전에는 LAB 변환·가우시안·
+    # 인페인팅을 사진 전체에 돌렸다(3413x2560에서 0.3초 이상). 마스크 상자를
+    # 필터 반경만큼 넓혀 잘라 처리하면 결과는 같다 — 상자 밖은 알파가 0이다.
+    h, w = arr_rgb.shape[:2]
+    short_side = min(h, w)
+    mx, my, mw, mh = cv2.boundingRect(skin_mask)
+    if mw == 0 or mh == 0:
+        return img
+    margin = _blemish_margin(short_side)
+    x1, y1 = max(0, mx - margin), max(0, my - margin)
+    x2, y2 = min(w, mx + mw + margin), min(h, my + mh + margin)
+    arr_bgr = cv2.cvtColor(arr_rgb[y1:y2, x1:x2], cv2.COLOR_RGB2BGR)
+    skin_crop = skin_mask[y1:y2, x1:x2]
+
     # 2. 잡티 탐지
-    blemish_mask = _detect_blemishes(arr_bgr, skin_mask, intensity)
+    blemish_mask = _detect_blemishes(arr_bgr, skin_crop, intensity, short_side=short_side)
 
     # 빈 마스크 → 깨끗한 피부, 원본 반환
     if cv2.countNonZero(blemish_mask) == 0:
         return img
 
     # 3. 인페인팅
-    inpainted = _inpaint_blemishes(arr_bgr, blemish_mask)
+    inpainted = _inpaint_blemishes(arr_bgr, blemish_mask, short_side=short_side)
 
     # 4. 잡티 픽셀만 교체 (마스크 경계를 살짝 블러하여 자연스럽게)
     #    intensity는 "무엇을 잡티로 볼지"의 감도다. 잡티라고 판정한 뒤에
     #    절반만 지울 이유는 없으므로 채움 강도는 따로 둔다.
-    short_side = min(arr_bgr.shape[:2])
     feather = max(5, int(short_side * 0.004)) | 1
     blend_mask = cv2.GaussianBlur(blemish_mask, (feather, feather), 0)
     fill = min(1.0, 0.6 + intensity * 0.4)
@@ -1717,9 +1863,9 @@ def apply_blemish_removal(
 
     result_bgr = arr_bgr.astype(np.float32) * (1.0 - alpha) + inpainted.astype(np.float32) * alpha
     result_bgr = np.clip(result_bgr, 0, 255).astype(np.uint8)
-    result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+    arr_rgb[y1:y2, x1:x2] = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
 
-    return Image.fromarray(result_rgb)
+    return Image.fromarray(arr_rgb)
 
 
 # ── AI 자동 편집 (autoEdits) ──
@@ -2513,9 +2659,11 @@ def apply_regional_transforms(
         if not applied:
             continue
 
+        # uint8로 들고 있다가 합성할 때 float로 바꾼다 — 영역마다 전체 크기
+        # float32(3413x2560에서 100MB)를 동시에 들고 있지 않게. 값은 같다.
         layers.append((
             region_name,
-            np.array(region_img, dtype=np.float32),
+            np.array(region_img, dtype=np.uint8),
             _soften_region_mask(mask, region_name, _feather_scale(params)),
         ))
 
@@ -2533,9 +2681,15 @@ def apply_regional_transforms(
 
     result = arr_rgb.copy()
     remaining = np.ones(arr_rgb.shape[:2], dtype=np.float32)
-    for _, region_arr, alpha in layers:
+    for _, region_u8, alpha in layers:
         weight = (alpha * remaining)[:, :, np.newaxis]
-        result += (region_arr - arr_rgb) * weight
+        # (region - 원본) * weight를 제자리 연산으로 — 같은 float32 연산 순서라
+        # 결과는 그대로이고 전체 크기 임시 배열이 하나로 준다.
+        delta = region_u8.astype(np.float32)
+        delta -= arr_rgb
+        delta *= weight
+        result += delta
+        del delta
         remaining *= 1.0 - alpha
 
     return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8))
@@ -2596,52 +2750,98 @@ _LEFT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387,
 _RIGHT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 
 
+# 변위장을 계산하는 격자 간격 (픽셀).
+#
+# 예전에는 출력 픽셀 전부에 대해 제어점별 가중치를 (N, H*W) float32 배열로
+# 한꺼번에 만들었다. 3413x2560 사진의 얼굴 ROI(약 1400x1500)에 제어점 90개면
+# 그 배열만 수백 MB이고 워프 한 번에 1.5초가 걸렸다. 지금은 제어점별로 누적해
+# 메모리가 격자 크기에만 비례한다 — 이것만으로 모든 픽셀을 계산해도 0.1초다.
+#
+# 거기에 변위장을 성긴 격자에서 계산해 선형 보간한다. 역거리가중 변위장은
+# 대부분 완만하지만 제어점 바로 위에서는 몇 px 폭의 뾰족한 봉우리가 생겨
+# (Shepard 보간의 특성), 격자가 성길수록 봉우리 끝이 무뎌진다.
+# 실측 최대 오차: 간격 2 → 0.12px, 간격 4 → 0.49px (tests/test_warp_grid.py).
+# 실제 사진 출력 PSNR은 간격 2에서 71~80dB, 4에서 58~77dB였고 시간 차이는
+# 얼굴 하나에 15ms뿐이라 2를 쓴다. 1이면 예전 계산과 결과가 같다.
+_WARP_GRID_STEP = 2
+
+
+def _idw_displacement(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    src_pts: np.ndarray,
+    dst_pts: np.ndarray,
+    alpha: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """(ys × xs) 격자에서 역워프 변위 (dx, dy)를 구한다.
+
+    xs: (W,), ys: (H,) float32 좌표. 반환: 각각 (H, W) float32.
+    변위 = Σ w_i (src_i - dst_i) / Σ w_i,  w_i = 1 / |dst_i - v|^(2*alpha)
+
+    제어점 수만큼의 (N, H*W) 가중치 배열을 만들지 않고 누적한다 —
+    메모리가 제어점 수와 무관하게 격자 크기에 비례한다.
+    """
+    xs = xs.astype(np.float32, copy=False)[np.newaxis, :]
+    ys = ys.astype(np.float32, copy=False)[:, np.newaxis]
+    shape = (ys.shape[0], xs.shape[1])
+    w_sum = np.zeros(shape, dtype=np.float32)
+    disp_x = np.zeros(shape, dtype=np.float32)
+    disp_y = np.zeros(shape, dtype=np.float32)
+    for (sx, sy), (tx, ty) in zip(src_pts, dst_pts):
+        dist_sq = (xs - np.float32(tx)) ** 2 + (ys - np.float32(ty)) ** 2 + np.float32(1e-6)
+        wt = 1.0 / (dist_sq ** alpha) if alpha != 1.0 else 1.0 / dist_sq
+        w_sum += wt
+        disp_x += wt * np.float32(sx - tx)
+        disp_y += wt * np.float32(sy - ty)
+    return disp_x / w_sum, disp_y / w_sum
+
+
 def _mls_similarity_warp(
     img: np.ndarray,
     src_pts: np.ndarray,
     dst_pts: np.ndarray,
     alpha: float = 1.0,
+    grid_step: int = _WARP_GRID_STEP,
 ) -> np.ndarray:
-    """MLS (Moving Least Squares) Similarity Warp.
+    """역거리가중(Shepard) 변위장으로 이미지를 역워프한다.
 
+    이름은 MLS지만 실제 계산은 제어점 변위의 역거리가중 평균이다.
     src_pts, dst_pts: (N, 2) float32 배열 — (x, y) 좌표.
     원본 이미지의 각 픽셀을 역워프하여 매핑한다.
     경계 접합선 없이 부드러운 변형을 생성한다.
+
+    grid_step > 1이면 변위장을 성긴 격자에서 계산해 선형 보간한다
+    (_WARP_GRID_STEP 참고). 1이면 모든 픽셀에서 계산한다.
     """
     h, w = img.shape[:2]
     n = len(src_pts)
     if n < 2:
         return img
 
-    # 출력 이미지의 픽셀 좌표 그리드
-    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-    grid = np.stack([xs, ys], axis=-1)  # (H, W, 2)
-    flat_grid = grid.reshape(-1, 2)  # (H*W, 2)
-    num_pixels = flat_grid.shape[0]
+    src_pts = np.asarray(src_pts, dtype=np.float32)
+    dst_pts = np.asarray(dst_pts, dtype=np.float32)
 
-    # 각 제어점의 가중치 계산: w_i = 1 / |p_i - v|^(2*alpha)
-    # (N, num_pixels) 가중치 배열
-    weights = np.zeros((n, num_pixels), dtype=np.float32)
-    for i in range(n):
-        diff = flat_grid - dst_pts[i]  # (num_pixels, 2)
-        dist_sq = np.sum(diff ** 2, axis=1) + 1e-6  # (num_pixels,)
-        weights[i] = 1.0 / (dist_sq ** alpha)
-
-    # 가중 합계
-    w_sum = np.sum(weights, axis=0)  # (num_pixels,)
-
-    # 가중 평균 displacement
-    disp = np.zeros_like(flat_grid)  # (num_pixels, 2)
-    for i in range(n):
-        d = src_pts[i] - dst_pts[i]  # (2,)
-        disp += weights[i, :, np.newaxis] * d[np.newaxis, :]
-
-    disp = disp / w_sum[:, np.newaxis]
+    step = max(1, int(grid_step))
+    gh = max(1, -(-h // step))
+    gw = max(1, -(-w // step))
+    if step == 1 or gh < 2 or gw < 2:
+        dx, dy = _idw_displacement(
+            np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32),
+            src_pts, dst_pts, alpha,
+        )
+    else:
+        # 격자점 j를 원본 좌표 (j + 0.5) * w / gw - 0.5에 둔다. cv2.resize
+        # (INTER_LINEAR)는 픽셀 중심 기준으로 보간하므로, 이렇게 두어야
+        # 확대 결과가 격자점 사이의 정확한 선형 보간이 된다 (반 픽셀 밀림 없음).
+        gxs = (np.arange(gw, dtype=np.float32) + 0.5) * (w / gw) - 0.5
+        gys = (np.arange(gh, dtype=np.float32) + 0.5) * (h / gh) - 0.5
+        cdx, cdy = _idw_displacement(gxs, gys, src_pts, dst_pts, alpha)
+        dx = cv2.resize(cdx, (w, h), interpolation=cv2.INTER_LINEAR)
+        dy = cv2.resize(cdy, (w, h), interpolation=cv2.INTER_LINEAR)
 
     # 역워프: 목적 좌표에서 원본 좌표 계산
-    map_xy = flat_grid + disp
-    map_x = map_xy[:, 0].reshape(h, w).astype(np.float32)
-    map_y = map_xy[:, 1].reshape(h, w).astype(np.float32)
+    map_x = dx + np.arange(w, dtype=np.float32)[np.newaxis, :]
+    map_y = dy + np.arange(h, dtype=np.float32)[:, np.newaxis]
 
     return cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
@@ -2987,33 +3187,37 @@ def apply_body_reshape(
             # 힙 아래 영역을 수직 스케일링 (단순 remap)
             stretch_factor = 1.0 + leg_stretch * 0.25  # 최대 25% 늘리기
 
-            # remap: hip_y 위는 그대로, 아래는 스트레칭
-            map_y = np.zeros((h, w), dtype=np.float32)
-            map_x = np.arange(w, dtype=np.float32)[np.newaxis, :].repeat(h, axis=0)
-
+            # remap: hip_y 위는 그대로, 아래는 스트레칭.
+            # 행마다 값이 같으므로 1차원으로 계산한다 (예전의 행 단위 파이썬 루프와 같은 값).
             hip_y_int = int(hip_y)
-            for row in range(h):
-                if row <= hip_y_int:
-                    map_y[row, :] = row
-                else:
-                    # 목적 row → 원본 row (역워프)
-                    orig_row = hip_y + (row - hip_y) / stretch_factor
-                    map_y[row, :] = min(h - 1, orig_row)
+            rows = np.arange(h, dtype=np.float64)
+            # 목적 row → 원본 row (역워프)
+            row_map = np.where(
+                rows <= hip_y_int, rows,
+                np.minimum(h - 1, hip_y + (rows - hip_y) / stretch_factor),
+            ).astype(np.float32)
 
-            # 경계 블렌딩 마스크
-            mask = np.zeros((h, w), dtype=np.float32)
-            mask[hip_y_int:, :] = 1.0
+            # 경계 블렌딩 마스크 (행 단위)
+            row_mask = np.zeros(h, dtype=np.float32)
+            row_mask[hip_y_int:] = 1.0
             # 힙 주변 부드러운 전환
             transition = max(10, int(h * 0.03))
-            for row in range(max(0, hip_y_int - transition), min(h, hip_y_int + transition)):
-                t = (row - (hip_y_int - transition)) / (2 * transition)
-                mask[row, :] = max(0.0, min(1.0, t))
+            t_rows = np.arange(max(0, hip_y_int - transition), min(h, hip_y_int + transition))
+            row_mask[t_rows] = np.clip(
+                (t_rows - (hip_y_int - transition)) / (2 * transition), 0.0, 1.0
+            )
 
-            stretched = cv2.remap(result_arr, map_x, map_y, cv2.INTER_LINEAR,
-                                  borderMode=cv2.BORDER_REPLICATE)
-            mask_3d = mask[:, :, np.newaxis]
-            result_arr = (result_arr.astype(np.float32) * (1 - mask_3d)
-                          + stretched.astype(np.float32) * mask_3d).astype(np.uint8)
+            # 마스크가 0인 행은 원본 그대로다. 사진 전체를 remap·float 블렌딩하지 않고
+            # 처음으로 마스크가 0이 아닌 행부터 아래만 계산한다 (결과는 같다).
+            nz = np.flatnonzero(row_mask)
+            if nz.size:
+                r0 = int(nz[0])
+                map_y = np.repeat(row_map[r0:, np.newaxis], w, axis=1)
+                map_x = np.repeat(np.arange(w, dtype=np.float32)[np.newaxis, :], h - r0, axis=0)
+                stretched = cv2.remap(result_arr, map_x, map_y, cv2.INTER_LINEAR,
+                                      borderMode=cv2.BORDER_REPLICATE)
+                alpha = np.repeat(row_mask[r0:, np.newaxis], w, axis=1)
+                result_arr[r0:] = _alpha_blend(stretched, result_arr[r0:], alpha)
 
     # ── shoulder_width: 어깨 너비 조절 ──
     if abs(shoulder_width) >= 0.01:
