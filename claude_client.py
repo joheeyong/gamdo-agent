@@ -2,6 +2,7 @@
 
 import base64
 import copy
+import io
 import hashlib
 import json
 import logging
@@ -31,6 +32,15 @@ MODEL = "sonnet"
 
 # Vision 분석용 이미지 최대 크기 (px). 해상도를 낮춰 전송량과 처리 시간을 줄인다.
 _VISION_MAX_PX = 1024
+
+# 변형할 사진을 메시지에 직접 넣을 때의 긴 변 상한. 모델이 보는 해상도의 상한과
+# 같게 두어, Read로 원본 파일을 읽게 하던 때보다 화질을 잃지 않는다.
+_INLINE_PHOTO_MAX_PX = 1568
+
+# 이미지 전달 방식. inline(기본) = stream-json 메시지에 이미지를 직접 담는다.
+# read = 임시 파일 경로를 주고 모델이 Read 도구로 읽게 한다 (예전 방식).
+# Read는 "도구 호출 → 결과 → 답변"으로 모델 왕복이 최소 한 번 더 생긴다.
+_VISION_INPUT_MODE = os.getenv("GAMDO_VISION_INPUT", "inline").strip().lower()
 
 # 이미지 임시 저장 디렉토리
 _TEMP_DIR = os.path.join(tempfile.gettempdir(), "gamdo-images")
@@ -443,6 +453,104 @@ def _create_reference_strip(ref_paths: list[str]) -> str | None:
     log.info("Created reference strip: %s (%dx%d, %d refs)",
              path, canvas.width, canvas.height, len(ref_imgs))
     return path
+
+
+def _encode_image_for_vision(img: Image.Image, max_px: int) -> str:
+    """모델에 직접 넣을 JPEG base64. 긴 변을 max_px 이하로 줄인다."""
+    img = _resize_for_vision(img.convert("RGB"), max_px=max_px)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _parse_stream_result(stdout: str) -> dict:
+    """stream-json 출력에서 마지막 result 이벤트를 꺼낸다. 없으면 RuntimeError."""
+    final: dict | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            final = event
+    if final is None:
+        raise RuntimeError("claude CLI inline: result 이벤트가 없음")
+    if final.get("is_error"):
+        raise RuntimeError(f"claude CLI inline error: {str(final.get('result'))[:200]}")
+    text = final.get("result")
+    if not isinstance(text, str) or not text.strip():
+        raise RuntimeError("claude CLI inline returned empty result")
+    return final
+
+
+def _call_claude_inline(
+    prompt: str,
+    system_prompt: str,
+    images_b64: list[str],
+    timeout: int = 300,
+) -> str:
+    """이미지를 stream-json 사용자 메시지에 직접 담아 claude -p를 호출한다.
+
+    도구를 하나도 열지 않는다(--tools ""). 모델이 파일을 읽으러 도구를 부를
+    필요가 없어 한 번의 응답으로 끝나고, 프롬프트 인젝션이 닿을 도구도 없다.
+    이미지는 JPEG base64이고, 메시지 안의 순서가 곧 프롬프트가 말하는 순서다.
+    """
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for b64 in images_b64:
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+        })
+    message = {"type": "user", "message": {"role": "user", "content": content}}
+
+    cmd = [
+        "claude", "-p",
+        "--input-format", "stream-json",
+        # print 모드의 stream-json 출력은 --verbose가 있어야 한다
+        "--output-format", "stream-json", "--verbose",
+        "--model", MODEL,
+        "--dangerously-skip-permissions",
+        "--strict-mcp-config",
+        "--tools", "",
+    ]
+    if system_prompt:
+        cmd.extend(["--system-prompt", system_prompt])
+
+    log.info("Calling claude CLI inline (model=%s, prompt length=%d, images=%d)",
+             MODEL, len(prompt), len(images_b64))
+
+    started = time.monotonic()
+    result = subprocess.run(
+        cmd,
+        input=json.dumps(message, ensure_ascii=False) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=child_env(os.environ),
+    )
+    if result.returncode != 0:
+        log.error("claude CLI inline returncode: %d", result.returncode)
+        log.error("claude CLI inline stderr: %s", result.stderr[:500] if result.stderr else "(empty)")
+        raise RuntimeError(
+            f"claude CLI inline failed (code={result.returncode}): "
+            f"{(result.stderr or result.stdout)[:200]}"
+        )
+
+    final = _parse_stream_result(result.stdout)
+    usage = final.get("usage") or {}
+    log.info(
+        "claude CLI inline done: %.1fs (api %.1fs), turns=%s, in=%s cache_read=%s out=%s",
+        time.monotonic() - started,
+        (final.get("duration_api_ms") or 0) / 1000,
+        final.get("num_turns"),
+        usage.get("input_tokens"),
+        usage.get("cache_read_input_tokens"),
+        usage.get("output_tokens"),
+    )
+    return final["result"]
 
 
 def _call_claude(
@@ -885,6 +993,60 @@ def _analysis_cache_put(key: str, value: dict) -> None:
             _analysis_cache.popitem(last=False)
 
 
+_PHOTO_COORD_RULE = (
+    "crop·remove_areas·local_* 의 정규화 좌표(0~1)는 모두 "
+    "**이 사진 한 장**을 기준으로 답하세요.\n"
+)
+_REF_STRIP_NOTE = (
+    "이 사용자가 평소 올리는 사진들을 위에서 아래로 이어 붙인 것입니다. "
+    "톤·색감의 방향만 참고하세요. "
+    "좌표의 기준이 아니며, 이 이미지를 변형하는 것도 아닙니다.\n"
+)
+
+
+def _transform_photo_inline(prompt_text: str, image_base64: str, ref_strip: str | None) -> str:
+    """변형할 사진(과 대표 사진 모음)을 메시지에 직접 담아 분석한다."""
+    with Image.open(io.BytesIO(base64.b64decode(image_base64))) as src:
+        images = [_encode_image_for_vision(src, _INLINE_PHOTO_MAX_PX)]
+    full_prompt = prompt_text + "\n\n=== 분석할 이미지 ===\n"
+    full_prompt += "첨부한 첫 번째 이미지가 변형할 사진입니다.\n" + _PHOTO_COORD_RULE
+    if ref_strip:
+        with Image.open(ref_strip) as strip:
+            images.append(_encode_image_for_vision(strip, _INLINE_PHOTO_MAX_PX))
+        full_prompt += "\n두 번째 이미지는 대표 사진 모음(참고용)입니다. " + _REF_STRIP_NOTE
+    return _call_claude_inline(full_prompt, TRANSFORM_PHOTO_SYSTEM, images)
+
+
+def _transform_photo_read(
+    prompt_text: str,
+    image_base64: str,
+    media_type: str,
+    ref_strip: str | None,
+    temp_files: list[str],
+) -> str:
+    """예전 방식: 임시 파일 경로를 주고 모델이 Read 도구로 읽게 한다."""
+    image_path = _save_temp_image(image_base64, media_type)
+    temp_files.append(image_path)
+    full_prompt = prompt_text + "\n\n" + (
+        "=== 분석할 이미지 ===\n"
+        f"변형할 사진: {image_path}\n"
+        "이 사진을 Read로 읽고 분석하세요.\n"
+    ) + _PHOTO_COORD_RULE
+    image_paths = [image_path]
+    if ref_strip:
+        image_paths.append(ref_strip)
+        full_prompt += (
+            f"\n대표 사진 모음(참고용): {ref_strip}\n"
+            "Read로 읽으세요. "
+        ) + _REF_STRIP_NOTE
+    # Read 도구만 허용하여 불필요한 도구 사용 방지
+    return _call_claude(
+        full_prompt, TRANSFORM_PHOTO_SYSTEM,
+        image_paths=image_paths,
+        tools="Read",
+    )
+
+
 def transform_photo(
     style_profile: dict,
     image_base64: str,
@@ -894,8 +1056,8 @@ def transform_photo(
 ) -> dict:
     """사용자 스타일 프로필에 맞춰 사진 보정 가이드를 반환한다.
 
-    새 사진 + 대표 사진을 하나의 합성 이미지로 만들어 Read 1회로 분석한다.
-    (기존: 파일 4개를 각각 Read → API 왕복 4~5회 → 합성 이미지 1회로 단축)
+    사진(과 대표 사진 모음)을 메시지에 직접 담아 모델 응답 한 번으로 분석한다.
+    실패하면 예전 방식(Read 도구)으로 한 번 더 시도한다.
     """
     cache_key = _analysis_cache_key(image_base64, style_profile or {}, user_id)
     cached = _analysis_cache_get(cache_key)
@@ -906,10 +1068,6 @@ def transform_photo(
     temp_files: list[str] = []
 
     try:
-        # 새 사진을 임시 파일로 저장
-        image_path = _save_temp_image(image_base64, media_type)
-        temp_files.append(image_path)
-
         # 대표 사진 경로 조회
         ref_paths = get_reference_image_paths(user_id) if user_id else []
 
@@ -923,30 +1081,17 @@ def transform_photo(
             style_profile=json.dumps(style_profile, ensure_ascii=False, indent=2),
         )
 
-        full_prompt = prompt_text + "\n\n"
-        full_prompt += (
-            "=== 분석할 이미지 ===\n"
-            f"변형할 사진: {image_path}\n"
-            "이 사진을 Read로 읽고 분석하세요.\n"
-            "crop·remove_areas·local_* 의 정규화 좌표(0~1)는 모두 "
-            "**이 사진 한 장**을 기준으로 답하세요.\n"
-        )
-        image_paths = [image_path]
-        if ref_strip:
-            image_paths.append(ref_strip)
-            full_prompt += (
-                f"\n대표 사진 모음(참고용): {ref_strip}\n"
-                "이 사용자가 평소 올리는 사진들을 위에서 아래로 이어 붙인 것입니다. "
-                "Read로 읽어 톤·색감의 방향만 참고하세요. "
-                "좌표의 기준이 아니며, 이 이미지를 변형하는 것도 아닙니다.\n"
+        result: str | None = None
+        if _VISION_INPUT_MODE != "read":
+            try:
+                result = _transform_photo_inline(prompt_text, image_base64, ref_strip)
+            except Exception as exc:
+                # 새 경로가 실패해도 분석은 계속돼야 한다 — 예전 방식으로 한 번 더
+                log.warning("transform_photo inline failed, falling back to Read: %s", exc)
+        if result is None:
+            result = _transform_photo_read(
+                prompt_text, image_base64, media_type, ref_strip, temp_files,
             )
-
-        # Read 도구만 허용하여 불필요한 도구 사용 방지
-        result = _call_claude(
-            full_prompt, TRANSFORM_PHOTO_SYSTEM,
-            image_paths=image_paths,
-            tools="Read",
-        )
         parsed = _parse_json_response(result)
 
         # 스키마 검증 — 어긋나면 부족한 필드만 짚어 한 번 다시 받는다.

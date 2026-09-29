@@ -37,6 +37,7 @@ python server.py                  # → http://localhost:8000 , 문서: /docs
 | `INSTAGRAM_CLIENT_ID` / `INSTAGRAM_CLIENT_SECRET` | (없음) | Instagram 로그인 OAuth 앱 자격증명 (code → token 교환). |
 | `GAMDO_MAX_BODY_MB` | `50` | 요청 본문 상한(MB). 넘으면 413. |
 | `GAMDO_MAX_CONCURRENT` | `3` | 이미지 처리 동시 실행 수 (메모리 보호). |
+| `GAMDO_VISION_INPUT` | `inline` | 사진을 모델에 넘기는 방식. `inline`은 stream-json 메시지에 이미지를 직접 담아 도구 없이 한 번에 응답받고(실측 평균 9.9s→8.0s), 실패하면 `read`로 자동 전환한다. `read`는 임시 파일을 Read 도구로 읽게 하는 예전 방식. |
 | `GAMDO_MAX_JOBS` | `4` | 비동기 분석 작업(`/api/jobs/...`) 워커 스레드 수. 픽셀 처리는 여전히 `GAMDO_MAX_CONCURRENT`로 묶인다. |
 | `GAMDO_MAX_QUEUED_JOBS` | `20` | 대기 중인 작업 상한. 넘으면 새 작업은 503 `busy`. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | (선택) | 헤드리스 서버에서 `claude` CLI 로그인 대신 쓰는 토큰. |
