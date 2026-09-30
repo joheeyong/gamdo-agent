@@ -2820,6 +2820,118 @@ _INPAINT_MAX_TOTAL_AREA = 0.05  # 전체 합 — 작은 영역 여러 개로 우
 _INPAINT_RADIUS = 5
 
 
+# 모델이 짚은 박스는 대상보다 작을 때가 많다. 실측: 유리에 비친 조명 반사의 박스 높이가
+# 실제의 절반 정도라 윗부분만 메워졌고, TELEA가 박스 바로 아래의 밝은 반사를 끌어와
+# 다시 밝게 채워 반사가 그대로 남았다. 그래서 박스를 넓힌 뒤 그 안에서 주변과 확연히
+# 다른 덩어리를 찾아 그 모양대로 지운다. 못 찾으면 원래 박스를 조금 넓혀 쓴다.
+_REMOVAL_MIN_PAD_FRAC = 0.01   # 짧은 변 대비 최소 여유
+_REMOVAL_SIDE_PAD = 0.4        # 가로 탐색 여유 (박스 너비 대비, 한쪽) — 반사 끝자락이 박스 밖에 남곤 했다
+_REMOVAL_DIFF_MIN = 12.0       # 국소 배경 대비 밝기 차 최소 (0~255)
+_REMOVAL_FALLBACK_GROW = 0.1   # 덩어리를 못 찾았을 때 박스를 넓히는 비율 (한쪽)
+
+
+def _removal_region_mask(lum: np.ndarray, left: int, top: int, right: int, bottom: int,
+                         ab: np.ndarray | None = None) -> np.ndarray:
+    """모델 박스 주변에서 실제로 지울 모양(uint8 0/255, 전체 크기)을 만든다.
+
+    반사·얼룩은 '주변보다 튀는 작은 점'이다. 탐색 영역 전체의 중앙값과 비교하면
+    옆 건물처럼 넓은 어두운 면까지 덩어리로 잡혀 건물 모서리가 뭉개졌다(실사진).
+    그래서 모폴로지 top-hat(밝은 점)/black-hat(어두운 점)으로 '국소 배경보다
+    튀는 작은 구조'만 찾고, 박스 안의 극성(밝음/어두움)과 같은 쪽만 지운다.
+
+    ab: CIELAB a·b 채널(float, 0 중심, HxWx2). 주면 박스 안 반사와 같은 색 방향으로
+    물든 곳도 잡는다 — 밝은 하늘에 붙은 반사 끝자락은 밝기로는 하늘과 구분이 안 됐다.
+    """
+    h, w = lum.shape
+    bw, bh = right - left, bottom - top
+    min_pad = max(2, int(_REMOVAL_MIN_PAD_FRAC * min(h, w)))
+    # 모델 박스는 높이가 모자라거나(실측: 절반) 끝자락이 빠지는 경우가 많다.
+    px = min_pad + int(bw * _REMOVAL_SIDE_PAD)
+    py = min_pad + max(int(1.5 * bh), int(bw * 0.3))
+    x0, y0 = max(0, left - px), max(0, top - py)
+    x1, y1 = min(w, right + px), min(h, bottom + py)
+    out = np.zeros((h, w), np.uint8)
+
+    # 커널은 반사의 짧은 쪽(높이 약 2×박스 높이)보다 커야 점 전체가 빠진다.
+    # 모폴로지는 커널만큼 더 넓은 맥락에서 돌리고, 덩어리는 탐색 영역 안에서만 찾는다.
+    k = int(2.5 * min(bw, 2 * bh)) + min_pad
+    k += 1 - k % 2
+    cx0, cy0 = max(0, x0 - k), max(0, y0 - k)
+    cx1, cy1 = min(w, x1 + k), min(h, y1 + k)
+    ctx = cv2.GaussianBlur(lum[cy0:cy1, cx0:cx1], (3, 3), 0)
+    # 큰 커널의 모폴로지는 커널 면적만큼 느리다 (고해상도 사진에서 박스당 수 초).
+    # 커널이 ~31px가 되도록 줄여서 돌리고 결과만 원래 크기로 되돌린다.
+    scale = min(1.0, 31.0 / k)
+    if scale < 1.0:
+        small = cv2.resize(ctx, (max(1, round(ctx.shape[1] * scale)), max(1, round(ctx.shape[0] * scale))),
+                           interpolation=cv2.INTER_AREA)
+        ks = max(3, int(k * scale) | 1)
+    else:
+        small, ks = ctx, k
+    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+    size = (ctx.shape[1], ctx.shape[0])
+    bright = cv2.resize(cv2.morphologyEx(small, cv2.MORPH_TOPHAT, kern), size, interpolation=cv2.INTER_LINEAR)
+    dark = cv2.resize(cv2.morphologyEx(small, cv2.MORPH_BLACKHAT, kern), size, interpolation=cv2.INTER_LINEAR)
+    sl = (slice(y0 - cy0, y1 - cy0), slice(x0 - cx0, x1 - cx0))
+    bright, dark = bright[sl], dark[sl]
+    by0, bx0 = top - y0, left - x0
+    inner = (slice(by0, by0 + bh), slice(bx0, bx0 + bw))
+    resp = bright if float(bright[inner].mean()) >= float(dark[inner].mean()) else dark
+    mad = float(np.median(np.abs(resp - np.median(resp)))) + 1e-3
+    # 질감(창문 띠)이 많으면 mad가 커져 반사의 약한 쪽을 놓치므로 상한을 둔다
+    thr = max(_REMOVAL_DIFF_MIN, min(4.0 * mad, 25.0))
+    blob = resp > thr
+    # 색: 박스 안 반사의 (a,b)가 배경에서 벗어난 방향으로 같이 물든 곳을 더한다.
+    # 방향을 보므로 파란 창문 띠처럼 반대쪽 색은 섞이지 않는다.
+    tinted = np.zeros_like(blob)
+    if ab is not None and blob[inner].any():
+        pab = cv2.GaussianBlur(ab[y0:y1, x0:x1], (3, 3), 0)
+        bg_ab = np.median(pab.reshape(-1, 2), axis=0)
+        v = pab[inner][blob[inner]].mean(axis=0) - bg_ab
+        nv = float(np.hypot(v[0], v[1]))
+        if nv >= 4.0:
+            proj = (pab - bg_ab) @ (v / nv)
+            tinted = proj > max(3.0, 0.4 * nv)
+    # 박스 밖으로는 박스 안 반사와 밝기가 비슷한 곳만 넓힌다. 반사 옆의 햇빛 받은 건물
+    # 측면(주변보다는 밝지만 반사보다는 어두움)이 붙어 따라 지워졌다(실사진).
+    patch = cv2.GaussianBlur(lum[y0:y1, x0:x1], (3, 3), 0)
+    core = patch[inner][blob[inner]]
+    if core.size:
+        level = float(np.median(core))
+        outside = np.ones_like(blob)
+        outside[inner] = False
+        far = (patch < level - 20.0) if resp is bright else (patch > level + 20.0)
+        blob &= ~(outside & far)
+    blob = blob.astype(np.uint8)
+    # 반사는 두툼한 덩어리다. 건물 모서리선·창틀 같은 가는 밝은 선이 반사에 붙어 있으면
+    # 그 선을 따라 마스크가 뻗어 모서리가 휘었다(실사진) — 가는 돌기는 잘라낸다.
+    t = max(3, int(0.5 * min(bw, bh)) | 1)
+    blob = cv2.morphologyEx(blob, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (t, t)))
+    # 색으로 잡은 곳은 가는 선 문제가 없어(모서리선은 무채색) 작은 잡티만 걸러 더한다.
+    # 반사 끝자락은 조각나 있어 큰 커널로 열면 사라졌다.
+    if tinted.any():
+        tinted = cv2.morphologyEx(tinted.astype(np.uint8), cv2.MORPH_OPEN,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        blob |= tinted
+
+    # 모델이 짚은 박스와 겹치는 덩어리만 — 탐색 영역의 다른 물체는 건드리지 않는다
+    _, labels = cv2.connectedComponents(blob, connectivity=8)
+    keep = [q for q in np.unique(labels[inner]) if q != 0]
+    found = np.isin(labels, keep).astype(np.uint8) if keep else np.zeros_like(blob)
+    n_found = int(found.sum())
+
+    if keep and 0.1 * bw * bh <= n_found <= 4 * bw * bh:
+        grow = max(2, int(0.08 * min(bw, bh)) + 1)
+        found = cv2.dilate(found, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1)))
+        out[y0:y1, x0:x1] = found * 255
+        # 모델 박스는 항상 포함 — 밝기로 안 잡히는 대상(회색 위 빨간 물체 등)도 예전처럼 지운다
+        out[top:bottom, left:right] = 255
+    else:
+        gx, gy = int(bw * _REMOVAL_FALLBACK_GROW), int(bh * _REMOVAL_FALLBACK_GROW)
+        out[max(0, top - gy):min(h, bottom + gy), max(0, left - gx):min(w, right + gx)] = 255
+    return out
+
+
 def apply_object_removal(img: Image.Image, areas: list[dict]) -> Image.Image:
     """AI가 지정한 영역의 불필요한 요소를 인페인팅으로 제거한다.
 
@@ -2835,6 +2947,8 @@ def apply_object_removal(img: Image.Image, areas: list[dict]) -> Image.Image:
         h, w = arr_bgr.shape[:2]
         frame_area = float(h * w)
 
+        lum = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        ab = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2LAB)[..., 1:].astype(np.float32) - 128.0
         mask = np.zeros((h, w), dtype=np.uint8)
         for area in areas:
             ax = max(0.0, min(1.0, float(area.get("x", 0))))
@@ -2850,17 +2964,23 @@ def apply_object_removal(img: Image.Image, areas: list[dict]) -> Image.Image:
             if right - left < 2 or bottom - top < 2:
                 continue
 
-            box_area = (right - left) * (bottom - top)
-            if box_area > frame_area * _INPAINT_MAX_AREA:
+            region = _removal_region_mask(lum, left, top, right, bottom, ab)
+            region_area = cv2.countNonZero(region)
+            if region_area > frame_area * _INPAINT_MAX_AREA:
+                # 찾은 모양이 한도를 넘으면 모델 박스 그대로 (예전 동작)
+                region = np.zeros_like(mask)
+                region[top:bottom, left:right] = 255
+                region_area = cv2.countNonZero(region)
+            if region_area > frame_area * _INPAINT_MAX_AREA:
                 log.info("object_removal: 영역 %.1f%%가 상한 %.0f%% 초과 — 건너뜀",
-                         box_area / frame_area * 100, _INPAINT_MAX_AREA * 100)
+                         region_area / frame_area * 100, _INPAINT_MAX_AREA * 100)
                 continue
-            if (cv2.countNonZero(mask) + box_area) > frame_area * _INPAINT_MAX_TOTAL_AREA:
+            if cv2.countNonZero(cv2.bitwise_or(mask, region)) > frame_area * _INPAINT_MAX_TOTAL_AREA:
                 log.info("object_removal: 누적 면적이 상한 %.0f%% 초과 — 나머지 건너뜀",
                          _INPAINT_MAX_TOTAL_AREA * 100)
                 break
 
-            mask[top:bottom, left:right] = 255
+            mask = cv2.bitwise_or(mask, region)
 
         if cv2.countNonZero(mask) == 0:
             return img
