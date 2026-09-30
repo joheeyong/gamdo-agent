@@ -3032,7 +3032,7 @@ def _region_mean_l(img: Image.Image, mask: np.ndarray) -> float:
         return float(l_ch.mean())
     return float(cv2.mean(l_ch, mask=mask)[0])
 
-# ── 얼굴/체형 보정 (MLS Warp) ──
+# ── 얼굴/체형 보정 (가우시안 국소 워프) ──
 
 # 얼굴 윤곽 랜드마크 인덱스 (MediaPipe 478개 중 양쪽 볼·턱선)
 _FACE_CONTOUR_LEFT = [234, 93, 132, 58, 172, 136, 150, 149, 176, 148, 152]
@@ -3077,169 +3077,241 @@ _RIGHT_EYE_CENTER = 473   # RIGHT iris 중심
 _LEFT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
 _RIGHT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 
+# 윤곽을 옮기면 안 되는 얼굴 부위 — 변위 0인 고정점으로 넣는다.
+#   이마·관자놀이(얼굴 타원 윗부분): 볼을 줄여도 헤어라인이 딸려오지 않게
+#   눈꼬리·입꼬리·입술 중앙: 볼 슬림이 눈을 가로로 좁히거나 웃는 입을 누르지 않게
+# 눈 확대는 따로 계산하는 국소 확대(아래 _eye_bulge)라 이 고정점과 부딪히지 않는다.
+_FACE_UPPER_ANCHORS = [127, 162, 21, 54, 103, 67, 109, 10, 338, 297, 332, 284, 251, 389, 356]
+_FACE_FEATURE_ANCHORS = [33, 133, 362, 263, 61, 291, 0, 17]
 
-# 변위장을 계산하는 격자 간격 (픽셀).
+# 윤곽점별 슬림 비중 (_FACE_CONTOUR_LEFT/RIGHT 순서: 광대 → 볼 → 턱 → 턱끝).
+# 예전에는 광대부터 턱끝 옆까지 똑같이 14%씩 당겨 광대와 관자놀이 경계,
+# 턱끝 양옆이 함께 꺾였다. 사진관 보정은 아랫볼·턱선이 주로 줄고 광대는 조금,
+# 턱끝은 제자리다 (152는 0 = 고정점).
+_SLIM_PROFILE = [0.45, 0.75, 1.0, 1.0, 1.0, 0.9, 0.75, 0.6, 0.45, 0.3, 0.0]
+
+# 턱선 비중 (_JAW_LEFT/RIGHT 순서: 턱각 → 턱끝 옆).
+# 예전 jaw_sharpen은 턱선 전체를 안쪽 10% + 턱끝 높이 쪽으로 5% 끌어내려
+# 턱끝이 뾰족한 V자가 됐다. 지금은 턱각만 안쪽으로 다듬고 턱끝 쪽으로 갈수록 줄인다.
+_JAW_PROFILE = [1.0, 1.0, 0.8, 0.55, 0.3, 0.15]
+
+# ── 보정 강도 보정(calibration) ──
 #
-# 예전에는 출력 픽셀 전부에 대해 제어점별 가중치를 (N, H*W) float32 배열로
-# 한꺼번에 만들었다. 3413x2560 사진의 얼굴 ROI(약 1400x1500)에 제어점 90개면
-# 그 배열만 수백 MB이고 워프 한 번에 1.5초가 걸렸다. 지금은 제어점별로 누적해
-# 메모리가 격자 크기에만 비례한다 — 이것만으로 모든 픽셀을 계산해도 0.1초다.
-#
-# 거기에 변위장을 성긴 격자에서 계산해 선형 보간한다. 역거리가중 변위장은
-# 대부분 완만하지만 제어점 바로 위에서는 몇 px 폭의 뾰족한 봉우리가 생겨
-# (Shepard 보간의 특성), 격자가 성길수록 봉우리 끝이 무뎌진다.
-# 실측 최대 오차: 간격 2 → 0.12px, 간격 4 → 0.49px (tests/test_warp_grid.py).
-# 실제 사진 출력 PSNR은 간격 2에서 71~80dB, 4에서 58~77dB였고 시간 차이는
-# 얼굴 하나에 15ms뿐이라 2를 쓴다. 1이면 예전 계산과 결과가 같다.
-_WARP_GRID_STEP = 2
+# 값 1.0(앱 슬라이더 최대)에서의 실제 효과. 모델이 주로 쓰는 0.2~0.35가
+# "티 나지 않게 조금"이 되도록 예전보다 약 절반으로 낮췄다.
+#   face_slim   1.0 → 아랫볼 윤곽이 얼굴 중심선까지 거리의 약 8% 안쪽으로 (예전 14%)
+#   jaw_sharpen 1.0 → 턱각이 약 7% 안쪽으로 (예전 10% + 아래로 5%)
+#   eye_enlarge 1.0 → 눈 중심 배율 약 1.28배 (0.3 → 1.07배, 0.45 → 1.11배), 눈 밖으로 갈수록 0
+#               (예전: 윤곽 18% + 얼굴 전체 출렁임). 0.10이던 게인은 0.45에서 최대 1px라 안 보였다.
+# 이 값들은 제어점에 주는 목표치이고, 가우시안 가중 평균이 주변 고정점과 섞으며
+# 조금 덜어낸다 — _FACE_FIELD_COMP가 그만큼을 되돌린다 (실측으로 맞춤).
+_FACE_SLIM_GAIN = 0.08
+_JAW_SHARPEN_GAIN = 0.07
+_EYE_ENLARGE_GAIN = 0.22
+_FACE_FIELD_COMP = 1.35
+
+# 변형 가능한 배경 띠의 폭 하한 (사진 짧은 변 대비). 인물 실루엣 밖으로는
+# 이 띠(또는 최대 이동량의 4배 중 큰 쪽) 안에서만 변위가 0으로 줄어든다.
+_SUPPORT_BAND_MIN = 0.01
 
 
-def _idw_displacement(
+def _gaussian_field(
     xs: np.ndarray,
     ys: np.ndarray,
-    src_pts: np.ndarray,
-    dst_pts: np.ndarray,
-    alpha: float = 1.0,
+    pts: np.ndarray,
+    disp: np.ndarray,
+    sigma: np.ndarray | float,
+    far: float = 3.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """(ys × xs) 격자에서 역워프 변위 (dx, dy)를 구한다.
+    """제어점 변위를 가우시안 가중 평균으로 (ys × xs) 격자에 펼친다.
 
-    xs: (W,), ys: (H,) float32 좌표. 반환: 각각 (H, W) float32.
-    변위 = Σ w_i (src_i - dst_i) / Σ w_i,  w_i = 1 / |dst_i - v|^(2*alpha)
+    d(v) = Σ g_i(v) d_i / (Σ g_i(v) + g_far),  g_i = exp(-|v - p_i|² / 2σ_i²)
 
-    제어점 수만큼의 (N, H*W) 가중치 배열을 만들지 않고 누적한다 —
-    메모리가 제어점 수와 무관하게 격자 크기에 비례한다.
+    예전 워프는 역거리가중(1/d², Shepard)이었다. 그 가중은 꼬리가 길어서
+    제어점에서 멀어질수록 변위가 0이 아니라 "모든 제어점 변위의 평균"으로
+    수렴한다. 그래서 눈 확대만 해도 볼·턱·머리카락·배경까지 수 px씩 밀렸고
+    (실측: eye_enlarge 0.45에서 인물 밖 3% 지점 배경 6.6px), 그 변형을
+    타원 마스크로 잘라내니 경계가 얼룩처럼 보였다.
+    가우시안 가중은 몇 σ 밖에서 사라지고, g_far(= 거리 far·σ의 가중)가
+    "먼 곳은 변위 0"인 보이지 않는 고정점 역할을 한다. 결과는 제어점 변위와
+    0의 볼록 결합이라 목표치를 넘치는 일(오버슈트)도 없다.
+
+    가중이 x·y로 분리되므로 제어점마다 (W,)·(H,) 두 벡터의 외적만 더한다.
+    pts: (N, 2) 출력 좌표, disp: (N, 2) 역워프 변위(출력 → 원본), sigma: (N,) 또는 스칼라.
     """
-    xs = xs.astype(np.float32, copy=False)[np.newaxis, :]
-    ys = ys.astype(np.float32, copy=False)[:, np.newaxis]
-    shape = (ys.shape[0], xs.shape[1])
-    w_sum = np.zeros(shape, dtype=np.float32)
-    disp_x = np.zeros(shape, dtype=np.float32)
-    disp_y = np.zeros(shape, dtype=np.float32)
-    for (sx, sy), (tx, ty) in zip(src_pts, dst_pts):
-        dist_sq = (xs - np.float32(tx)) ** 2 + (ys - np.float32(ty)) ** 2 + np.float32(1e-6)
-        wt = 1.0 / (dist_sq ** alpha) if alpha != 1.0 else 1.0 / dist_sq
-        w_sum += wt
-        disp_x += wt * np.float32(sx - tx)
-        disp_y += wt * np.float32(sy - ty)
-    return disp_x / w_sum, disp_y / w_sum
+    xs = np.asarray(xs, dtype=np.float32)
+    ys = np.asarray(ys, dtype=np.float32)
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+    disp = np.asarray(disp, dtype=np.float32).reshape(-1, 2)
+    sig = np.broadcast_to(np.asarray(sigma, dtype=np.float32), (len(pts),))
+    shape = (ys.shape[0], xs.shape[0])
+    den = np.full(shape, np.exp(-0.5 * far * far), dtype=np.float32)
+    num_x = np.zeros(shape, dtype=np.float32)
+    num_y = np.zeros(shape, dtype=np.float32)
+    for (px, py), (dx, dy), s in zip(pts, disp, sig):
+        inv = np.float32(-0.5 / max(float(s), 1e-3) ** 2)
+        gx = np.exp(inv * (xs - px) ** 2)
+        gy = np.exp(inv * (ys - py) ** 2)
+        wgt = np.outer(gy, gx)
+        den += wgt
+        if dx != 0.0:
+            num_x += wgt * dx
+        if dy != 0.0:
+            num_y += wgt * dy
+    return num_x / den, num_y / den
 
 
-def _mls_similarity_warp(
-    img: np.ndarray,
-    src_pts: np.ndarray,
-    dst_pts: np.ndarray,
-    alpha: float = 1.0,
-    grid_step: int = _WARP_GRID_STEP,
-) -> np.ndarray:
-    """역거리가중(Shepard) 변위장으로 이미지를 역워프한다.
+def _eye_bulge(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    center: tuple[float, float],
+    rx: float,
+    ry: float,
+    angle: float,
+    amount: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """눈 하나를 국소 확대하는 역워프 변위.
 
-    이름은 MLS지만 실제 계산은 제어점 변위의 역거리가중 평균이다.
-    src_pts, dst_pts: (N, 2) float32 배열 — (x, y) 좌표.
-    원본 이미지의 각 픽셀을 역워프하여 매핑한다.
-    경계 접합선 없이 부드러운 변형을 생성한다.
-
-    grid_step > 1이면 변위장을 성긴 격자에서 계산해 선형 보간한다
-    (_WARP_GRID_STEP 참고). 1이면 모든 픽셀에서 계산한다.
+    원본 = c + (q - c)(1 - a·k(ρ)),  k(ρ) = (1 - ρ²)² (ρ < 1), ρ = 눈 좌표계 타원 반경.
+    변위는 타원(눈꺼풀·눈 주변) 밖에서 정확히 0이다. 예전에는 눈 윤곽점만
+    바깥으로 밀고 나머지를 보간에 맡겨 얼굴 전체가 따라 움직였다.
+    반경 방향 사상의 기울기는 1 - a(1-ρ²)(1-5ρ²) ≥ 1 - a라 a < 1이면 단조 — 접힘이 없다
+    (eye_enlarge 1.0에서 a = 0.22).
     """
-    h, w = img.shape[:2]
-    n = len(src_pts)
-    if n < 2:
-        return img
-
-    src_pts = np.asarray(src_pts, dtype=np.float32)
-    dst_pts = np.asarray(dst_pts, dtype=np.float32)
-
-    step = max(1, int(grid_step))
-    gh = max(1, -(-h // step))
-    gw = max(1, -(-w // step))
-    if step == 1 or gh < 2 or gw < 2:
-        dx, dy = _idw_displacement(
-            np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32),
-            src_pts, dst_pts, alpha,
-        )
-    else:
-        # 격자점 j를 원본 좌표 (j + 0.5) * w / gw - 0.5에 둔다. cv2.resize
-        # (INTER_LINEAR)는 픽셀 중심 기준으로 보간하므로, 이렇게 두어야
-        # 확대 결과가 격자점 사이의 정확한 선형 보간이 된다 (반 픽셀 밀림 없음).
-        gxs = (np.arange(gw, dtype=np.float32) + 0.5) * (w / gw) - 0.5
-        gys = (np.arange(gh, dtype=np.float32) + 0.5) * (h / gh) - 0.5
-        cdx, cdy = _idw_displacement(gxs, gys, src_pts, dst_pts, alpha)
-        dx = cv2.resize(cdx, (w, h), interpolation=cv2.INTER_LINEAR)
-        dy = cv2.resize(cdy, (w, h), interpolation=cv2.INTER_LINEAR)
-
-    # 역워프: 목적 좌표에서 원본 좌표 계산
-    map_x = dx + np.arange(w, dtype=np.float32)[np.newaxis, :]
-    map_y = dy + np.arange(h, dtype=np.float32)[:, np.newaxis]
-
-    return cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    cx, cy = center
+    ca, sa = math.cos(angle), math.sin(angle)
+    X = (np.asarray(xs, dtype=np.float32) - cx)[np.newaxis, :]
+    Y = (np.asarray(ys, dtype=np.float32) - cy)[:, np.newaxis]
+    u = X * ca + Y * sa
+    v = -X * sa + Y * ca
+    rho2 = (u / rx) ** 2 + (v / ry) ** 2
+    k = np.clip(1.0 - rho2, 0.0, None) ** 2
+    f = np.float32(-amount) * k
+    return X * f, Y * f
 
 
-def _warp_with_mask(
-    img: np.ndarray,
-    src_pts: np.ndarray,
-    dst_pts: np.ndarray,
-    roi: tuple[int, int, int, int] | None = None,
-) -> np.ndarray:
-    """MLS 워프 + 가우시안 마스크 블렌딩으로 원본과 자연스럽게 합성.
+def _support_weight(person: np.ndarray | None, band: float) -> np.ndarray | None:
+    """인물 실루엣 안은 1, 밖으로 band px에 걸쳐 0으로 줄어드는 가중치.
 
-    roi: (x, y, w, h) — 워프 영향 영역. None이면 전체.
-    ROI가 주어지면 패딩된 ROI 영역만 워프하여 성능 향상 + 배경 아티팩트 방지.
+    변위장에 곱해서 배경(문틀·벽 모서리·수평선)이 인물 옆에서 휘지 않게 한다.
+    윤곽이 옮겨 간 자리를 채우려면 실루엣 바로 밖의 좁은 띠는 늘어나야 하므로
+    0/1로 자르지 않고 band 폭으로 부드럽게 줄인다 (band ≥ 최대 이동량의 4배라 접힘 없음).
     """
-    if roi is None:
-        return _mls_similarity_warp(img, src_pts, dst_pts)
+    if person is None:
+        return None
+    fg = (person > 0.5).astype(np.uint8)
+    if not fg.any():
+        return None
+    if fg.all():
+        return np.ones(fg.shape, dtype=np.float32)
+    dist = cv2.distanceTransform(1 - fg, cv2.DIST_L2, 3)
+    t = np.clip(1.0 - dist / max(band, 1.0), 0.0, 1.0)
+    return (t * t * (3.0 - 2.0 * t)).astype(np.float32)
 
-    h, w = img.shape[:2]
-    rx, ry, rw, rh = roi
-    rx = max(0, rx)
-    ry = max(0, ry)
-    rw = min(w - rx, rw)
-    rh = min(h - ry, rh)
 
-    if rw <= 0 or rh <= 0:
-        return img
+def _field_step(scale: float) -> int:
+    """변위장을 계산할 성긴 격자 간격. 장이 σ(얼굴 폭의 ~10%) 규모로 매끄러워
+    얼굴 폭의 1.5% 간격이면 충분하다 (선형 보간 오차 < 0.1px)."""
+    return int(np.clip(scale * 0.015, 2, 12))
 
-    # ROI를 패딩하여 블렌딩 경계가 자연스럽도록 (블러 커널 크기의 1.5배)
-    blur_size = max(31, int(min(rw, rh) * 0.3)) | 1
-    pad = blur_size
-    crop_x1 = max(0, rx - pad)
-    crop_y1 = max(0, ry - pad)
-    crop_x2 = min(w, rx + rw + pad)
-    crop_y2 = min(h, ry + rh + pad)
-    crop_w = crop_x2 - crop_x1
-    crop_h = crop_y2 - crop_y1
 
-    # ROI 영역만 잘라내서 워프 (제어점도 ROI 좌표계로 변환)
-    crop = img[crop_y1:crop_y2, crop_x1:crop_x2].copy()
-    offset = np.array([crop_x1, crop_y1], dtype=np.float32)
-    crop_src = src_pts - offset
-    crop_dst = dst_pts - offset
+def _remap_region(
+    arr: np.ndarray,
+    roi: tuple[int, int, int, int],
+    field_fn,
+    step: int,
+    person: np.ndarray | None,
+    band: float,
+) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray] | None]:
+    """roi (x0, y0, x1, y1) 안에서 변위장을 만들어 한 번의 remap으로 적용한다.
 
-    warped_crop = _mls_similarity_warp(crop, crop_src, crop_dst)
+    field_fn(xs, ys) -> (dx, dy): 원본 좌표계 격자 좌표를 받아 역워프 변위를 준다.
+    반환: (결과 배열, roi 안의 최종 변위장 또는 None).
+    """
+    h, w = arr.shape[:2]
+    x0, y0, x1, y1 = roi
+    x0, y0 = max(0, int(x0)), max(0, int(y0))
+    x1, y1 = min(w, int(math.ceil(x1))), min(h, int(math.ceil(y1)))
+    rw, rh = x1 - x0, y1 - y0
+    if rw < 4 or rh < 4:
+        return arr, None
 
-    # 타원형 마스크 (ROI 좌표계)
-    mask = np.zeros((crop_h, crop_w), dtype=np.float32)
-    # 타원 중심과 축을 crop 좌표계로 변환
-    ellipse_cx = rx + rw // 2 - crop_x1
-    ellipse_cy = ry + rh // 2 - crop_y1
-    cv2.ellipse(
-        mask,
-        center=(ellipse_cx, ellipse_cy),
-        axes=(rw // 2, rh // 2),
-        angle=0, startAngle=0, endAngle=360,
-        color=1.0, thickness=-1,
-    )
-    mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
-    mask = mask[:, :, np.newaxis]
+    gw = max(2, -(-rw // step))
+    gh = max(2, -(-rh // step))
+    # 격자점 j를 픽셀 중심 규약에 맞춰 둔다 — cv2.resize(INTER_LINEAR)가
+    # 격자점 사이를 정확히 선형 보간하도록 (반 픽셀 밀림 없음).
+    gxs = x0 + (np.arange(gw, dtype=np.float32) + 0.5) * (rw / gw) - 0.5
+    gys = y0 + (np.arange(gh, dtype=np.float32) + 0.5) * (rh / gh) - 0.5
+    cdx, cdy = field_fn(gxs, gys)
+    dx = cv2.resize(np.ascontiguousarray(cdx, dtype=np.float32), (rw, rh), interpolation=cv2.INTER_LINEAR)
+    dy = cv2.resize(np.ascontiguousarray(cdy, dtype=np.float32), (rw, rh), interpolation=cv2.INTER_LINEAR)
 
-    # 블렌딩 후 원본에 합성
-    blended_crop = (
-        crop.astype(np.float32) * (1 - mask)
-        + warped_crop.astype(np.float32) * mask
-    ).astype(np.uint8)
+    # ROI 가장자리는 어떤 경우에도 변위 0 — 장이 이미 0에 수렴하지만 안전장치.
+    edge = max(2, int(min(rw, rh) * 0.04))
+    ramp_x = np.clip(np.minimum(np.arange(rw), np.arange(rw)[::-1]) / edge, 0, 1).astype(np.float32)
+    ramp_y = np.clip(np.minimum(np.arange(rh), np.arange(rh)[::-1]) / edge, 0, 1).astype(np.float32)
+    taper = np.outer(ramp_y, ramp_x)
+    if person is not None:
+        sup = _support_weight(person[y0:y1, x0:x1], band)
+        if sup is not None:
+            taper *= sup
+    dx *= taper
+    dy *= taper
 
-    result = img.copy()
-    result[crop_y1:crop_y2, crop_x1:crop_x2] = blended_crop
-    return result
+    map_x = dx + np.arange(x0, x1, dtype=np.float32)[np.newaxis, :]
+    map_y = dy + np.arange(y0, y1, dtype=np.float32)[:, np.newaxis]
+    out = arr.copy()
+    out[y0:y1, x0:x1] = cv2.remap(arr, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return out, (dx, dy)
+
+
+class _FaceControls:
+    """얼굴 한 개의 변형 정의 — 윤곽 제어점(가우시안 장) + 눈 국소 확대."""
+
+    def __init__(self) -> None:
+        self.pts: list[list[float]] = []    # 출력 좌표
+        self.disp: list[list[float]] = []   # 역워프 변위 (0이면 고정점)
+        self.eyes: list[tuple] = []          # (center, rx, ry, angle, amount)
+        self.sigma = 1.0
+        self.scale = 1.0                     # 얼굴 폭 (px)
+        self.max_move = 0.0                  # 최대 이동량 (px)
+        self.yaw = 0.0                       # -1~1, 부호 = 가까운 쪽
+
+    @property
+    def active(self) -> bool:
+        return self.max_move > 0.0 or bool(self.eyes)
+
+    def field(self, xs: np.ndarray, ys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if self.max_move > 0.0:
+            dx, dy = _gaussian_field(xs, ys, np.array(self.pts), np.array(self.disp), self.sigma)
+        else:
+            dx = np.zeros((len(ys), len(xs)), np.float32)
+            dy = np.zeros_like(dx)
+        for center, rx, ry, ang, amt in self.eyes:
+            ex, ey = _eye_bulge(xs, ys, center, rx, ry, ang, amt)
+            dx += ex
+            dy += ey
+        return dx, dy
+
+
+def _face_yaw(pt) -> float:
+    """고개 돌림 정도 (-1~1). 코 중심선에서 양쪽 광대(234, 454)까지 거리의 비대칭.
+
+    정면 0. 코 중심선이 머리 앞쪽 표면에 있어 작은 회전에도 크게 반응한다
+    (대략 tan θ — 15° ≈ ±0.25, 25° ≈ ±0.45). 부호는 454 쪽이 가까우면 +.
+    """
+    top = np.array(pt(168), np.float64)
+    chin = np.array(pt(152), np.float64)
+    m = chin - top
+    n_ = np.linalg.norm(m)
+    if n_ < 1e-6:
+        return 0.0
+    nrm = np.array([m[1], -m[0]]) / n_
+    dl = abs(float(np.dot(np.array(pt(234)) - top, nrm)))
+    dr = abs(float(np.dot(np.array(pt(454)) - top, nrm)))
+    if dl + dr < 1e-6:
+        return 0.0
+    return (dr - dl) / (dr + dl)
 
 
 def _build_reshape_controls(
@@ -3248,101 +3320,152 @@ def _build_reshape_controls(
     face_slim: float,
     jaw_sharpen: float,
     eye_enlarge: float,
-) -> tuple[list[list[float]], list[list[float]]]:
-    """얼굴 한 개의 워프 제어점 (src, dst)을 만든다.
+) -> _FaceControls:
+    """얼굴 한 개의 변형 정의를 만든다.
 
     pt(idx) -> (x, y): 랜드마크 인덱스를 픽셀 좌표로 바꾸는 함수.
     MediaPipe에 의존하지 않아 합성 좌표로 단독 검증할 수 있다.
+
+    - 윤곽은 얼굴 중심선(미간 168 – 턱끝 152)에 수직으로, 그 선까지 거리에 비례해 옮긴다.
+      예전에는 광대 양끝의 중점을 축으로 좌우 같은 px만큼 옮겨, 돌아간 얼굴에서
+      좁게 보이는 먼 쪽 볼이 비율상 더 많이 눌렸다.
+    - 양쪽 광대 끝의 이동량은 머리 반폭 기준으로 같게 — 돌아간 얼굴에서 한쪽만 깎이지 않게.
+      먼 쪽은 조금 덜(yaw 0.25에서 0.8배) 옮기고, 거의 옆모습이면 슬림·턱·눈을 끈다.
+    - 윤곽 바깥에 변위 0인 고정점 띠를 둘러 배경·머리카락·목이 따라 휘지 않게 한다.
     """
-    src_all: list[list[float]] = []
-    dst_all: list[list[float]] = []
+    c = _FaceControls()
+    face_slim = float(np.clip(face_slim, 0.0, 1.0))
+    jaw_sharpen = float(np.clip(jaw_sharpen, 0.0, 1.0))
+    eye_enlarge = float(np.clip(eye_enlarge, 0.0, 1.0))
+    if face_slim < 0.01 and jaw_sharpen < 0.01 and eye_enlarge < 0.01:
+        return c
 
-    # 얼굴 중심축.
-    # 코끝(1)을 쓰면 얼굴이 조금만 돌아가도 축이 한쪽으로 치우쳐
-    # 볼 슬림·턱선 이동량이 좌우로 달라진다. 광대 양끝(234, 454)의
-    # 중점은 고개 방향에 훨씬 덜 흔들린다.
-    left_cheek = pt(234)
-    right_cheek = pt(454)
-    cx = (left_cheek[0] + right_cheek[0]) / 2.0
+    P = lambda i: np.array(pt(i), dtype=np.float64)  # noqa: E731
+    top, chin = P(168), P(152)
+    axis = chin - top
+    axis_len = float(np.linalg.norm(axis))
+    face_w = float(np.linalg.norm(P(454) - P(234)))
+    if axis_len < 1e-3 or face_w < 1e-3:
+        return c
+    down = axis / axis_len
+    lateral = np.array([down[1], -down[0]])  # 중심선에 수직
+    c.scale = face_w
+    c.sigma = 0.11 * face_w
+    yaw = _face_yaw(pt)
+    c.yaw = yaw
 
-    # ── face_slim: 볼 양쪽을 중심 방향으로 ──
+    # 좌우 이동량 기준 — 머리 반폭 (234·454 사이 거리의 절반).
+    # 코 중심선은 머리 앞쪽 표면에 있어서, 고개가 조금만 돌아가도 먼 쪽으로
+    # 치우쳐 보인다 (hammock 실측: 중심선에서 234까지 238px, 454까지 418px, 약 15°).
+    # 중심선까지 거리에 비례해 옮기면 가까운 쪽 볼이 먼 쪽의 1.8배 움직이고,
+    # 먼 쪽 감쇠까지 겹치면 3배가 넘어 한쪽 볼만 깎인 얼굴이 된다.
+    # 실제 얼굴을 3D로 좁히면 양쪽 실루엣은 화면에서 거의 같은 px만큼 들어온다.
+    # 그래서 각 쪽 윤곽점의 "그 쪽 볼 폭 대비 위치"(0=중심선, 1=광대 끝)에
+    # 머리 반폭을 곱해 양쪽 광대 끝의 목표 이동량을 같게 맞춘다.
+    lat_l = float(np.dot(P(234) - top, lateral))
+    lat_r = float(np.dot(P(454) - top, lateral))
+    half_w = 0.5 * abs(lat_r - lat_l)
+
+    # 먼 쪽은 보이는 볼 폭이 좁아 같은 px도 더 크게 눌린다 — 살짝만 덜 옮긴다
+    # (yaw 0.25에서 0.8배). 많이 돌아간 얼굴(|yaw| 0.5~0.75, 약 27°~37°)은 전체를
+    # 줄여 가다 끈다 — 먼 쪽 윤곽이 코 뒤로 숨어 랜드마크를 믿기 어렵다.
+    far_factor = float(np.clip(1.0 - 0.8 * abs(yaw), 0.5, 1.0))
+    global_factor = float(np.clip((0.75 - abs(yaw)) / 0.25, 0.0, 1.0))
+    near_sign = float(np.sign(lat_r) * np.sign(yaw))  # yaw > 0: 454 쪽이 가깝다
+
+    def side_scale(s: float) -> float:
+        """lateral 좌표 s인 윤곽점의 이동 기준 거리 (px, 부호 없음)."""
+        side_extent = abs(lat_r) if np.sign(s) == np.sign(lat_r) else abs(lat_l)
+        if side_extent < 1e-3:
+            return 0.0
+        is_far = yaw != 0.0 and np.sign(s) == -near_sign
+        return abs(s) / side_extent * half_w * global_factor * (far_factor if is_far else 1.0)
+
+    moves: dict[int, np.ndarray] = {}
+
+    def add_move(idx: int, weight: float, gain: float) -> None:
+        if idx >= n_landmarks or weight <= 0.0:
+            return
+        p = P(idx)
+        s = float(np.dot(p - top, lateral))
+        mv = -np.sign(s) * side_scale(s) * gain * weight * lateral
+        moves[idx] = moves.get(idx, np.zeros(2)) + mv
+
     if face_slim >= 0.01:
-        strength = face_slim * 0.14  # 최대 14% 이동
-        for idx in _FACE_CONTOUR_LEFT:
-            px, py = pt(idx)
-            dx = (cx - px) * strength
-            src_all.append([px, py])
-            dst_all.append([px + dx, py])
-        for idx in _FACE_CONTOUR_RIGHT:
-            if idx == 152:
-                continue  # 턱 끝은 중복
-            px, py = pt(idx)
-            dx = (cx - px) * strength
-            src_all.append([px, py])
-            dst_all.append([px + dx, py])
-
-    # ── jaw_sharpen: 턱선을 V자로 ──
+        g = face_slim * _FACE_SLIM_GAIN * _FACE_FIELD_COMP
+        for contour in (_FACE_CONTOUR_LEFT, _FACE_CONTOUR_RIGHT):
+            for idx, wt in zip(contour, _SLIM_PROFILE):
+                add_move(idx, wt, g)
     if jaw_sharpen >= 0.01:
-        strength_x = jaw_sharpen * 0.10
-        strength_y = jaw_sharpen * 0.05
-        jaw_tip_x, jaw_tip_y = pt(152)
-        for idx in _JAW_LEFT:
-            px, py = pt(idx)
-            dx = (cx - px) * strength_x
-            dy = (jaw_tip_y - py) * strength_y
-            src_all.append([px, py])
-            dst_all.append([px + dx, py + dy])
-        for idx in _JAW_RIGHT:
-            px, py = pt(idx)
-            dx = (cx - px) * strength_x
-            dy = (jaw_tip_y - py) * strength_y
-            src_all.append([px, py])
-            dst_all.append([px + dx, py + dy])
+        g = jaw_sharpen * _JAW_SHARPEN_GAIN * _FACE_FIELD_COMP
+        for jaw in (_JAW_LEFT, _JAW_RIGHT):
+            for idx, wt in zip(jaw, _JAW_PROFILE):
+                add_move(idx, wt, g)
 
-    # ── eye_enlarge: 눈 윤곽 방사형 확대 ──
-    if eye_enlarge >= 0.01:
-        strength = eye_enlarge * 0.18  # 최대 18% 확대
-        # 왼쪽 눈
-        if n_landmarks > _LEFT_EYE_CENTER:
-            ecx, ecy = pt(_LEFT_EYE_CENTER)
-        else:
-            # iris 랜드마크 없으면 눈 중앙 계산
-            pts = [pt(i) for i in _LEFT_EYE_CONTOUR]
-            ecx = sum(p[0] for p in pts) / len(pts)
-            ecy = sum(p[1] for p in pts) / len(pts)
-        for idx in _LEFT_EYE_CONTOUR:
-            px, py = pt(idx)
-            dx = (px - ecx) * strength
-            dy = (py - ecy) * strength
-            src_all.append([px, py])
-            dst_all.append([px + dx, py + dy])
-
-        # 오른쪽 눈
-        if n_landmarks > _RIGHT_EYE_CENTER:
-            ecx, ecy = pt(_RIGHT_EYE_CENTER)
-        else:
-            pts = [pt(i) for i in _RIGHT_EYE_CONTOUR]
-            ecx = sum(p[0] for p in pts) / len(pts)
-            ecy = sum(p[1] for p in pts) / len(pts)
-        for idx in _RIGHT_EYE_CONTOUR:
-            px, py = pt(idx)
-            dx = (px - ecx) * strength
-            dy = (py - ecy) * strength
-            src_all.append([px, py])
-            dst_all.append([px + dx, py + dy])
-
-
-    # 코는 옮기지 않지만 "옮기지 않는다"를 명시해야 한다. 제어점이 없으면
-    # 주변 볼의 변위가 그대로 보간돼 코가 가로로 눌린다.
-    if src_all:
-        for idx in _NOSE_ANCHORS:
-            if idx >= n_landmarks:
+    moves = {i: m for i, m in moves.items() if float(np.linalg.norm(m)) > 1e-3}
+    if moves:
+        c.max_move = max(float(np.linalg.norm(m)) for m in moves.values()) / _FACE_FIELD_COMP
+        delta = max(4.0 * c.max_move, 0.10 * face_w)
+        center = (top + chin) / 2.0
+        for idx, mv in moves.items():
+            p = P(idx)
+            # 역워프 변위는 옮겨 간 자리(출력 좌표)에 둔다
+            c.pts.append(list(p + mv))
+            c.disp.append(list(-mv))
+        # 고정점: 이동한 윤곽 바깥 띠 + 턱끝 아래(목)
+        moved_contour = [i for i in (_FACE_CONTOUR_LEFT + _FACE_CONTOUR_RIGHT) if i < n_landmarks]
+        for idx in dict.fromkeys(moved_contour):
+            p = P(idx)
+            out = p - center
+            nrm = float(np.linalg.norm(out))
+            if nrm < 1e-6:
                 continue
-            px, py = pt(idx)
-            src_all.append([px, py])
-            dst_all.append([px, py])
+            c.pts.append(list(p + out / nrm * delta))
+            c.disp.append([0.0, 0.0])
+        c.pts.append(list(chin + down * delta))
+        c.disp.append([0.0, 0.0])
+        # 고정점: 코, 이마·관자놀이, 눈꼬리·입꼬리
+        for idx in list(_NOSE_ANCHORS) + _FACE_UPPER_ANCHORS + _FACE_FEATURE_ANCHORS:
+            if idx < n_landmarks and idx not in moves:
+                c.pts.append(list(P(idx)))
+                c.disp.append([0.0, 0.0])
 
-    return src_all, dst_all
+    if eye_enlarge >= 0.01:
+        amount = eye_enlarge * _EYE_ENLARGE_GAIN * global_factor
+        if amount > 1e-4:
+            for center_idx, contour, corners in (
+                (_LEFT_EYE_CENTER, _LEFT_EYE_CONTOUR, (362, 263)),
+                (_RIGHT_EYE_CENTER, _RIGHT_EYE_CONTOUR, (133, 33)),
+            ):
+                if any(i >= n_landmarks for i in corners):
+                    continue
+                a, b = P(corners[0]), P(corners[1])
+                ew = float(np.linalg.norm(b - a))
+                if ew < 2.0:
+                    continue
+                if n_landmarks > center_idx:
+                    ec = P(center_idx)
+                else:
+                    ec = np.mean([P(i) for i in contour if i < n_landmarks], axis=0)
+                ang = math.atan2(b[1] - a[1], b[0] - a[0])
+                c.eyes.append(((float(ec[0]), float(ec[1])), 0.85 * ew, 0.65 * ew, ang, amount))
+
+    return c
+
+
+def _cached_person_mask(cache: Any, arr_rgb: np.ndarray) -> np.ndarray | None:
+    """캐시에 인물 분할이 있으면 쓴다 (없거나 실패하면 None → 실루엣 제한 없이 고정점만)."""
+    getter = getattr(cache, "get_person_mask", None) if cache is not None else None
+    if getter is None:
+        return None
+    try:
+        mask = getter(arr_rgb)
+    except Exception as exc:  # 분할 실패가 보정 전체를 막지 않게
+        log.warning("reshape: person mask unavailable: %s", exc)
+        return None
+    if mask is None or mask.shape[:2] != arr_rgb.shape[:2]:
+        return None
+    return mask
 
 
 def apply_face_reshape(
@@ -3352,14 +3475,15 @@ def apply_face_reshape(
     eye_enlarge: float = 0.0,
     cache: MediaPipeCache | None = None,
 ) -> Image.Image:
-    """얼굴 보정 — MediaPipe 478 랜드마크 기반 MLS 워프.
+    """얼굴 보정 — MediaPipe 478 랜드마크 기반 국소 워프.
 
-    face_slim: 0~1 (얼굴 양쪽을 중심축 방향으로)
-    jaw_sharpen: 0~1 (턱 V라인)
-    eye_enlarge: 0~1 (눈 확대)
+    face_slim: 0~1 (아랫볼·턱선을 얼굴 중심선 쪽으로)
+    jaw_sharpen: 0~1 (턱각을 안쪽으로 — 턱끝은 고정)
+    eye_enlarge: 0~1 (눈 주변만 국소 확대)
 
-    얼굴 미감지 시 원본 반환. 다중 얼굴은 각각 독립 적용.
-    cache가 제공되면 MediaPipe 모델/결과 캐시를 재사용한다.
+    변형은 얼굴 윤곽 바로 바깥의 고정점 띠와 인물 실루엣(분할 마스크) 안에서
+    끝난다 — 배경의 직선이 볼 옆에서 휘지 않는다. 얼굴 미감지 시 원본 반환.
+    다중 얼굴은 각각 독립 적용. cache가 있으면 MediaPipe 모델/결과를 재사용한다.
     """
     if face_slim < 0.01 and jaw_sharpen < 0.01 and eye_enlarge < 0.01:
         return img
@@ -3393,40 +3517,200 @@ def apply_face_reshape(
         if not results.face_landmarks:
             return img
 
-    result_arr = arr_rgb.copy()
+    person = _cached_person_mask(cache, arr_rgb)
+    result_arr = arr_rgb
 
     for face_lms in results.face_landmarks:
         def _pt(idx: int) -> tuple[float, float]:
             lm = face_lms[idx]
             return lm.x * w, lm.y * h
 
-        src_all, dst_all = _build_reshape_controls(
-            _pt, len(face_lms), face_slim, jaw_sharpen, eye_enlarge
-        )
-
-        if not src_all:
+        ctrl = _build_reshape_controls(_pt, len(face_lms), face_slim, jaw_sharpen, eye_enlarge)
+        if not ctrl.active:
             continue
 
-        src_pts = np.array(src_all, dtype=np.float32)
-        dst_pts = np.array(dst_all, dtype=np.float32)
+        # 변형이 닿는 범위: 얼굴 랜드마크 상자 + 고정점 띠 + 가우시안 꼬리
+        fxs = [face_lms[i].x * w for i in range(min(len(face_lms), 468))]
+        fys = [face_lms[i].y * h for i in range(min(len(face_lms), 468))]
+        margin = max(4.0 * ctrl.max_move, 0.10 * ctrl.scale) + 3.5 * ctrl.sigma
+        roi = (min(fxs) - margin, min(fys) - margin, max(fxs) + margin, max(fys) + margin)
+        band = max(4.0 * ctrl.max_move, _SUPPORT_BAND_MIN * min(h, w))
+        result_arr, _ = _remap_region(
+            result_arr, roi, ctrl.field, _field_step(ctrl.scale), person, band,
+        )
 
-        # 얼굴 바운딩 영역 계산 (마스크용)
-        all_face_pts = [_pt(i) for i in range(min(len(face_lms), 468))]
-        fxs = [p[0] for p in all_face_pts]
-        fys = [p[1] for p in all_face_pts]
-        # 얼굴 경계 상자 + 여백. 폭/높이를 이미지 전체 크기로 자르면
-        # (min(w, ...)) x가 0으로 밀린 만큼을 반영하지 못해 블렌딩 타원이
-        # 얼굴에서 어긋나고, 얼굴의 한쪽만 변형된다.
-        margin = int(min(h, w) * 0.05)
-        rx = max(0, int(min(fxs)) - margin)
-        ry = max(0, int(min(fys)) - margin)
-        rx2 = min(w, int(max(fxs)) + margin)
-        ry2 = min(h, int(max(fys)) + margin)
-        roi = (rx, ry, max(0, rx2 - rx), max(0, ry2 - ry))
-
-        result_arr = _warp_with_mask(result_arr, src_pts, dst_pts, roi)
-
+    if result_arr is arr_rgb:
+        return img
     return Image.fromarray(result_arr)
+
+
+# ── 체형 보정 강도 (값 1.0에서) ──
+#   leg_stretch    1.0 → 엉덩이~발목 다리 길이 +10% (예전: 힙 아래 전체 +25%, 발이 잘림)
+#   waist_slim     1.0 → 허리 실루엣이 반폭의 8% 안쪽으로 (예전 11%, 관절점을 밀어 팔·배경이 휨)
+#   shoulder_width ±1.0 → 어깨선이 어깨 반폭의 ±6% (예전 ±10%, 목·턱까지 끌려감)
+_LEG_STRETCH_GAIN = 0.10
+_WAIST_SLIM_GAIN = 0.08
+_SHOULDER_GAIN = 0.06
+_BODY_FIELD_COMP = 1.4
+# 다리를 늘린 만큼 발 아래 바닥을 최대 이 비율까지 눌러 발이 프레임 밖으로 밀리지 않게 한다
+_FLOOR_MAX_COMPRESS = 0.3
+
+
+def _smooth_plateau(t: np.ndarray, a: float, b: float, ramp_in: float, ramp_out: float) -> np.ndarray:
+    """[a, b]에서 1, 양끝 ramp 폭에 걸쳐 0으로 매끄럽게 (smoothstep) 줄어드는 창."""
+    def ss(x):
+        x = np.clip(x, 0.0, 1.0)
+        return x * x * (3.0 - 2.0 * x)
+    up = ss((t - a) / max(ramp_in, 1e-6))
+    dn = 1.0 - ss((t - (b - ramp_out)) / max(ramp_out, 1e-6))
+    return up * dn
+
+
+def _leg_row_map(
+    h: int, hip_y: float, ankle_y: float, foot_y: float, leg_stretch: float,
+) -> tuple[np.ndarray, int] | None:
+    """다리 늘리기의 행 사상 (출력 행 → 원본 행)과 처음 바뀌는 행을 만든다.
+
+    예전에는 힙 아래 전체를 1 + 0.25·값 배로 늘려, 엉덩이·손·코트 자락까지 늘어나고
+    발이 사진 아래로 밀려 잘렸다 (0.45에서 발끝이 프레임 끝에 닿음).
+    지금은
+      - 허벅지 중간~발목(정강이 위주)만 늘리고, 엉덩이·손 높이는 그대로
+      - 발은 크기 그대로 아래로 옮기고
+      - 그만큼 발 아래 바닥을 눌러(최대 30%) 사진 높이 안에서 발을 지킨다.
+    행 단위 사상이라 배경의 수직선은 수직, 수평선은 수평 그대로다 (휘지 않음).
+    밀도(행 간격)를 매끄러운 창으로 바꾸므로 비스듬한 선에도 꺾임이 없다.
+    """
+    L = ankle_y - hip_y
+    if L < 0.05 * h or leg_stretch < 0.01:
+        return None
+    extra = float(np.clip(leg_stretch, 0.0, 1.0)) * _LEG_STRETCH_GAIN * L
+
+    t = np.arange(h, dtype=np.float64) + 0.5
+    stretch = _smooth_plateau(t, hip_y + 0.15 * L, ankle_y - 0.02 * L, 0.2 * L, 0.15 * L)
+    floor_top = foot_y + 0.01 * h
+    floor_len = h - floor_top
+    if floor_len > 0.02 * h:
+        floor = _smooth_plateau(t, floor_top, h + floor_len, 0.3 * floor_len, 1e-6)
+        # 바닥 행 간격이 최대 _FLOOR_MAX_COMPRESS만큼만 줄도록 늘릴 양을 제한
+        extra = min(extra, _FLOOR_MAX_COMPRESS * float(floor.sum()))
+    else:
+        floor = None  # 발이 이미 프레임 끝이면 늘어난 만큼 아래로 밀려 나간다
+    if extra < 0.5 or stretch.sum() < 1.0:
+        return None
+
+    density = stretch * (extra / stretch.sum())
+    if floor is not None and floor.sum() > 1.0:
+        density = density - floor * (extra / floor.sum())
+    # 원본 행 경계 y → 출력 위치 y + Σ밀도
+    edges_src = np.arange(h + 1, dtype=np.float64)
+    edges_out = np.concatenate([[0.0], np.cumsum(1.0 + density)])
+    out_rows = np.arange(h, dtype=np.float64) + 0.5
+    src = np.interp(out_rows, edges_out, edges_src) - 0.5
+    src = np.clip(src, 0.0, h - 1).astype(np.float32)
+    changed = np.flatnonzero(np.abs(src - (out_rows - 0.5)) > 1e-3)
+    if changed.size == 0:
+        return None
+    return src, int(changed[0])
+
+
+def _torso_edge(person: np.ndarray | None, center: np.ndarray, direction: np.ndarray,
+                guess: float) -> float:
+    """몸통 중심에서 direction으로 실루엣 가장자리까지 거리.
+
+    분할 마스크를 따라가 처음 배경이 나오는 곳. 팔이 몸통에 붙어 끝을 못 찾으면
+    (또는 마스크가 없으면) 관절 폭으로 추정한 guess를 쓴다.
+    """
+    if person is None:
+        return guess
+    h, w = person.shape[:2]
+    ss = np.arange(0.6 * guess, 1.3 * guess, 1.0)
+    xs = np.round(center[0] + direction[0] * ss).astype(int)
+    ys = np.round(center[1] + direction[1] * ss).astype(int)
+    ok = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+    if not ok.any():
+        return guess
+    vals = np.zeros(len(ss), np.float32)
+    vals[ok] = person[ys[ok], xs[ok]]
+    off = np.flatnonzero(vals < 0.5)
+    if off.size == 0:
+        return guess
+    return float(ss[off[0]])
+
+
+def _build_body_controls(
+    pt, vis, person: np.ndarray | None, shoulder_width: float, waist_slim: float,
+) -> tuple[list, list, float, float, float]:
+    """허리·어깨 변형 제어점. 반환: (pts, disp, sigma, 최대 이동량, 어깨 반폭)."""
+    pts: list[list[float]] = []
+    disp: list[list[float]] = []
+    P = lambda i: np.array(pt(i), dtype=np.float64)  # noqa: E731
+    ls, rs, lh, rh = P(11), P(12), P(23), P(24)
+    ms, mh = (ls + rs) / 2.0, (lh + rh) / 2.0
+    sh_half = float(np.linalg.norm(ls - rs)) / 2.0
+    hip_half = float(np.linalg.norm(lh - rh)) / 2.0
+    torso = mh - ms
+    t_len = float(np.linalg.norm(torso))
+    if sh_half < 2.0 or t_len < 2.0:
+        return pts, disp, 1.0, 0.0, sh_half
+    down = torso / t_len
+    lateral = np.array([down[1], -down[0]])
+    sigma = 0.22 * sh_half
+    moves: list[tuple[np.ndarray, np.ndarray]] = []
+    anchors: list[np.ndarray] = []
+
+    if waist_slim >= 0.01 and min(vis(23), vis(24)) >= 0.5:
+        g = float(np.clip(waist_slim, 0.0, 1.0)) * _WAIST_SLIM_GAIN * _BODY_FIELD_COMP
+        for tl in (0.3, 0.42, 0.54, 0.66, 0.78, 0.9, 1.0):
+            prof = 0.5 * (1.0 + math.cos(math.pi * (tl - 0.62) / 0.38)) if abs(tl - 0.62) < 0.38 else 0.0
+            c = ms + torso * tl
+            guess = (1.0 - tl) * 0.85 * sh_half + tl * 1.6 * hip_half
+            anchors.append(c)
+            for sgn in (-1.0, 1.0):
+                d = lateral * sgn
+                e = _torso_edge(person, c, d, guess)
+                edge = c + d * e
+                if prof > 0.0:
+                    moves.append((edge, -d * e * g * prof))
+                else:
+                    anchors.append(edge)
+        # 팔은 움직이지 않는다 — 팔꿈치·손목 고정 (허리 옆 팔이 휘던 문제)
+        for i in (13, 14, 15, 16):
+            if vis(i) >= 0.5:
+                anchors.append(P(i))
+
+    if abs(shoulder_width) >= 0.01 and min(vis(11), vis(12)) >= 0.5:
+        g = float(np.clip(shoulder_width, -1.0, 1.0)) * _SHOULDER_GAIN * _BODY_FIELD_COMP
+        for s_pt, e_idx, w_idx in ((ls, 13, 15), (rs, 14, 16)):
+            o = s_pt - ms
+            o = o / max(float(np.linalg.norm(o)), 1e-6)
+            mv = o * sh_half * g
+            # 어깨 관절과 바깥 어깨선이 함께, 팔은 통째로 따라가며 아래로 갈수록 덜
+            moves.append((s_pt, mv))
+            moves.append((s_pt + o * 0.18 * sh_half, mv))
+            if vis(e_idx) >= 0.5:
+                moves.append((P(e_idx), mv * 0.6))
+            if vis(w_idx) >= 0.5:
+                moves.append((P(w_idx), mv * 0.3))
+        # 목·가슴 중앙·얼굴은 제자리 (예전에는 턱까지 끌려갔다)
+        anchors += [ms - down * 0.35 * sh_half, ms + down * 0.5 * sh_half, P(0), P(9), P(10)]
+
+    if not moves:
+        return pts, disp, sigma, 0.0, sh_half
+    max_move = max(float(np.linalg.norm(m)) for _, m in moves) / _BODY_FIELD_COMP
+    delta = max(4.0 * max_move, 0.2 * sh_half)
+    body_c = (ms + mh) / 2.0
+    for p, mv in moves:
+        pts.append(list(p + mv))
+        disp.append(list(-mv))
+        out = p - body_c
+        nrm = float(np.linalg.norm(out))
+        if nrm > 1e-6:
+            pts.append(list(p + out / nrm * delta))
+            disp.append([0.0, 0.0])
+    for a in anchors:
+        pts.append(list(a))
+        disp.append([0.0, 0.0])
+    return pts, disp, sigma, max_move, sh_half
 
 
 def apply_body_reshape(
@@ -3436,13 +3720,13 @@ def apply_body_reshape(
     waist_slim: float = 0.0,
     cache: MediaPipeCache | None = None,
 ) -> Image.Image:
-    """체형 보정 — MediaPipe Pose 33 랜드마크 기반.
+    """체형 보정 — MediaPipe Pose 33 랜드마크 + 인물 분할 기반.
 
-    leg_stretch: 0~1 (힙 아래 수직 스트레칭)
+    leg_stretch: 0~1 (허벅지~발목 세로 늘리기, 발 아래 바닥으로 흡수)
     shoulder_width: -1~1 (음수=좁게, 양수=넓게)
-    waist_slim: 0~1 (허리 양쪽을 안쪽으로)
+    waist_slim: 0~1 (허리 실루엣을 안쪽으로)
 
-    바디 미감지 시 원본 반환. 다중 바디는 가장 신뢰도 높은 것만.
+    바디 미감지 시 원본 반환. 다중 바디는 가장 큰 것만.
     cache가 제공되면 MediaPipe 모델/결과 캐시를 재사용한다.
     """
     if abs(leg_stretch) < 0.01 and abs(shoulder_width) < 0.01 and abs(waist_slim) < 0.01:
@@ -3497,170 +3781,54 @@ def apply_body_reshape(
         return lm.x * w, lm.y * h
 
     def _vis(idx: int) -> float:
-        return pose[idx].visibility if hasattr(pose[idx], 'visibility') else 1.0
+        v = getattr(pose[idx], "visibility", None)
+        return 1.0 if v is None else float(v)
 
-    result_arr = arr_rgb.copy()
+    result_arr = arr_rgb
 
-    # ── leg_stretch: 힙 아래 영역 수직 스트레칭 ──
-    if leg_stretch >= 0.01:
-        # Pose 랜드마크: 23=왼쪽 힙, 24=오른쪽 힙, 27=왼쪽 발목, 28=오른쪽 발목
-        left_ankle_vis = _vis(27)
-        right_ankle_vis = _vis(28)
-
-        if left_ankle_vis >= 0.5 or right_ankle_vis >= 0.5:
-            lhip = _pt(23)
-            rhip = _pt(24)
-            hip_y = (lhip[1] + rhip[1]) / 2.0
-
-            # 힙 아래 영역을 수직 스케일링 (단순 remap)
-            stretch_factor = 1.0 + leg_stretch * 0.25  # 최대 25% 늘리기
-
-            # remap: hip_y 위는 그대로, 아래는 스트레칭.
-            # 행마다 값이 같으므로 1차원으로 계산한다 (예전의 행 단위 파이썬 루프와 같은 값).
-            hip_y_int = int(hip_y)
-            rows = np.arange(h, dtype=np.float64)
-            # 목적 row → 원본 row (역워프)
-            row_map = np.where(
-                rows <= hip_y_int, rows,
-                np.minimum(h - 1, hip_y + (rows - hip_y) / stretch_factor),
-            ).astype(np.float32)
-
-            # 경계 블렌딩 마스크 (행 단위)
-            row_mask = np.zeros(h, dtype=np.float32)
-            row_mask[hip_y_int:] = 1.0
-            # 힙 주변 부드러운 전환
-            transition = max(10, int(h * 0.03))
-            t_rows = np.arange(max(0, hip_y_int - transition), min(h, hip_y_int + transition))
-            row_mask[t_rows] = np.clip(
-                (t_rows - (hip_y_int - transition)) / (2 * transition), 0.0, 1.0
+    # ── 허리·어깨: 실루엣 기준 국소 워프 (한 번의 remap) ──
+    if abs(shoulder_width) >= 0.01 or waist_slim >= 0.01:
+        person = _cached_person_mask(cache, arr_rgb)
+        pts, disp, sigma, max_move, sh_half = _build_body_controls(
+            _pt, _vis, person, shoulder_width, waist_slim,
+        )
+        if max_move > 0.0:
+            arr_pts = np.array(pts, np.float32)
+            arr_disp = np.array(disp, np.float32)
+            margin = 3.5 * sigma
+            roi = (arr_pts[:, 0].min() - margin, arr_pts[:, 1].min() - margin,
+                   arr_pts[:, 0].max() + margin, arr_pts[:, 1].max() + margin)
+            band = max(4.0 * max_move, _SUPPORT_BAND_MIN * min(h, w))
+            result_arr, _ = _remap_region(
+                result_arr, roi,
+                lambda xs, ys: _gaussian_field(xs, ys, arr_pts, arr_disp, sigma),
+                _field_step(2.0 * sh_half), person, band,
             )
 
-            # 마스크가 0인 행은 원본 그대로다. 사진 전체를 remap·float 블렌딩하지 않고
-            # 처음으로 마스크가 0이 아닌 행부터 아래만 계산한다 (결과는 같다).
-            nz = np.flatnonzero(row_mask)
-            if nz.size:
-                r0 = int(nz[0])
+    # ── leg_stretch: 행 단위 세로 늘리기 ──
+    if leg_stretch >= 0.01:
+        # Pose: 23/24 힙, 27/28 발목, 29/30 뒤꿈치, 31/32 발끝
+        ankles = [i for i in (27, 28) if _vis(i) >= 0.5]
+        if ankles:
+            hip_y = (_pt(23)[1] + _pt(24)[1]) / 2.0
+            ankle_y = max(_pt(i)[1] for i in ankles)
+            feet = [_pt(i)[1] for i in (29, 30, 31, 32) if _vis(i) >= 0.3]
+            foot_y = max(feet) if feet else ankle_y + 0.06 * (ankle_y - hip_y)
+            foot_y = max(foot_y, ankle_y)
+            mapping = _leg_row_map(h, hip_y, ankle_y, foot_y, leg_stretch)
+            if mapping is not None:
+                row_map, r0 = mapping
                 map_y = np.repeat(row_map[r0:, np.newaxis], w, axis=1)
                 map_x = np.repeat(np.arange(w, dtype=np.float32)[np.newaxis, :], h - r0, axis=0)
-                stretched = cv2.remap(result_arr, map_x, map_y, cv2.INTER_LINEAR,
-                                      borderMode=cv2.BORDER_REPLICATE)
-                alpha = np.repeat(row_mask[r0:, np.newaxis], w, axis=1)
-                result_arr[r0:] = _alpha_blend(stretched, result_arr[r0:], alpha)
+                if result_arr is arr_rgb:
+                    result_arr = arr_rgb.copy()
+                result_arr[r0:] = cv2.remap(result_arr, map_x, map_y, cv2.INTER_LINEAR,
+                                            borderMode=cv2.BORDER_REPLICATE)
 
-    # ── shoulder_width: 어깨 너비 조절 ──
-    if abs(shoulder_width) >= 0.01:
-        # Pose: 11=왼쪽 어깨, 12=오른쪽 어깨, 23=왼쪽 힙, 24=오른쪽 힙
-        ls = _pt(11)
-        rs = _pt(12)
-        mid_x = (ls[0] + rs[0]) / 2.0
-        mid_y = (ls[1] + rs[1]) / 2.0
-        strength = shoulder_width * 0.10  # 최대 10%
-
-        # 어깨 위 1/3 지점과 어깨 사이 보간점 추가 → 자연스러운 워프
-        neck_y = mid_y - abs(rs[0] - ls[0]) * 0.25  # 어깨 위 목 부근
-        below_y = mid_y + abs(rs[0] - ls[0]) * 0.3   # 어깨 아래
-
-        src_list = [
-            [ls[0], ls[1]],  # 왼쪽 어깨
-            [rs[0], rs[1]],  # 오른쪽 어깨
-            # 어깨-목 사이 보간점 (강도 50%)
-            [(ls[0] + mid_x) / 2, neck_y],
-            [(rs[0] + mid_x) / 2, neck_y],
-            # 고정 앵커 (목 중앙, 어깨 아래 중앙) — 변형되지 않아야 할 점
-            [mid_x, neck_y],
-            [mid_x, below_y],
-        ]
-        dst_list = [
-            [ls[0] + (ls[0] - mid_x) * strength, ls[1]],
-            [rs[0] + (rs[0] - mid_x) * strength, rs[1]],
-            [(ls[0] + mid_x) / 2 + ((ls[0] + mid_x) / 2 - mid_x) * strength * 0.3, neck_y],
-            [(rs[0] + mid_x) / 2 + ((rs[0] + mid_x) / 2 - mid_x) * strength * 0.3, neck_y],
-            [mid_x, neck_y],      # 고정
-            [mid_x, below_y],     # 고정
-        ]
-
-        src_pts = np.array(src_list, dtype=np.float32)
-        dst_pts = np.array(dst_list, dtype=np.float32)
-
-        shoulder_w = abs(rs[0] - ls[0])
-        shoulder_h = shoulder_w * 0.6
-        roi = (
-            max(0, int(min(ls[0], rs[0]) - shoulder_w * 0.3)),
-            max(0, int(mid_y - shoulder_h)),
-            min(w, int(shoulder_w + shoulder_w * 0.6)),
-            min(h, int(shoulder_h * 2)),
-        )
-        result_arr = _warp_with_mask(result_arr, src_pts, dst_pts, roi)
-
-    # ── waist_slim: 허리 양쪽을 안쪽으로 ──
-    if waist_slim >= 0.01:
-        # Pose: 23=왼쪽 힙, 24=오른쪽 힙, 11=왼쪽 어깨, 12=오른쪽 어깨
-        lhip = _pt(23)
-        rhip = _pt(24)
-        ls = _pt(11)
-        rs = _pt(12)
-
-        # 허리 위치 = 어깨와 힙의 중간
-        waist_y = (ls[1] + lhip[1]) / 2.0
-        mid_x = (lhip[0] + rhip[0]) / 2.0
-        waist_left_x = min(ls[0], lhip[0])
-        waist_right_x = max(rs[0], rhip[0])
-
-        strength = waist_slim * 0.11  # 최대 11%
-
-        # 허리 위/아래 보간점 + 고정 앵커 추가 → 자연스러운 수직 그라데이션
-        above_y = (ls[1] + waist_y) / 2.0   # 어깨-허리 중간
-        below_y = (waist_y + lhip[1]) / 2.0  # 허리-힙 중간
-
-        src_list = [
-            # 허리 중심 (주 제어점 — 강도 100%)
-            [waist_left_x, waist_y],
-            [waist_right_x, waist_y],
-            # 허리 위 보간 (강도 40%)
-            [waist_left_x, above_y],
-            [waist_right_x, above_y],
-            # 허리 아래 보간 (강도 40%)
-            [waist_left_x, below_y],
-            [waist_right_x, below_y],
-            # 고정 앵커 (중심축, 어깨, 힙 — 변형되지 않아야 할 점)
-            [mid_x, waist_y],
-            [ls[0], ls[1]],
-            [rs[0], rs[1]],
-            [lhip[0], lhip[1]],
-            [rhip[0], rhip[1]],
-        ]
-        dst_list = [
-            # 허리 중심 (주 변형)
-            [waist_left_x + (mid_x - waist_left_x) * strength, waist_y],
-            [waist_right_x + (mid_x - waist_right_x) * strength, waist_y],
-            # 허리 위 보간 (40% 강도)
-            [waist_left_x + (mid_x - waist_left_x) * strength * 0.4, above_y],
-            [waist_right_x + (mid_x - waist_right_x) * strength * 0.4, above_y],
-            # 허리 아래 보간 (40% 강도)
-            [waist_left_x + (mid_x - waist_left_x) * strength * 0.4, below_y],
-            [waist_right_x + (mid_x - waist_right_x) * strength * 0.4, below_y],
-            # 고정 앵커 (원래 위치 유지)
-            [mid_x, waist_y],
-            [ls[0], ls[1]],
-            [rs[0], rs[1]],
-            [lhip[0], lhip[1]],
-            [rhip[0], rhip[1]],
-        ]
-
-        src_pts = np.array(src_list, dtype=np.float32)
-        dst_pts = np.array(dst_list, dtype=np.float32)
-
-        waist_w = abs(waist_right_x - waist_left_x)
-        waist_h = abs(lhip[1] - ls[1])
-        roi = (
-            max(0, int(waist_left_x - waist_w * 0.3)),
-            max(0, int(min(ls[1], above_y) - waist_h * 0.1)),
-            min(w, int(waist_w + waist_w * 0.6)),
-            min(h, int(waist_h * 1.2)),
-        )
-        result_arr = _warp_with_mask(result_arr, src_pts, dst_pts, roi)
-
+    if result_arr is arr_rgb:
+        return img
     return Image.fromarray(result_arr)
+
 
 
 # ── LAB 일괄 보정 헬퍼 (색 공간 변환 1회) ──

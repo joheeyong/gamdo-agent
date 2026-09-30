@@ -142,35 +142,41 @@ class _PoseCache:
         return self.results
 
 
-def _old_leg_stretch(arr: np.ndarray, hip_y: float, leg_stretch: float) -> np.ndarray:
-    h, w = arr.shape[:2]
-    stretch_factor = 1.0 + leg_stretch * 0.25
-    map_y = np.zeros((h, w), dtype=np.float32)
-    map_x = np.arange(w, dtype=np.float32)[np.newaxis, :].repeat(h, axis=0)
-    hip_y_int = int(hip_y)
-    for row in range(h):
-        if row <= hip_y_int:
-            map_y[row, :] = row
-        else:
-            map_y[row, :] = min(h - 1, hip_y + (row - hip_y) / stretch_factor)
-    mask = np.zeros((h, w), dtype=np.float32)
-    mask[hip_y_int:, :] = 1.0
-    transition = max(10, int(h * 0.03))
-    for row in range(max(0, hip_y_int - transition), min(h, hip_y_int + transition)):
-        t = (row - (hip_y_int - transition)) / (2 * transition)
-        mask[row, :] = max(0.0, min(1.0, t))
-    stretched = cv2.remap(arr, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    m3 = mask[:, :, np.newaxis]
-    return (arr.astype(np.float32) * (1 - m3) + stretched.astype(np.float32) * m3).astype(np.uint8)
-
-
 @pytest.mark.parametrize("hip_norm", [0.55, 0.02, 0.999, -0.03])  # 음수: 힙이 프레임 밖
-def test_다리_늘리기가_예전_행_루프와_같다(monkeypatch, hip_norm):
+def test_다리_늘리기는_힙_위를_건드리지_않고_크기를_유지한다(monkeypatch, hip_norm):
+    """예전 행 루프는 힙 아래를 통째로 늘려 코트 자락·손이 늘고 발이 잘렸다.
+    새 사상은 허벅지 중간~발목만 늘리므로 힙 위 행은 그대로여야 한다."""
     monkeypatch.setattr(ip, "pose_model_path", lambda: "stub")
     arr = _skin_image(2)
     results = _fake_pose(hip_norm)
     out = np.array(ip.apply_body_reshape(Image.fromarray(arr), leg_stretch=0.4,
                                          cache=_PoseCache(results)))
+    assert out.shape == arr.shape
     lms = results.pose_landmarks[0]
     hip_y = (lms[23].y * H + lms[24].y * H) / 2.0
-    assert np.array_equal(out, _old_leg_stretch(arr, hip_y, 0.4))
+    top = int(max(0.0, hip_y) * 0.9)
+    assert np.array_equal(out[:top], arr[:top])
+
+
+def _leg_map(h=1000, hip=400.0, ankle=850.0, foot=900.0, v=0.45):
+    return ip._leg_row_map(h, hip, ankle, foot, v)
+
+
+def test_다리_사상은_접히지_않고_사진_높이_안에서_발을_지킨다():
+    src, first = _leg_map()
+    assert np.all(np.diff(src) >= -1e-4)          # 행 순서가 뒤집히지 않음
+    assert src[-1] == pytest.approx(999.0, abs=1.0)  # 맨 아래 행 = 원본 맨 아래 (발이 밀려 잘리지 않음)
+    assert first >= 400 - 0.05 * 450 - 1          # 힙 위는 그대로
+
+
+def test_다리_사상은_정강이만_늘리고_발_크기는_그대로다():
+    src, _ = _leg_map()
+    slope = np.gradient(src)
+    assert slope[650:800].mean() < 0.97            # 정강이: 원본 행을 천천히 읽음 = 늘어남
+    assert slope[870:890].mean() == pytest.approx(1.0, abs=0.03)  # 발: 배율 1
+    assert slope[:350].max() == pytest.approx(1.0, abs=1e-6)      # 상체: 변화 없음
+
+
+def test_다리_사상은_값이_작으면_아무것도_하지_않는다():
+    assert _leg_map(v=0.0) is None
+    assert ip._leg_row_map(1000, 400.0, 420.0, 430.0, 0.45) is None  # 다리가 너무 짧음
