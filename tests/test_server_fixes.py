@@ -156,9 +156,10 @@ def test_feed_compatibility_before_uses_original_image(client, monkeypatch, tmp_
                     json={"image_base64": _photo_b64((200, 100)), "user_id": "u"})
     body = r.json()
     assert body["success"], body.get("error")
-    # 첫 측정(before)은 원본 200x100, 나중 측정(after)은 1:1로 크롭된 결과
+    # 첫 측정(before)은 원본 200x100, 나중 측정(after)은 크롭된 결과.
+    # 모델의 1:1은 제안으로만 남고, 2:1은 인스타 상한을 넘어 1.91:1로 맞춰진다.
     assert measured_sizes[0] == (200, 100)
-    assert measured_sizes[-1] == (100, 100)
+    assert measured_sizes[-1] == (191, 100)
     assert body["analysis"]["feedCompatibilityBefore"] == 50
 
 

@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from image_processor import _HSL_CHANNELS, estimate_noise_sigma
+from image_processor import _HSL_CHANNELS, estimate_illuminant, estimate_noise_sigma
 
 log = logging.getLogger("gamdo-agent")
 
@@ -107,8 +107,10 @@ def measure_image_stats(img: Image.Image) -> dict[str, float]:
         # 라플라시안 분산 500 정도면 충분히 선명한 사진으로 본다
         "sharpness": min(1.0, lap_var / 500.0),
         # 노이즈는 반드시 원본 해상도에서 잰다 — 축소하면 이웃 화소가 평균되어
-        # 노이즈가 사라져 버린다. 비용을 아끼려 가운데 일부만 잘라 본다.
-        "noise": estimate_noise_sigma(_center_crop(img, 512)),
+        # 노이즈가 사라져 버린다. 비용을 아끼려 가운데 일부만 잘라 보되,
+        # 512px 조각은 음식 접사처럼 가운데가 온통 질감인 사진에서 매끈한
+        # 영역이 없어 질감을 노이즈로 읽는다. 2048px(12MP에서도 수십 ms)로 본다.
+        "noise": estimate_noise_sigma(_center_crop(img, 2048)),
         "cast_uniformity": round(cast_uniformity, 3),
     }
 
@@ -191,6 +193,9 @@ _FILTER_GAIN = {
     "auto": 0.8,
 }
 
+# 어둡지 않은 사진의 denoise 상한, 그리고 denoise 1.0일 때 레시피 그레인을 덜어 내는 비율
+_DENOISE_CAP_BRIGHT = 0.5
+_DENOISE_GRAIN_TRADE = 0.7
 _GRAIN_LEVELS = {"none": 0.0, "subtle": 0.12, "moderate": 0.22, "heavy": 0.35, "film": 0.28}
 _VIGNETTE_LEVELS = {"none": 0.0, "subtle": 0.10, "moderate": 0.20, "strong": 0.30}
 _SKIN_LEVELS = {"none": 0.0, "light": 0.18, "moderate": 0.30, "heavy": 0.45}
@@ -220,7 +225,8 @@ def _level_index(value: str | None, default: int = 2) -> int:
 #   clarity / sharpness — 피사체 레시피 값에 더해진다
 #   clarity_cap / sharpness_cap — 피사체 레시피가 더해진 뒤의 상한. 음식·풍경
 #                    레시피가 필름 룩을 쨍한 HDR로 덮어쓰지 않게 한다. (0.25)
-#   vignette — 피사체 레시피 값과 비교해 큰 쪽을 쓴다
+#   vignette — 스타일로서의 비네팅 (피사체 레시피에는 없다)
+#   background_blur — 인물 배경 흐림 (없으면 0 — 기본으로는 걸지 않는다)
 #   monochrome — True면 완전한 흑백 (saturation −1.0, 색 보정 전부 끔)
 #   split — 스플릿 토닝 {"shadow": (hue, 세기), "highlight": (hue, 세기)}
 
@@ -313,22 +319,26 @@ _DEFAULT_RECIPE: dict[str, Any] = {
 # 흑백 트렌드 이름 (describe_params·테스트가 참조)
 _MONO_TRENDS = frozenset(k for k, v in _TREND_RECIPES.items() if v.get("monochrome"))
 
+# 비네팅은 피사체 레시피에 두지 않는다 — 스타일(트렌드)이나 사용자 취향
+# (vignettePreference)이 원할 때만 건다. 예전에는 피사체마다 0.03~0.18을 넣어
+# 모든 사진의 모서리가 어두워졌다 (실측 7장 전부 0.09~0.14, ΔE 2~3).
+# 2026년의 내추럴 톤에서는 스타일이 아닌 비네팅이 오래된 필터처럼 보인다.
 _SUBJECT_RECIPES: dict[str, dict[str, Any]] = {
     # 인물의 톤 커브는 트렌드(또는 기본 레시피)가 정한다. 예전에는 여기서 S커브 0.30을
     # 강제해 기본 레시피 인물 사진이 전부 S커브를 탔다.
     "인물": {
-        "clarity": -0.02, "sharpness": 0.05, "vignette": 0.12,
+        "clarity": -0.02, "sharpness": 0.05,
         "blemish_removal": 0.35, "skin_smoothing": 0.28, "dehaze": 0.0,
     },
-    "풍경": {"clarity": 0.18, "sharpness": 0.12, "vignette": 0.03, "use_haze": True},
+    "풍경": {"clarity": 0.18, "sharpness": 0.12, "use_haze": True},
     # 음식은 질감이 맛이라 필름 룩에서도 조금 더 또렷하게 남긴다 (texture_bonus)
     "음식": {
-        "clarity": 0.25, "sharpness": 0.22, "vignette": 0.18,
-        "saturation": 0.06, "temperature": 0.25, "texture_bonus": 0.06,
+        "clarity": 0.25, "sharpness": 0.22,
+        "saturation": 0.06, "temperature": 0.15, "texture_bonus": 0.06,
     },
-    "카페/일상": {"clarity": -0.10, "contrast": -0.05, "vignette": 0.10},
-    "사물": {"clarity": 0.15, "sharpness": 0.10, "vignette": 0.15},
-    "동물": {"clarity": 0.12, "sharpness": 0.15, "vignette": 0.10},
+    "카페/일상": {"clarity": -0.10, "contrast": -0.05},
+    "사물": {"clarity": 0.15, "sharpness": 0.10},
+    "동물": {"clarity": 0.12, "sharpness": 0.15},
     "혼합": {},
 }
 
@@ -338,6 +348,22 @@ _CORRECTION_BAND = 0.35
 
 # 측정분에 레시피 상수를 더한 뒤의 상한. 게인을 곱하기 전에 한 번 더 묶는다.
 _STYLE_BAND = 0.45
+
+# 목표 warmth가 이 이상이면(웜 필름·골든아워·웜 취향) 스타일이 웜톤을 요구하는 것으로
+# 보고 장면의 빛을 이유로 웜톤을 덜어내지 않는다.
+_WARM_STYLE_TARGET = 0.12
+# WB 뒤 warmth가 이 구간에 있으면 양수 temperature를 선형으로 덜어낸다 (이미 따뜻한 사진)
+_WARM_SCENE_LO, _WARM_SCENE_HI = 0.15, 0.40
+# WB 뒤 warmth가 이 구간(음수 크기)이면 고르지 않은 쿨 캐스트를 의도된 빛으로 본다
+_COOL_SCENE_LO, _COOL_SCENE_HI = 0.04, 0.12
+# cast_uniformity가 이 구간 위면 조명 캐스트로 본다. 곱셈형 캐스트는 어두운 곳에서
+# R-B 차가 작아 고름이 0.3~0.4로 나온다 (실측 상점가 인물 0.65, 새벽 호수 0.09).
+_CAST_UNIFORM_LO, _CAST_UNIFORM_HI = 0.10, 0.40
+
+# 전역 웜톤이 이만큼 걸리면 피부 채널(orange) 채도 부스트·얼굴 영역 temperature를
+# 덜어낸다 — 같은 피부에 웜톤이 세 번 쌓이지 않게 ([_damp_warm_stacking]).
+_STACK_T_LO, _STACK_T_HI = 0.05, 0.20
+_STACK_ORANGE_DAMP = 0.6
 
 # 흰 화소(휘도 250 초과)가 이 비율이면 색온도를 바닥까지 줄인다.
 _WHITE_TEMPERATURE_TOLERANCE = 0.25
@@ -599,9 +625,24 @@ def build_params_with_comment(
     saturation = _band(
         saturation + float(recipe.get("saturation", 0.0))
         + float(subject_recipe.get("saturation", 0.0)), _STYLE_BAND)
+    # 장면의 원래 빛을 존중한다 — 스타일이 웜톤을 요구하지 않을 때만(목표 warmth <
+    # _WARM_STYLE_TARGET: 기본 레시피·뉴트럴 계열) 적용한다.
+    #  - 이미 따뜻한 사진은 더 덥히지 않는다. 실측: 라테(warmth 0.35)에 음식 레시피
+    #    0.25가 그대로 얹혀 temperature +0.18.
+    #  - 차가운 쪽으로 기울었는데 캐스트가 고르지 않으면(cast_uniformity < 0.4) 조명
+    #    탓이 아니라 장면의 색이다 — 새벽 호수·파란 수트·흐린 날. 덥히지 않는다.
+    #    실측: 라벤더빛 새벽 호수(warmth −0.14, 고름 0.09)·파란 수트 인물 2장이
+    #    전부 temperature +0.216을 받아 가장 큰 보정(ΔE 3~4.3)이 됐다.
+    #    고른 캐스트(그늘·형광등)는 그대로 교정한다.
     temperature = _band(
         temperature + float(recipe.get("temperature", 0.0))
         + float(subject_recipe.get("temperature", 0.0)), _STYLE_BAND)
+    # 덜어내기만 한다(양수 → 0 쪽). 식히는 값은 건드리지 않는다.
+    if target_warmth < _WARM_STYLE_TARGET and temperature > 0:
+        temperature *= 1.0 - _ramp(warmth_after_wb, _WARM_SCENE_LO, _WARM_SCENE_HI)
+        cool_scene = (_ramp(-warmth_after_wb, _COOL_SCENE_LO, _COOL_SCENE_HI)
+                      * (1.0 - _ramp(stats["cast_uniformity"], _CAST_UNIFORM_LO, _CAST_UNIFORM_HI)))
+        temperature *= 1.0 - cool_scene
     contrast = _band(contrast + float(recipe.get("contrast", 0.0))
                      + float(subject_recipe.get("contrast", 0.0)), _STYLE_BAND)
     brightness = _band(brightness + float(recipe.get("brightness", 0.0)), _STYLE_BAND)
@@ -727,6 +768,10 @@ def build_params_with_comment(
         denoise_strength = min(1.0, denoise_strength + max(0.0, shadows) * 0.4)
     if scene["low_light"]:
         denoise_strength = min(1.0, denoise_strength + 0.2)
+    else:
+        # 밝은 사진의 노이즈는 대개 옅다. 세게 지우면 음식·천·나뭇결 질감이
+        # 먼저 사라져 플라스틱처럼 보이므로, 정말 어두운 사진이 아니면 절반까지만.
+        denoise_strength = min(denoise_strength, _DENOISE_CAP_BRIGHT)
 
     # 안개 제거는 풍경에서 실제로 뿌옇게 측정될 때만.
     #
@@ -760,6 +805,11 @@ def build_params_with_comment(
     # 그레인·비네팅은 프로필이 명시하면 프로필이 이긴다
     grain_pref = editing.get("grainPreference") or "auto"
     grain = float(recipe.get("grain", 0.0)) if grain_pref == "auto" else _GRAIN_LEVELS.get(grain_pref, 0.0)
+    # 노이즈를 지운 만큼 레시피 그레인을 덜어 낸다 — 지우고 다시 뿌리는 건
+    # 모순이고, 뭉개진 면 위의 그레인은 필름이 아니라 노이즈로 읽힌다.
+    # 사용자가 직접 고른 그레인 강도는 그대로 둔다.
+    if grain_pref == "auto" and denoise_strength > 0.0:
+        grain *= 1.0 - _DENOISE_GRAIN_TRADE * min(1.0, denoise_strength)
 
     vignette_pref = editing.get("vignettePreference") or "auto"
     if vignette_pref != "auto":
@@ -828,8 +878,13 @@ def build_params_with_comment(
         # 촬영 결함 교정은 취향(보정 강도)과 무관하므로 게인을 곱하지 않는다
         "auto_wb": _clamp(auto_wb_strength, 0.0, 1.0),
         "denoise": _clamp(denoise_strength, 0.0, 1.0),
-        # 배경 흐림은 인물에서만. 얼굴이 없으면 apply 단계에서 무시된다.
-        "background_blur": _clamp(0.25 * gain if is_portrait else 0.0, 0.0, 1.0),
+        # 배경 흐림은 기본으로 걸지 않는다 — 스타일이 원할 때(레시피의
+        # background_blur)만, 인물에서만. 예전에는 인물 사진 전부에 0.25×게인을
+        # 걸어 스튜디오 배경·건물까지 가짜 보케로 뭉갰다 (실측 인물 4장 전부 0.2).
+        # 앱의 수동 편집 슬라이더는 이 값과 무관하게 그대로 동작한다.
+        "background_blur": _clamp(
+            float(recipe.get("background_blur", 0.0)) * gain if is_portrait else 0.0,
+            0.0, 1.0),
         # 피부 보정은 사용자가 고른 강도 그대로 — 필터 게인을 곱하지 않는다
         "blemish_removal": _clamp(blemish, 0.0, 1.0),
         "skin_smoothing": _clamp(skin_smoothing, 0.0, 1.0),
@@ -860,9 +915,15 @@ def build_params_with_comment(
     # 색계열별 조정은 측정으로 나오지 않는 판단이라 모델 값을 그대로 쓴다.
     # 없으면 키를 넣지 않는다 — analysis_to_transform_params가 None으로 본다.
     hsl = None if mono else _clamp_hsl(analysis.get("hslAdjust"), gain)
+    # 사진에 거의 없는 색·사진 대부분을 덮는 색(사실상 전역 채도)을 걸러낸다.
+    hsl = _prune_hsl(hsl, img)
+    # 영역 보정도 효과 없는 값·전역과 겹치는 값을 걸러 analysis에 되돌려 둔다
+    # (서버와 앱이 analysis["regionParams"]를 그대로 꺼내 쓴다).
+    _prune_region_params(analysis, params, is_portrait, gain)
     if hsl:
         params["hslAdjust"] = hsl
         log.info("param_engine: hslAdjust from model — %s", list(hsl.keys()))
+    _damp_warm_stacking(params, analysis)
 
     # 얼굴/체형은 눈이 필요한 판단이라 모델이 인물 사진에서만 제안한다.
     # 스키마상 최상위에 오지만, 옛 응답 형식(recommendedParams 안)도 받아준다.
@@ -876,6 +937,10 @@ def build_params_with_comment(
     if isinstance(reshape, dict) and is_portrait and reshape_enabled:
         params["reshapeParams"] = _clamp_reshape(reshape)
 
+    # 눈에 안 보이는 값은 0으로 — 렌더 단계를 건너뛰고, 앱의 '적용된 변형'에도
+    # 실제로 한 보정만 남는다 (게인까지 곱한 최종값 기준).
+    _drop_negligible(params, img)
+
     log.info(
         "param_engine: subject=%s trend=%s source=%s gain=%.2f | measured b=%.2f c=%.2f s=%.2f w=%.2f haze=%.2f sharp=%.2f",
         subject or "-", trend or "default", profile.get("styleSource") or "-", gain,
@@ -883,6 +948,56 @@ def build_params_with_comment(
         stats["warmth"], stats["haze"], stats["sharpness"],
     )
     return params, describe_params(stats, trend, subject, params, gain)
+
+
+# 이 값보다 작으면 결과가 눈에 띄게 달라지지 않는 파라미터의 최소 효과 크기.
+#
+# 실사진 7장(카페·음식·풍경·인물 4)에서 "그 값 vs 0"의 색차를 쟀다(1280px,
+# float LAB ΔE76). 임계값 바로 아래는 평균 ΔE 0.5 이하·p99 1.6 이하 — 8비트 출력
+# 양자화 수준이다. 예전 서버 응답에 흔했던 값: 선명감 ±0.016(ΔE 0.1~0.2),
+# 선명도 0.04(평균 0.01~0.05), 채도 0.016, 색온도 −0.023, 밝기 0.01, 비네팅 0.024 미만.
+# 효과가 세기에 비례하지 않는 항목(노이즈 제거·피부·배경 흐림·체형)과
+# 모델이 정하는 HSL은 여기서 건드리지 않는다.
+_MIN_EFFECT = {
+    "brightness": 0.015,
+    "contrast": 0.015,
+    "saturation": 0.025,
+    "temperature": 0.025,
+    "highlights": 0.025,
+    "shadows": 0.025,
+    "clarity": 0.04,
+    "sharpness": 0.06,
+    "vignette": 0.02,
+    "dehaze": 0.02,
+}
+# 톤 커브·스플릿 토닝 세기
+_MIN_BLEND_EFFECT = 0.03
+# apply_auto_white_balance는 모든 채널 게인이 1%p 안쪽이면 아무것도 하지 않는다
+_AWB_NOOP_GAIN = 0.01
+
+
+def _drop_negligible(params: dict[str, Any], img: Image.Image) -> None:
+    """효과가 보이지 않는 값을 0으로 만든다 (params를 제자리에서 고친다)."""
+    for key, floor in _MIN_EFFECT.items():
+        if key in params and abs(params[key]) < floor:
+            params[key] = 0.0
+
+    tone = params.get("toneCurve") or {}
+    if not tone.get("points") and float(tone.get("strength") or 0.0) < _MIN_BLEND_EFFECT:
+        tone["strength"] = 0.0
+    for side in (params.get("splitToning") or {}).values():
+        if float(side.get("strength") or 0.0) < _MIN_BLEND_EFFECT:
+            side["strength"] = 0.0
+
+    # auto_wb는 세기가 아니라 "세기 × 이 사진의 색 틀어짐"이 효과다. 렌더러와
+    # 같은 계산으로 모든 게인이 1% 안쪽(=렌더러가 건너뜀)이면 0으로 적는다.
+    # 실측: 0.05~0.06은 7장 전부 이 경우였다(ΔE 0).
+    strength = float(params.get("auto_wb") or 0.0)
+    if 0.0 < strength:
+        gains = estimate_illuminant(img)
+        if all(abs(max(0.75, min(1.25, 1.0 + (g - 1.0) * strength)) - 1.0) < _AWB_NOOP_GAIN
+               for g in gains):
+            params["auto_wb"] = 0.0
 
 
 # HSL 한 채널이 낼 수 있는 최대치. apply_hsl_adjust에서 1.0은 색상 ±30°,
@@ -915,6 +1030,213 @@ def _clamp_hsl(raw: Any, gain: float) -> dict[str, dict[str, float]] | None:
         if vals:
             out[channel] = vals
     return out or None
+
+
+# HSL 채널 거르기 기준. 점유율 = apply_hsl_adjust와 같은 색상·채도 마스크의 평균.
+# 실측(7장): 원본에 0.3~1.0%뿐인 색(음식 yellow, 거리 인물 orange)에 준 값은
+# 그 색을 잡는 게 아니라 전역 색온도로 데워진 화소를 한 번 더 물들였다
+# (walker orange: 원본 점유 0.8%인데 ΔE 1.26). 반대로 81%를 덮는 색(카페 orange)은
+# 사실상 전역 채도라 전역 채도·색온도 위에 겹쳐 쌓인다.
+_HSL_MIN_SHARE = 0.02
+_HSL_GLOBAL_SHARE = 0.50
+_HSL_GLOBAL_DAMP = 0.5
+_HSL_MAX_CHANNELS = 2
+
+
+def _hsl_channel_shares(img: Image.Image) -> dict[str, float]:
+    """채널별로 apply_hsl_adjust가 움직일 화소의 비율(마스크 평균, 0~1)."""
+    small = img.convert("RGB")
+    small.thumbnail((256, 256))
+    hsv = cv2.cvtColor(np.asarray(small)[:, :, ::-1], cv2.COLOR_BGR2HSV).astype(np.float32)
+    h_ch, gate = hsv[:, :, 0], np.clip(hsv[:, :, 1] / 40.0, 0.0, 1.0)
+    shares: dict[str, float] = {}
+    for channel, (lo, hi) in _HSL_CHANNELS.items():
+        if lo > hi:
+            half = ((180 - lo) + hi) / 2.0
+            d = np.abs(h_ch - (lo + half) % 180)
+            dist = np.minimum(d, 180.0 - d)
+        else:
+            half = (hi - lo) / 2.0
+            dist = np.abs(h_ch - (lo + hi) / 2.0)
+        mask = np.clip(1.0 - dist / max(half + 5, 1), 0.0, 1.0) * gate
+        shares[channel] = float(mask.mean())
+    return shares
+
+
+def _prune_hsl(
+    hsl: dict[str, dict[str, float]] | None, img: Image.Image,
+) -> dict[str, dict[str, float]] | None:
+    """사진에 거의 없는 색은 버리고, 대부분을 덮는 색은 줄이고, 채널 수를 묶는다."""
+    if not hsl:
+        return hsl
+    shares = _hsl_channel_shares(img)
+    kept: list[tuple[float, str, dict[str, float]]] = []
+    for channel, vals in hsl.items():
+        share = shares.get(channel, 0.0)
+        if share < _HSL_MIN_SHARE:
+            log.info("param_engine: hsl %s 버림 — 점유 %.1f%%", channel, share * 100)
+            continue
+        if share >= _HSL_GLOBAL_SHARE:
+            vals = {k: v * _HSL_GLOBAL_DAMP for k, v in vals.items()}
+            vals = {k: v for k, v in vals.items() if abs(v) >= 0.01}
+            if not vals:
+                continue
+        kept.append((share * max(abs(v) for v in vals.values()), channel, vals))
+    kept.sort(key=lambda item: -item[0])
+    out = {channel: vals for _, channel, vals in kept[:_HSL_MAX_CHANNELS]}
+    return out or None
+
+
+# 영역 보정 거르기 기준.
+# 실측(7장): 인물 4장 전부 face 밝기(0.04~0.10)가 같은 방향의 전역 밝기(0.13~0.16)
+# 위에 얹혔고, background는 "하늘도 얼굴 피부도 아닌 전부"라 인물의 몸·옷까지
+# 포함한다(astro 98%, hammock 91%). 그래서 background 채도·대비는 전역 보정과 같은
+# 방향으로 한 번 더 걸린 사실상의 전역 보정이었다 (astro ΔE 3.64 — 주황 우주복이
+# 바래고 얼굴만 원래 채도로 남았다). 국소 보정 두 개가 겹친 채 반대 방향으로
+# 밝기를 당기기도 했다 (store: 아치 −0.1 / 상반신 +0.15).
+_REGION_MIN_EFFECT = 0.05
+_REGION_GLOBAL_DAMP = 0.5
+_REGION_LOCAL_MAX = 2
+_REGION_OVERLAP = 0.5
+_REGION_META = frozenset({"area", "shape", "feather", "reason"})
+_REGION_TONE_KEYS = ("brightness", "contrast", "saturation", "temperature",
+                     "highlights", "shadows")
+
+
+def _local_box(spec: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    area = spec.get("area")
+    if not isinstance(area, dict):
+        return None
+    try:
+        x, y = float(area.get("x", 0.0)), float(area.get("y", 0.0))
+        w, h = float(area.get("width", 0.0)), float(area.get("height", 0.0))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (x, y, w, h)) or w <= 0 or h <= 0:
+        return None
+    return x, y, x + w, y + h
+
+
+def _overlap_of_smaller(a: tuple[float, ...], b: tuple[float, ...]) -> float:
+    iw = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    ih = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    smaller = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return iw * ih / smaller if smaller > 0 else 0.0
+
+
+def _nonzero(raw: Any) -> bool:
+    try:
+        return abs(float(raw)) >= 0.01
+    except (TypeError, ValueError):
+        return False
+
+
+def _prune_region_params(
+    analysis: dict[str, Any], params: dict[str, Any], is_portrait: bool, gain: float,
+) -> None:
+    """analysis["regionParams"]에서 효과가 없거나 전역 보정과 겹치는 값을 뺀다.
+
+    요청 원본 딕셔너리는 건드리지 않고 새 딕셔너리로 바꿔 넣는다. 남는 게
+    없으면 None (스키마상 허용되는 값)."""
+    regions = analysis.get("regionParams")
+    if not isinstance(regions, dict):
+        return
+    if gain <= 0.0:
+        # "보정 없음"이면 영역 보정도 하지 않는다
+        analysis["regionParams"] = None
+        return
+
+    out: dict[str, dict[str, Any]] = {}
+    local_boxes: list[tuple[tuple[float, ...], float]] = []
+    for name in sorted(regions, key=lambda n: (n.startswith("local"), n)):
+        spec = regions.get(name)
+        if not isinstance(spec, dict):
+            continue
+        if name == "background" and is_portrait:
+            log.info("param_engine: region background 버림 — 인물의 몸까지 덮는 전역 보정")
+            continue
+        vals: dict[str, Any] = {}
+        for key, raw in spec.items():
+            if key in _REGION_META or key in _FACE_TEXTURE_KEYS:
+                # 잡티·스무딩은 _merge_face_texture가 이미 정리했다
+                vals[key] = raw
+                continue
+            try:
+                v = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(v):
+                continue
+            g = params.get(key)
+            same_dir = (
+                key in _REGION_TONE_KEYS and isinstance(g, (int, float))
+                and abs(g) >= 0.03 and g * v > 0
+            )
+            if name == "face" and key == "brightness" and same_dir and abs(g) >= _REGION_MIN_EFFECT:
+                continue   # 전역 밝기가 이미 같은 쪽으로 얼굴을 올린다
+            if name == "background" and same_dir:
+                v *= _REGION_GLOBAL_DAMP
+            if abs(v) < _REGION_MIN_EFFECT:
+                continue
+            vals[key] = v
+        if not any(k not in _REGION_META and _nonzero(vals[k]) for k in vals):
+            continue
+        if name.startswith("local"):
+            box = _local_box(vals)
+            if box is None:
+                continue
+            if len(local_boxes) >= _REGION_LOCAL_MAX:
+                log.info("param_engine: region %s 버림 — 국소 보정 %d개 한도", name, _REGION_LOCAL_MAX)
+                continue
+            b = float(vals.get("brightness", 0.0))
+            if any(_overlap_of_smaller(box, ob) > _REGION_OVERLAP and b * obr < 0
+                   for ob, obr in local_boxes):
+                log.info("param_engine: region %s 버림 — 겹친 국소 보정과 밝기 방향이 반대", name)
+                continue
+            local_boxes.append((box, b))
+        out[name] = vals
+
+    if out != regions:
+        log.info("param_engine: regionParams %s → %s", list(regions), list(out))
+    analysis["regionParams"] = out or None
+
+def _damp_warm_stacking(params: dict[str, Any], analysis: dict[str, Any]) -> None:
+    """전역 temperature가 이미 웜이면 피부에 겹치는 웜 보정을 덜어낸다.
+
+    전역 웜톤 + hslAdjust.orange 채도 부스트 + regionParams.face temperature가
+    같은 피부에 차례로 걸려 인물 사진이 전부 같은 주황 피부로 수렴했다.
+    - orange 채도 양수: 전역 웜의 세기에 따라 최대 _STACK_ORANGE_DAMP만큼 줄인다.
+    - face temperature 양수: 전역이 이미 준 몫을 뺀다 (0 아래로는 내리지 않는다).
+    음수(식히기·채도 빼기)는 겹침이 아니므로 그대로 둔다. analysis["regionParams"]는
+    새 딕셔너리로 바꿔 넣는다 (요청 원본을 건드리지 않게).
+    """
+    t = float(params.get("temperature") or 0.0)
+    if t < _STACK_T_LO:
+        return
+    hsl = params.get("hslAdjust")
+    orange = hsl.get("orange") if isinstance(hsl, dict) else None
+    if isinstance(orange, dict) and orange.get("saturation", 0.0) > 0:
+        keep = 1.0 - _STACK_ORANGE_DAMP * _ramp(t, _STACK_T_LO, _STACK_T_HI)
+        sat = round(orange["saturation"] * keep, 3)
+        new_orange = {k: sat if k == "saturation" else v for k, v in orange.items()
+                      if k != "saturation" or sat >= 0.01}
+        new_hsl = {k: new_orange if k == "orange" else v for k, v in hsl.items()
+                   if k != "orange" or new_orange}
+        if new_hsl:
+            params["hslAdjust"] = new_hsl
+        else:
+            params.pop("hslAdjust", None)
+    regions = analysis.get("regionParams")
+    face = regions.get("face") if isinstance(regions, dict) else None
+    if isinstance(face, dict):
+        try:
+            face_t = float(face.get("temperature") or 0.0)
+        except (TypeError, ValueError):
+            face_t = 0.0
+        if math.isfinite(face_t) and face_t > 0:
+            new_regions = dict(regions)
+            new_regions["face"] = {**face, "temperature": round(max(0.0, face_t - t), 3)}
+            analysis["regionParams"] = new_regions
 
 
 # 워프 계수가 커진 만큼 모델이 범위를 벗어난 값을 주면 얼굴이 뭉개진다.
@@ -1385,7 +1707,9 @@ def detect_scene(stats: dict[str, float], img: Image.Image) -> dict[str, bool]:
         and center.mean() < 0.45
     )
 
-    low_light = bool(stats["brightness"] < 0.32 and stats["noise"] > 3.0)
+    # 노이즈 1.5는 블록 추정(질감 제외) 눈금이다. 예전 전체 평균 추정의 3.0과
+    # 같은 사진들(어두운 야간 인물 noguchi 2.05·walker 1.85)을 저조도로 잡는다.
+    low_light = bool(stats["brightness"] < 0.32 and stats["noise"] > 1.5)
 
     if backlit or low_light:
         log.info("scene: backlit=%s low_light=%s (center=%.2f border=%.2f)",

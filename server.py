@@ -65,6 +65,7 @@ from image_processor import (
     decode_base64_image,
     detect_regions,
     encode_image_base64,
+    gate_auto_edits,
     sanitize_hsl_adjust,
     sanitize_tone_curve_points,
 )
@@ -317,6 +318,11 @@ def api_transform_photo(
 # ── 분석 + 변형 통합 API ──
 
 
+# 자동 수평 보정의 하한(도). 이보다 작은 기울기는 눈에 띄지 않는데, 회전하면
+# 빈 모서리를 없애려고 테두리를 잘라야 해 구도와 해상도를 잃는다.
+_MIN_AUTO_STRAIGHTEN = 1.0
+
+
 def _run_analyze_and_transform(
     req: AnalyzeAndTransformRequest,
     on_stage=None,
@@ -404,7 +410,14 @@ def _run_analyze_and_transform(
                 log.info("analyze-and-transform: keystone %.3f", keystone)
 
             measured_tilt = detect_tilt_angle(img)
-            if measured_tilt is not None:
+            if measured_tilt is not None and abs(measured_tilt) < _MIN_AUTO_STRAIGHTEN:
+                # 직선이 확신 있게 '거의 수평'이라고 말한 경우다. 모델 예비값으로
+                # 넘어가지 않고 그대로 둔다.
+                log.info("analyze-and-transform: tilt %.2f° below %.1f° — skipped",
+                         measured_tilt, _MIN_AUTO_STRAIGHTEN)
+                auto_edits["straighten"] = None
+                measured_tilt = None
+            elif measured_tilt is not None:
                 auto_edits["straighten"] = measured_tilt
                 log.info("analyze-and-transform: measured tilt %.2f°", measured_tilt)
             elif auto_edits.get("straighten") is not None:
@@ -415,11 +428,17 @@ def _run_analyze_and_transform(
                         # min/max는 NaN을 만나면 다른 쪽 인자를 돌려준다 — 8°가 된다
                         raise ValueError("non-finite tilt")
                     llm_tilt = max(-8.0, min(8.0, llm_tilt))
+                    if abs(llm_tilt) < _MIN_AUTO_STRAIGHTEN:
+                        raise ValueError("imperceptible tilt")
                     auto_edits["straighten"] = llm_tilt
                     measured_tilt = llm_tilt
                     log.info("analyze-and-transform: using model tilt %.2f°", llm_tilt)
                 except (TypeError, ValueError):
                     auto_edits["straighten"] = None
+            # 구도를 바꾸는 편집(크롭·비율)은 모델 말대로 자동 적용하지 않는다.
+            # 인스타가 받지 않는 비율만 맞추고, 모델 크롭은 제안(suggested_*)으로
+            # 남겨 앱에서 사용자가 고르게 한다.
+            gate_auto_edits(auto_edits, img.size, allow_vertical_crop=subject != "인물")
             analysis["autoEdits"] = auto_edits
             params_comment = prefix_tilt_comment(params_comment, measured_tilt)
 

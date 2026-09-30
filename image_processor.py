@@ -524,7 +524,16 @@ def estimate_noise_sigma(img: Image.Image) -> float:
 
     Immerkær(1996)의 라플라시안 기반 추정 — 평탄한 영역의 고주파 성분만
     남기는 3x3 커널로 합성곱한 뒤 평균 절대값을 취한다. 사진 내용(엣지)에
-    거의 영향을 받지 않아 별도 마스킹 없이 쓸 수 있다.
+    남기는 3x3 커널로 합성곱한 뒤 평균 절대값을 취한다.
+
+    화면 전체 평균을 내면 안 된다. 코코아 가루·스펀지·잎사귀 같은 고운 질감도
+    고주파라 노이즈로 잡힌다 — 실측: 스튜디오 조명의 깨끗한 케이크 사진이
+    12.2로 나와 denoise 0.83이 걸리고 케이크 질감이 뭉개졌다(평탄부 실제 노이즈 ≈0).
+    그래서 16px 블록별로 추정해 하위 25% 블록 값을 쓴다. 노이즈는 화면 전체에
+    고르게 깔리지만 질감은 일부에만 있으므로, 가장 매끈한 블록들이 노이즈만
+    보여 준다. 흰색·검은색으로 날아간 블록은 노이즈가 잘려 0이 되고, 아주
+    어둡거나 밝은 블록(평균 24 미만·232 초과)은 톤 압축·JPEG 양자화로 노이즈가
+    눌려 과소 추정되므로 중간톤 블록만 본다(그런 블록이 부족하면 전체로).
     """
     gray = np.asarray(img.convert("L"), dtype=np.float32)
     h, w = gray.shape
@@ -532,8 +541,26 @@ def estimate_noise_sigma(img: Image.Image) -> float:
         return 0.0
 
     kernel = np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], dtype=np.float32)
-    conv = cv2.filter2D(gray, cv2.CV_32F, kernel)
-    sigma = float(np.abs(conv).mean()) * np.sqrt(np.pi / 2.0) / 6.0
+    conv = np.abs(cv2.filter2D(gray, cv2.CV_32F, kernel))[1:-1, 1:-1]
+    inner = gray[1:-1, 1:-1]
+    block = 16
+    bh, bw = conv.shape[0] // block, conv.shape[1] // block
+    if bh * bw < 8:
+        return round(float(conv.mean()) * np.sqrt(np.pi / 2.0) / 6.0, 3)
+
+    def _blocks(a: np.ndarray) -> np.ndarray:
+        return a[:bh * block, :bw * block].reshape(bh, block, bw, block).mean(axis=(1, 3))
+
+    per_block = _blocks(conv)
+    clipped = _blocks(((inner <= 3) | (inner >= 252)).astype(np.float32))
+    level = _blocks(inner)
+    usable = per_block[(clipped < 0.05) & (level >= 24) & (level <= 232)]
+    if usable.size < 8:
+        usable = per_block[clipped < 0.05]
+    if usable.size < 8:
+        usable = per_block.ravel()
+    # 순수 노이즈에서 하위 25% 블록은 평균의 약 0.94배다 — 그만큼 되돌린다
+    sigma = float(np.percentile(usable, 25)) / 0.94 * np.sqrt(np.pi / 2.0) / 6.0
     return round(sigma, 3)
 
 
@@ -631,7 +658,9 @@ def apply_auto_white_balance(img: Image.Image, strength: float) -> Image.Image:
         arr[..., c] *= g
 
     log.info("auto_wb: strength=%.2f gains=(%.3f, %.3f, %.3f)", strength, *gains)
-    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+    # 반올림해서 되돌린다. astype만 하면 소수점이 버려져 게인을 거의 안 건
+    # 채널까지 평균 0.5레벨 어두워진다 (약한 WB가 "색"이 아니라 절삭으로 보였다).
+    return Image.fromarray(np.clip(np.rint(arr), 0, 255).astype(np.uint8))
 
 
 def estimate_keystone(img: Image.Image, max_correction: float = 0.35) -> float:
@@ -1231,6 +1260,35 @@ def apply_tone_curve(
     return Image.fromarray(result_rgb)
 
 
+# 8비트 눈금(L 0~255, a/b 128 중심 / H 0~180, S·V 0~255)을 유지한 채 float로
+# 색공간을 왕복한다. 예전처럼 uint8로 절삭(astype)하면 단계마다 채널이 평균
+# 0.5씩 깎이고(어둡고 푸르게) 약한 보정이 단계 경계에서 한 칸씩 뒤집혔다 —
+# 비네팅·HSL·스플릿은 왕복만으로 ΔE 0.2~0.7을 잃었다.
+# (채널별 스케일은 cv2.transform으로 — numpy 스트라이드 연산보다 20배 빠르다)
+_LAB8_FWD = np.float32([[255.0 / 100.0, 0, 0, 0], [0, 1, 0, 128.0], [0, 0, 1, 128.0]])
+_LAB8_INV = np.float32([[100.0 / 255.0, 0, 0, 0], [0, 1, 0, -128.0], [0, 0, 1, -128.0]])
+_HSV8_FWD = np.float32([[0.5, 0, 0, 0], [0, 255.0, 0, 0], [0, 0, 255.0, 0]])
+_HSV8_INV = np.float32([[2.0, 0, 0, 0], [0, 1 / 255.0, 0, 0], [0, 0, 1 / 255.0, 0]])
+
+
+def _rgb_float(img: Image.Image) -> np.ndarray:
+    return cv2.multiply(np.asarray(img.convert("RGB")), 1.0 / 255.0, dtype=cv2.CV_32F)
+
+
+def _rgb_image(rgb_f: np.ndarray) -> Image.Image:
+    """0~1 float RGB → 반올림한 8비트 이미지."""
+    np.clip(rgb_f, 0.0, 1.0, out=rgb_f)
+    return Image.fromarray(cv2.convertScaleAbs(rgb_f, alpha=255.0))
+
+
+def _to_lab8f(img: Image.Image) -> np.ndarray:
+    return cv2.transform(cv2.cvtColor(_rgb_float(img), cv2.COLOR_RGB2LAB), _LAB8_FWD)
+
+
+def _from_lab8f(lab: np.ndarray) -> Image.Image:
+    return _rgb_image(cv2.cvtColor(cv2.transform(lab, _LAB8_INV), cv2.COLOR_LAB2RGB))
+
+
 def apply_split_toning(
     img: Image.Image,
     shadow_hue: float = 0.0,
@@ -1250,9 +1308,7 @@ def apply_split_toning(
     if shadow_strength < 0.01 and highlight_strength < 0.01:
         return img
 
-    arr = np.array(img, dtype=np.uint8)
-    arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    lab = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab = _to_lab8f(img)   # float 왕복 ([_to_lab8f] 참고)
 
     l_ch = lab[:, :, 0]  # 0~255
     a_ch = lab[:, :, 1]  # 128 중심
@@ -1289,10 +1345,7 @@ def apply_split_toning(
     lab[:, :, 1] = np.clip(a_ch, 0, 255)
     lab[:, :, 2] = np.clip(b_ch, 0, 255)
 
-    result_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-    result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-
-    return Image.fromarray(result_rgb)
+    return _from_lab8f(lab)
 
 
 # ── HSL 선택적 색상 조절 ──
@@ -1336,9 +1389,8 @@ def apply_hsl_adjust(
     if not active:
         return img
 
-    arr = np.array(img, dtype=np.uint8)
-    arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    hsv = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    # float 왕복 ([_to_lab8f] 참고). 8비트 HSV는 색상도 2° 단위로 깎았다.
+    hsv = cv2.transform(cv2.cvtColor(_rgb_float(img), cv2.COLOR_RGB2HSV), _HSV8_FWD)
 
     h_ch = hsv[:, :, 0]  # 0~180
     s_ch = hsv[:, :, 1]  # 0~255
@@ -1389,14 +1441,11 @@ def apply_hsl_adjust(
         if abs(l_shift) >= 0.01:
             v_ch = v_ch + l_shift * 80.0 * mask
 
-    hsv[:, :, 0] = np.clip(h_ch, 0, 179)
+    hsv[:, :, 0] = np.mod(h_ch, 180.0)
     hsv[:, :, 1] = np.clip(s_ch, 0, 255)
     hsv[:, :, 2] = np.clip(v_ch, 0, 255)
 
-    result_bgr = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-    result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-
-    return Image.fromarray(result_rgb)
+    return _rgb_image(cv2.cvtColor(cv2.transform(hsv, _HSV8_INV), cv2.COLOR_HSV2RGB))
 
 
 def apply_vignette(img: Image.Image, intensity: float) -> Image.Image:
@@ -1411,9 +1460,9 @@ def apply_vignette(img: Image.Image, intensity: float) -> Image.Image:
     if abs(intensity) < 0.01:
         return img
 
-    arr = np.array(img, dtype=np.uint8)
-    arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    lab = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    # float 왕복 ([_to_lab8f] 참고). 8비트 왕복·절삭은 가운데(마스크 0)까지
+    # 화면 전체를 L 0.3가량 어둡게 해서, 약한 비네팅도 사진 전체를 바꿨다.
+    lab = _to_lab8f(img)
 
     h, w = lab.shape[:2]
 
@@ -1431,10 +1480,7 @@ def apply_vignette(img: Image.Image, intensity: float) -> Image.Image:
     l_ch = l_ch - intensity * 80.0 * mask
     lab[:, :, 0] = np.clip(l_ch, 0, 255)
 
-    result_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-    result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-
-    return Image.fromarray(result_rgb)
+    return _from_lab8f(lab)
 
 
 # 그레인·샤픈의 기준 해상도.
@@ -1634,7 +1680,9 @@ def apply_sharpness(img: Image.Image, factor: float) -> Image.Image:
         # 음수는 흐리게 — 디테일을 빼는 대신 흐린 쪽으로 섞는다.
         # 그냥 뺐다가는 -1.0에서 디테일이 반전돼 윤곽이 이중으로 보인다.
         out = arr * (1.0 + factor) - blurred * factor
-    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
+    # 반올림해서 되돌린다. 절삭(astype)은 세기와 무관하게 화면 전체를 0.5레벨
+    # 어둡게 해서, 0.04 같은 약한 선명도의 "효과"가 대부분 이 어두워짐이었다.
+    return Image.fromarray(np.clip(np.rint(out), 0, 255).astype(np.uint8))
 
 
 # ── 잡티 제거 (Blemish Removal) ──
@@ -2267,7 +2315,21 @@ _INSTAGRAM_RATIOS: dict[str, float] = {
     "3:4": 3 / 4,
     "4:5": 4 / 5,
     "1:1": 1.0,
+    # 가로형 상한. 이보다 넓은 파노라마를 올려야 할 때만 서버가 고른다.
+    "1.91:1": 1.91,
 }
+
+# 인스타그램이 자르지 않고 받는 비율 범위 (가로/세로). 3:4(세로) ~ 1.91:1(가로).
+# 이 안의 사진은 비율을 바꿀 이유가 없다 — 바꾸면 사용자가 잡은 구도를 잃는다.
+# 실측: 모델이 7장 중 6장에 "4:5"를 달아 4:3 가로 사진의 좌우 40%가 잘렸다.
+_INSTAGRAM_MIN_ASPECT = 3 / 4
+_INSTAGRAM_MAX_ASPECT = 1.91
+# 비율 비교 여유. apply_instagram_ratio가 "이미 비슷한 비율"로 보는 폭과 같다.
+_ASPECT_TOLERANCE = 0.02
+
+# 모델 크롭 제안이 이 면적 비율보다 많이 남기면(=조금만 자르면) 버린다.
+# 가장자리 몇 %를 깎는 크롭은 구도를 바꾸지 못하고 해상도만 잃는다.
+_SUGGEST_CROP_MAX_AREA = 0.85
 
 
 def apply_instagram_ratio(
@@ -2305,6 +2367,106 @@ def apply_instagram_ratio(
             return img.crop((0, top, w, top + new_h))
     except Exception:
         return img
+
+
+def required_instagram_ratio(size: tuple[int, int]) -> str | None:
+    """인스타그램에 올리려면 꼭 잘라야 하는 사진이면 그 비율을, 아니면 None.
+
+    분석 단계가 모델의 instagram_ratio 대신 이 값만 자동 적용한다. 범위를 벗어난
+    사진은 가장 가까운 허용 비율(가장 덜 자르는 쪽)로 맞춘다: 9:16 세로 → 3:4,
+    파노라마 → 1.91:1.
+    """
+    w, h = size
+    if w <= 0 or h <= 0:
+        return None
+    aspect = w / h
+    if aspect < _INSTAGRAM_MIN_ASPECT - _ASPECT_TOLERANCE:
+        return "3:4"
+    if aspect > _INSTAGRAM_MAX_ASPECT + _ASPECT_TOLERANCE:
+        return "1.91:1"
+    return None
+
+
+def _ratio_would_crop(
+    size: tuple[int, int], ratio: object, allow_vertical_crop: bool
+) -> bool:
+    """[apply_instagram_ratio]가 이 비율로 실제로 무언가를 잘라낼지."""
+    target = _INSTAGRAM_RATIOS.get(str(ratio).strip().lower().replace("x", ":"))
+    w, h = size
+    if target is None or w <= 0 or h <= 0:
+        return False
+    current = w / h
+    if abs(current - target) < _ASPECT_TOLERANCE:
+        return False
+    # 세로가 더 긴 쪽을 맞추려면 위아래를 잘라야 한다
+    return current > target or allow_vertical_crop
+
+
+def suggest_crop(crop: object, allow_vertical_crop: bool = True) -> dict | None:
+    """모델 크롭을 '제안'으로 쓸 만하면 정리된 박스를, 아니면 None.
+
+    [apply_smart_crop]과 같은 규칙(최소 변 0.3, 안쪽으로 당기기, 인물은
+    위아래 유지)으로 정리한 뒤, 남는 면적이 [_SUGGEST_CROP_MAX_AREA]를
+    넘으면 버린다 — 가장자리만 깎는 크롭은 제안할 가치가 없다.
+    """
+    if not isinstance(crop, dict):
+        return None
+    try:
+        raw = [float(crop.get(k, d)) for k, d in
+               (("x", 0), ("y", 0), ("width", 1), ("height", 1))]
+    except (TypeError, ValueError):
+        return None
+    # min/max는 NaN을 만나면 다른 쪽 인자를 돌려준다 — 먼저 걸러야 한다
+    if not all(math.isfinite(v) for v in raw):
+        return None
+    x = max(0.0, min(1.0, raw[0]))
+    y = max(0.0, min(1.0, raw[1]))
+    cw = max(_CROP_MIN_SIDE, min(1.0, raw[2]))
+    ch = max(_CROP_MIN_SIDE, min(1.0, raw[3]))
+    if not allow_vertical_crop:
+        y, ch = 0.0, 1.0
+    x = min(x, 1.0 - cw)
+    y = min(y, 1.0 - ch)
+    if cw * ch > _SUGGEST_CROP_MAX_AREA:
+        return None
+    return {"x": round(x, 4), "y": round(y, 4),
+            "width": round(cw, 4), "height": round(ch, 4)}
+
+
+def gate_auto_edits(
+    auto_edits: dict, size: tuple[int, int], allow_vertical_crop: bool
+) -> dict:
+    """분석 결과의 autoEdits에서 구도를 바꾸는 편집을 자동 적용/제안으로 나눈다.
+
+    모델은 크롭을 "적극" 권하도록 쓰인 프롬프트를 따라 거의 매번 crop과
+    instagram_ratio를 달았다 (실사진 7장 중 비율 6장, 크롭 5장). 사용자가 잡은
+    구도를 말없이 바꾸는 것이라, 서버가 판단한다:
+      - instagram_ratio: 인스타가 받지 않는 비율일 때만 자동 적용 (가장 덜 자르는
+        허용 비율로). 모델이 고른 비율이 실제로 사진을 자르면 suggested_ratio로.
+      - crop: 자동 적용하지 않는다. 의미 있게 자르는 것만 suggested_crop으로.
+    suggested_* 는 [apply_auto_edits]가 apply_suggested_crop=True일 때만 쓴다
+    (앱의 '추천 구도로 자르기'). 들어온 dict를 제자리에서 고치고 돌려준다.
+    """
+    model_crop = auto_edits.pop("crop", None)
+    model_ratio = auto_edits.pop("instagram_ratio", None)
+    auto_edits.pop("suggested_crop", None)
+    auto_edits.pop("suggested_ratio", None)
+    auto_edits.pop("apply_suggested_crop", None)
+
+    needed = required_instagram_ratio(size)
+    if needed is not None:
+        auto_edits["instagram_ratio"] = needed
+
+    suggestion = suggest_crop(model_crop, allow_vertical_crop)
+    if suggestion is not None:
+        auto_edits["suggested_crop"] = suggestion
+    if (
+        isinstance(model_ratio, str)
+        and model_ratio != needed
+        and _ratio_would_crop(size, model_ratio, allow_vertical_crop)
+    ):
+        auto_edits["suggested_ratio"] = model_ratio
+    return auto_edits
 
 
 # 인페인팅으로 메울 수 있는 최대 크기 (프레임 면적 대비).
@@ -2507,6 +2669,10 @@ def _map_normalized_box(
             "width": (x1 - x0) / dw, "height": (y1 - y0) / dh}
 
 
+# apply_auto_edits 안에서 "비율은 크롭 뒤 프레임으로 다시 판단"을 뜻하는 표식
+_RECHECK_RATIO = object()
+
+
 def apply_auto_edits(
     img: Image.Image, auto_edits: dict, allow_vertical_crop: bool = True
 ) -> Image.Image:
@@ -2557,8 +2723,20 @@ def apply_auto_edits(
         except (TypeError, ValueError):
             pass
 
-    # 3. 스마트 크롭 (줌/리프레임) — 원본 좌표를 새 프레임으로 옮겨서
+    # 사용자가 '추천 구도로 자르기'를 고르면 제안 값을 크롭·비율 자리에 쓴다.
+    # 그 외에는 suggested_* 를 보지 않는다 — 제안은 자동 적용이 아니다.
     crop = auto_edits.get("crop")
+    ig_ratio = auto_edits.get("instagram_ratio")
+    if auto_edits.get("apply_suggested_crop") is True:
+        if isinstance(auto_edits.get("suggested_crop"), dict):
+            crop = auto_edits["suggested_crop"]
+        # 제안 비율이 없으면 자른 뒤의 프레임으로 필요 비율을 다시 잰다 —
+        # 좁게 자른 세로 크롭은 인스타 범위(3:4)를 벗어날 수 있다.
+        ig_ratio = auto_edits.get("suggested_ratio")
+        if not isinstance(ig_ratio, str):
+            ig_ratio = _RECHECK_RATIO
+
+    # 3. 스마트 크롭 (줌/리프레임) — 원본 좌표를 새 프레임으로 옮겨서
     if crop and isinstance(crop, dict):
         mapped = _map_normalized_box(crop, geometry, src_size, img.size)
         if mapped is None:
@@ -2567,7 +2745,8 @@ def apply_auto_edits(
             img = apply_smart_crop(img, mapped, allow_vertical_crop)
 
     # 4. 인스타그램 비율 크롭
-    ig_ratio = auto_edits.get("instagram_ratio")
+    if ig_ratio is _RECHECK_RATIO:
+        ig_ratio = required_instagram_ratio(img.size)
     if ig_ratio and isinstance(ig_ratio, str):
         img = apply_instagram_ratio(img, ig_ratio, allow_vertical_crop)
 
@@ -3876,22 +4055,34 @@ def _soft_limit(x: np.ndarray, knee: float = _SOFT_KNEE) -> np.ndarray:
     원래 255였던 순백이 249로 내려가 흰 배경이 회색으로 보인다.
     넘친 값이 있을 때만, 넘친 폭에 맞춰 위쪽 [255-knee, 최댓값]을
     [255-knee, 255]로 부드럽게 눌러 담는다. 순서는 유지된다(단조).
+
+    넘친 폭이 작을수록 항등에 가까워야 한다(연속). 예전 곡선은 무릎 시작점의
+    기울기가 2·knee/(최댓값-edge)라, 화소 하나가 255.01만 돼도 기울기 2로
+    무릎 구간 전체를 최대 knee/4(6레벨)씩 들어 올렸다. 그래서 밝기 +0.01 같은
+    미세한 값이 사진 전체에 ΔE 1~2를 만들거나 안 만들거나 했다.
+    넘친 폭 P(= 최댓값-edge)가 2·knee 이하일 때는 u - c·u² (c = (P-knee)/P²)로
+    누른다: P=knee면 항등, P=2·knee에서 예전 곡선과 정확히 같아진다.
     """
     y = np.array(x, dtype=np.float32, copy=True)
+
+    def fold(u: np.ndarray, span: float) -> np.ndarray:
+        # u: 무릎 시작점에서 바깥쪽으로 잰 거리(0~span) → 0~knee
+        if span <= 2.0 * knee:
+            return u - (span - knee) / (span * span) * u * u
+        t = u / span
+        return knee * (1.0 - (1.0 - t) ** 2)
 
     peak = float(y.max()) if y.size else 0.0
     if peak > 255.0:
         edge = 255.0 - knee
         up = y > edge
-        t = (y[up] - edge) / (peak - edge)
-        y[up] = edge + knee * (1.0 - (1.0 - t) ** 2)
+        y[up] = edge + fold(y[up] - edge, peak - edge)
 
     floor = float(y.min()) if y.size else 0.0
     if floor < 0.0:
         edge = knee
         dn = y < edge
-        t = (edge - y[dn]) / (edge - floor)
-        y[dn] = edge - knee * (1.0 - (1.0 - t) ** 2)
+        y[dn] = edge - fold(edge - y[dn], edge - floor)
 
     return np.clip(y, 0.0, 255.0)
 
@@ -3968,7 +4159,7 @@ def _apply_lab_adjustments(
 
         t = transmission[:, :, np.newaxis]
         result_f = (arr_f - atm) / t + atm
-        arr_bgr = np.clip(result_f, 0, 255).astype(np.uint8)
+        arr_bgr = np.clip(np.rint(result_f), 0, 255).astype(np.uint8)  # 절삭 대신 반올림
 
     # ── BGR → LAB (float32) 1회 변환 ──
     lab = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -4001,9 +4192,13 @@ def _apply_lab_adjustments(
             blended_curve = identity * (1.0 - tone_curve_strength) + curve * tone_curve_strength
             # float32 LUT (0~255)
             tc_lut = np.clip(blended_curve * 255.0, 0, 255).astype(np.float32)
-            # l_ch를 uint8 인덱스로 변환하여 LUT 적용, 결과는 float32 유지
-            l_idx = np.clip(l_ch, 0, 255).astype(np.uint8)
-            l_ch = tc_lut[l_idx]
+            # LUT 사이를 선형 보간해 적용한다. uint8 인덱스로 자르면 L이 평균
+            # 0.5 어두워지고, 앞 단계(highlights·shadows)의 1레벨 미만 변화가
+            # 통째로 사라져 약한 값이 "아무것도 안 하는" 것처럼 보였다.
+            # (1차원 remap = 선형 보간 LUT. np.interp보다 20배 빠르다)
+            l_ch = cv2.remap(tc_lut.reshape(1, 256), np.clip(l_ch, 0, 255).astype(np.float32),
+                             np.zeros(l_ch.shape, np.float32), cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_REPLICATE)
 
     # ── 4. Brightness (L 채널 감마 보정) ──
     if abs(brightness) >= 0.01:
@@ -4058,9 +4253,10 @@ def _apply_lab_adjustments(
     lab[:, :, 1] = _soft_limit(a_ch)
     lab[:, :, 2] = _soft_limit(b_ch)
 
-    bgr_out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-    rgb_out = cv2.cvtColor(bgr_out, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb_out)
+    # float LAB 그대로 역변환한 뒤 반올림한다. 예전처럼 8비트 LAB로 절삭(astype)하면
+    # L·a·b가 각각 평균 0.5씩 깎이고(어둡고 푸르게), 색온도 등이 남긴 소수점이
+    # 미세한 값 변화에 화면 전체가 한 칸씩 뒤집혀 ΔE 1~2가 튀었다.
+    return _from_lab8f(lab)
 
 
 # ── 통합 변형 ──
