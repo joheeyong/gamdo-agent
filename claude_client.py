@@ -204,7 +204,8 @@ _PROFILE_ENUMS: dict[str, tuple[str, ...]] = {
         ("none", "light", "moderate", "heavy"),
     "trendCategory": (
         "warm_film", "korean_gamsung", "cinematic_moody",
-        "bright_airy", "golden_hour", "clean_minimal", "custom",
+        "bright_airy", "golden_hour", "clean_minimal",
+        "flash_digicam", "soft_pastel", "bw_grain", "custom",
     ),
 }
 

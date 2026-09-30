@@ -28,7 +28,26 @@ TONE_CURVE_PRESETS: dict[str, list[tuple[float, float]]] = {
     "fade": [(0, 0.08), (0.25, 0.28), (0.5, 0.50), (0.75, 0.72), (1, 0.92)],
     "high_contrast": [(0, 0), (0.25, 0.12), (0.5, 0.5), (0.75, 0.88), (1, 1)],
     "bright": [(0, 0.04), (0.25, 0.30), (0.5, 0.56), (0.75, 0.80), (1, 1)],
+    # ── 2026 트렌드 커브 ──
+    # 소프트 필름: 검정을 살짝 띄우고(바랜 바닥) 흰색 끝을 부드럽게 접는다.
+    # S커브와 달리 중간톤 기울기가 1보다 조금 낮아 대비가 순해진다.
+    "soft_film": [(0, 0.07), (0.25, 0.255), (0.5, 0.505), (0.75, 0.755), (1, 0.955)],
+    # 정면 플래시 스냅: 중간~밝은 톤을 세워 피사체가 튀어나오고, 바닥은 그대로 깊다.
+    "flash": [(0, 0), (0.25, 0.20), (0.5, 0.53), (0.75, 0.84), (1, 1)],
+    # 소프트 파스텔: 바닥을 크게 띄우고 전체를 밝은 쪽으로 눌러 담는다 (저대비).
+    "pastel": [(0, 0.10), (0.25, 0.32), (0.5, 0.575), (0.75, 0.795), (1, 0.955)],
+    # 흑백 그레인: 필름 인화 같은 적당한 대비, 검정·흰색 끝만 살짝 접는다.
+    "bw": [(0, 0.035), (0.25, 0.21), (0.5, 0.50), (0.75, 0.80), (1, 0.975)],
 }
+
+# saturation이 이 값 이하면 "흑백 변환"으로 본다 (채도를 끝까지 뺀 것).
+_MONO_SATURATION = -0.99
+# 흑백 변환의 색→밝기 믹스 (LAB a·b 편차 → L 가산).
+# 채널 평균으로 뽑으면 피부가 칙칙해진다. 흑백 필름에 옅은 주황 필터를 끼운 것처럼
+# 따뜻한 색(피부·입술)은 살짝 밝게, 파랑(하늘)은 살짝 어둡게 옮긴다.
+_MONO_MIX_A = 0.22
+_MONO_MIX_B = 0.14
+_MONO_MIX_LIMIT = 18.0
 
 
 # MediaPipe는 선택적 의존성 — 없으면 잡티 제거 비활성화
@@ -2242,23 +2261,30 @@ def apply_smart_crop(
         return img
 
 
+# 인스타그램이 받는 세로형·정사각 비율 (가로/세로).
+# 3:4는 2025년 1월 프로필 그리드가 3:4로 바뀌고 5월부터 3:4 게시물이 지원되면서 추가했다.
+_INSTAGRAM_RATIOS: dict[str, float] = {
+    "3:4": 3 / 4,
+    "4:5": 4 / 5,
+    "1:1": 1.0,
+}
+
+
 def apply_instagram_ratio(
     img: Image.Image, ratio: str, allow_vertical_crop: bool = True
 ) -> Image.Image:
     """인스타그램 최적 비율로 중앙 크롭한다.
 
-    ratio: "4:5" (피드 최적) 또는 "1:1" (정사각형)
+    ratio: "3:4" (2025년부터 프로필 그리드 비율, 1080x1440), "4:5" (피드 세로),
+           "1:1" (정사각형). 공백·"x" 구분자("3x4")도 받는다.
 
     allow_vertical_crop=False면 위아래를 자르지 않는다. 전신 인물 사진에서
     가운데를 기준으로 위아래를 자르면 머리와 발이 잘려 다리가 짧아 보인다.
     """
     try:
         w, h = img.size
-        if ratio == "4:5":
-            target = 4 / 5
-        elif ratio == "1:1":
-            target = 1.0
-        else:
+        target = _INSTAGRAM_RATIOS.get(str(ratio).strip().lower().replace("x", ":"))
+        if target is None:
             return img
 
         current = w / h
@@ -4015,7 +4041,14 @@ def _apply_lab_adjustments(
         a_ch = a_ch + shift * 0.3
 
     # ── 9. Saturation (A, B 채널) ──
-    if abs(saturation) >= 0.01:
+    if saturation <= _MONO_SATURATION:
+        # 흑백 변환 — 색을 밝기로 옮긴 뒤 a·b를 완전히 중립으로 둔다.
+        # 스케일(1+saturation)로 두면 -0.99가 1% 색을 남겨 완전한 흑백이 아니다.
+        mix = (a_ch - 128.0) * _MONO_MIX_A + (b_ch - 128.0) * _MONO_MIX_B
+        l_ch = l_ch + np.clip(mix, -_MONO_MIX_LIMIT, _MONO_MIX_LIMIT)
+        a_ch = np.full_like(a_ch, 128.0)
+        b_ch = np.full_like(b_ch, 128.0)
+    elif abs(saturation) >= 0.01:
         a_ch = 128.0 + (a_ch - 128.0) * (1.0 + saturation)
         b_ch = 128.0 + (b_ch - 128.0) * (1.0 + saturation)
 

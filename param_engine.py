@@ -204,53 +204,127 @@ def _level_index(value: str | None, default: int = 2) -> int:
 #
 # 프롬프트에 산문으로 적혀 있던 규칙을 그대로 옮긴 것이다.
 # 여기 없는 키는 0으로 본다.
+#
+# 키 설명 (값이 없으면 괄호 안의 기본 동작):
+#   shadow_floor / highlight_ceiling — 어두운 끝(p5)·밝은 끝(p95)의 목표 위치
+#   crush_blacks — "always": 바닥이 목표보다 떠 있으면 눌러 내린다 (깊은 그림자가
+#                  스타일인 트렌드). "hazy": 사진이 실제로 뿌옇고 평평할 때만
+#                  누른다 — 바랜 검정이 스타일인 필름 계열. (always)
+#   contrast_target / saturation_target / warmth_target — 프로필에 해당 성향이 없거나
+#                  사용자가 스타일을 직접 골랐을 때(styleSource=manual) 쓰는 측정 목표
+#                  (medium 0.68 / 0.38 / 중립 0.0)
+#   saturation_range / temperature_range — contrast_range와 같은 방식의 채도·색온도 교정 범위
+#   contrast_range — 측정 기반 대비 교정의 (하한, 상한). 필름 계열은 대비를
+#                    크게 세우지 않는다. (±밴드)
+#   contrast / brightness — 측정과 무관하게 더하는 방향성
+#   clarity / sharpness — 피사체 레시피 값에 더해진다
+#   clarity_cap / sharpness_cap — 피사체 레시피가 더해진 뒤의 상한. 음식·풍경
+#                    레시피가 필름 룩을 쨍한 HDR로 덮어쓰지 않게 한다. (0.25)
+#   vignette — 피사체 레시피 값과 비교해 큰 쪽을 쓴다
+#   monochrome — True면 완전한 흑백 (saturation −1.0, 색 보정 전부 끔)
+#   split — 스플릿 토닝 {"shadow": (hue, 세기), "highlight": (hue, 세기)}
 
 _TREND_RECIPES: dict[str, dict[str, Any]] = {
     "warm_film": {
-        "temperature": 0.18, "shadow_floor": 0.11, "highlight_ceiling": 0.91, "saturation": -0.08,
+        "warmth_target": 0.12, "saturation_target": 0.30, "saturation_range": (-0.20, 0.08),
+        "temperature_range": (-0.06, 0.25),
+        "temperature": 0.16, "shadow_floor": 0.11, "highlight_ceiling": 0.91, "saturation": -0.10,
+        "crush_blacks": "hazy", "contrast_target": 0.62, "contrast_range": (-0.20, 0.08),
+        "clarity_cap": 0.05, "sharpness_cap": 0.08,
         "tone_curve": ("film", 0.60), "grain": 0.20,
-        "split": {"shadow": (255, 0.15), "highlight": (30, 0.15)},
+        "split": {"shadow": (255, 0.12), "highlight": (35, 0.15)},
     },
     "korean_gamsung": {
-        "temperature": 0.10, "shadow_floor": 0.13, "highlight_ceiling": 0.89, "saturation": -0.12,
-        "clarity": -0.08, "tone_curve": ("fade", 0.40), "grain": 0.08,
+        "warmth_target": 0.04, "saturation_target": 0.26, "saturation_range": (-0.30, 0.04),
+        "temperature": 0.08, "shadow_floor": 0.13, "highlight_ceiling": 0.89, "saturation": -0.14,
+        "crush_blacks": "hazy", "contrast_target": 0.56, "contrast_range": (-0.25, 0.05),
+        "clarity": -0.08, "clarity_cap": 0.0, "sharpness_cap": 0.06,
+        "tone_curve": ("fade", 0.45), "grain": 0.10,
     },
     "cinematic_moody": {
         "temperature": 0.05, "shadow_floor": 0.04, "highlight_ceiling": 0.93, "saturation": -0.10,
         "clarity": 0.20, "vignette": 0.22, "tone_curve": ("high_contrast", 0.50), "grain": 0.28,
         "split": {"shadow": (210, 0.30), "highlight": (30, 0.22)},
     },
+    # 예전(2010년대 후반) 유행 — 유지하되 새 사용자에게 권하지는 않는다
     "bright_airy": {
-        "temperature": 0.08, "shadow_floor": 0.15, "highlight_ceiling": 0.96, "saturation": -0.05,
-        "clarity": 0.05, "vignette": 0.0, "tone_curve": ("bright", 0.40), "grain": 0.05,
+        "saturation_target": 0.30,
+        "temperature": 0.06, "shadow_floor": 0.15, "highlight_ceiling": 0.96, "saturation": -0.06,
+        "crush_blacks": "hazy", "clarity_cap": 0.05, "sharpness_cap": 0.08,
+        "vignette": 0.0, "tone_curve": ("bright", 0.40), "grain": 0.05,
     },
     "golden_hour": {
+        "warmth_target": 0.20,
         "temperature": 0.22, "shadow_floor": 0.09, "highlight_ceiling": 0.93, "saturation": 0.0,
+        "crush_blacks": "hazy", "clarity_cap": 0.08, "sharpness_cap": 0.10,
         "tone_curve": ("film", 0.45), "grain": 0.12,
         "split": {"shadow": (270, 0.12), "highlight": (40, 0.15)},
     },
     "clean_minimal": {
+        "warmth_target": 0.0,
         "temperature": 0.05, "shadow_floor": 0.03, "highlight_ceiling": 0.97, "saturation": -0.05,
         "clarity": 0.05, "vignette": 0.0, "tone_curve": ("linear", 0.0), "grain": 0.0,
     },
+    # 정면 플래시 스냅 / Y2K 디카: 밝게 튀어나온 피사체, 깊은 바닥, 또렷한 로컬 대비,
+    # 뉴트럴~쿨한 화이트밸런스, 가장자리가 떨어지는 조명, 디지털 노이즈 같은 그레인.
+    "flash_digicam": {
+        "warmth_target": -0.02, "saturation_target": 0.40,
+        "temperature": -0.12, "shadow_floor": 0.03, "highlight_ceiling": 0.97, "saturation": 0.04,
+        "contrast_target": 0.80, "contrast": 0.08,
+        "clarity": 0.16, "sharpness": 0.08, "clarity_cap": 0.30,
+        "vignette": 0.24, "tone_curve": ("flash", 0.60), "grain": 0.15,
+        "wb_boost": 0.25,
+    },
+    # 핑크·피치 파스텔: 들린 그림자, 낮은 대비, 부드러운 하이라이트.
+    "soft_pastel": {
+        "warmth_target": 0.04, "saturation_target": 0.30, "saturation_range": (-0.15, 0.0),
+        "temperature": 0.03, "shadow_floor": 0.16, "highlight_ceiling": 0.92, "saturation": -0.10,
+        "crush_blacks": "hazy", "contrast_target": 0.52, "contrast_range": (-0.30, 0.0),
+        "contrast": -0.06, "brightness": 0.06,
+        "clarity": -0.10, "clarity_cap": -0.02, "sharpness_cap": 0.04,
+        "vignette": 0.0, "tone_curve": ("pastel", 0.70), "grain": 0.06,
+        "temperature_range": (-0.08, 0.15),
+        "split": {"shadow": (335, 0.42), "highlight": (5, 0.36)},
+    },
+    # 흑백 + 필름 그레인. 대비는 적당히, 그레인은 눈에 보이게.
+    "bw_grain": {
+        "monochrome": True, "shadow_floor": 0.04, "highlight_ceiling": 0.95,
+        "contrast_target": 0.74, "contrast": 0.04, "clarity": 0.08, "vignette": 0.12,
+        "tone_curve": ("bw", 0.60), "grain": 0.30,
+    },
 }
 
-# 트렌드를 모를 때 쓰는 2025-2026 공통 베이스라인
+# 트렌드를 모를 때(스타일 프로필 없음·custom) 쓰는 2026 공통 베이스라인
+# "소프트 필름 내추럴": 살짝 바랜 검정, 순한 대비, 옅은 웜톤, 고운 그레인.
+#
+# 예전 기본값은 S커브 + 바닥 누르기였다. 스타일 프로필이 없는 사용자는 전부
+# 이 레시피를 탔는데 (실측 38건 중 38건), 평균 shadows −0.18·contrast +0.18·
+# clarity +0.10·sharpness +0.17로 대부분의 사진이 쨍하고 무거워졌다 — 2026년의
+# 아날로그 필름·뮤트 톤 흐름과 정반대다.
 _DEFAULT_RECIPE: dict[str, Any] = {
-    "temperature": 0.10, "shadow_floor": 0.08, "highlight_ceiling": 0.94, "saturation": -0.08,
-    "tone_curve": ("s_curve", 0.25), "grain": 0.05,
+    "temperature": 0.07, "shadow_floor": 0.07, "highlight_ceiling": 0.93, "saturation": -0.08,
+    "crush_blacks": "hazy", "contrast_target": 0.62, "contrast_range": (-0.12, 0.08),
+    "warmth_target": 0.06, "saturation_target": 0.32, "saturation_range": (-0.15, 0.10),
+    "temperature_range": (-0.10, 0.20),
+    "clarity_cap": 0.05, "sharpness_cap": 0.08,
+    "tone_curve": ("soft_film", 0.65), "grain": 0.16,
 }
+
+# 흑백 트렌드 이름 (describe_params·테스트가 참조)
+_MONO_TRENDS = frozenset(k for k, v in _TREND_RECIPES.items() if v.get("monochrome"))
 
 _SUBJECT_RECIPES: dict[str, dict[str, Any]] = {
+    # 인물의 톤 커브는 트렌드(또는 기본 레시피)가 정한다. 예전에는 여기서 S커브 0.30을
+    # 강제해 기본 레시피 인물 사진이 전부 S커브를 탔다.
     "인물": {
         "clarity": -0.02, "sharpness": 0.05, "vignette": 0.12,
         "blemish_removal": 0.35, "skin_smoothing": 0.28, "dehaze": 0.0,
-        "tone_curve": ("s_curve", 0.30),
     },
     "풍경": {"clarity": 0.18, "sharpness": 0.12, "vignette": 0.03, "use_haze": True},
+    # 음식은 질감이 맛이라 필름 룩에서도 조금 더 또렷하게 남긴다 (texture_bonus)
     "음식": {
         "clarity": 0.25, "sharpness": 0.22, "vignette": 0.18,
-        "saturation": 0.06, "temperature": 0.25,
+        "saturation": 0.06, "temperature": 0.25, "texture_bonus": 0.06,
     },
     "카페/일상": {"clarity": -0.10, "contrast": -0.05, "vignette": 0.10},
     "사물": {"clarity": 0.15, "sharpness": 0.10, "vignette": 0.15},
@@ -345,6 +419,19 @@ def _ramp(v: float, lo: float, hi: float) -> float:
     return max(0.0, min(1.0, (v - lo) / (hi - lo)))
 
 
+def haze_flatness(stats: dict[str, float]) -> float:
+    """사진이 실제로 뿌옇고 평평한 정도 (0~1).
+
+    바닥(p5)이 높이 떠 있고 대비(p95-p5)가 낮을 때만 1에 가까워진다.
+    바닥만 높은 사진(밝은 하이키·흰 배경)이나 대비만 낮은 사진(원래 어두운 장면)은
+    뿌연 게 아니다. 다크 채널(stats["haze"])이 높으면 조금 더 믿는다.
+    """
+    lifted = _ramp(stats["shadow_p05"], 0.10, 0.24)
+    flat = _ramp(0.66 - stats["contrast"], 0.0, 0.22)
+    veil = _ramp(stats.get("haze", 0.0), 0.35, 0.65)
+    return round(min(1.0, lifted * flat * (0.7 + 0.3 * veil) * 1.4), 3)
+
+
 def build_recommended_params(
     img: Image.Image,
     style_profile: dict[str, Any] | None,
@@ -389,11 +476,23 @@ def build_params_with_comment(
 
     color_pref = profile.get("colorPreference") or {}
     editing = profile.get("editingStyle") or {}
-    trend = profile.get("trendCategory") or ""
+    trend = str(profile.get("trendCategory") or "").strip()
     subject = str(analysis.get("subjectType") or "").strip()
+    manual = profile.get("styleSource") == "manual"
 
+    # 알 수 없는 트렌드(custom·빈 값·앱이 새로 보낸 값)는 기본 레시피
+    if trend and trend not in _TREND_RECIPES:
+        log.info("param_engine: unknown trendCategory %r → default recipe", trend)
+        trend = ""
     recipe = dict(_TREND_RECIPES.get(trend, _DEFAULT_RECIPE))
     subject_recipe = _SUBJECT_RECIPES.get(subject, {})
+    mono = bool(recipe.get("monochrome"))
+
+    # 사용자가 설정에서 스타일을 직접 골랐으면(styleSource=manual) 그 스타일이
+    # 피드 측정보다 우선한다. 레퍼런스(대표 사진)는 "자동(내 피드 기준)"일 때의 목표다.
+    if manual and trend and reference:
+        log.info("param_engine: manual style %s — ignoring feed reference", trend)
+        reference = None
 
     # 게인: 보정 강도 성향이 전체 세기를 정한다
     gain = _FILTER_GAIN.get(editing.get("filterTendency") or "auto", 0.8)
@@ -407,9 +506,22 @@ def build_params_with_comment(
         target_warmth = reference["warmth"]
     else:
         target_brightness = _BRIGHTNESS_TARGETS[_level_index(color_pref.get("brightnessTendency"))]
-        target_contrast = _CONTRAST_TARGETS[_level_index(color_pref.get("contrast"))]
-        target_saturation = _SATURATION_TARGETS[_level_index(color_pref.get("saturationTendency"))]
-        target_warmth = _TONE_TARGETS.get(color_pref.get("preferredTones") or "neutral", 0.0)
+        if color_pref.get("contrast") in _LEVEL5 and not (manual and "contrast_target" in recipe):
+            target_contrast = _CONTRAST_TARGETS[_level_index(color_pref.get("contrast"))]
+        else:
+            # 프로필에 대비 성향이 없으면(수동 선택·프로필 없음) 레시피가 정한다
+            target_contrast = float(recipe.get("contrast_target", _CONTRAST_TARGETS[2]))
+        # 프로필에 성향이 없거나(수동 선택·프로필 없음) 사용자가 스타일을 직접
+        # 골랐으면 레시피의 목표를 쓴다. 중립 목표를 그대로 두면 웜 필름을 골라도
+        # 따뜻한 사진이 차갑게 당겨지고, 뮤트 톤을 골라도 채도가 올라간다.
+        if color_pref.get("saturationTendency") in _LEVEL5 and not (manual and "saturation_target" in recipe):
+            target_saturation = _SATURATION_TARGETS[_level_index(color_pref.get("saturationTendency"))]
+        else:
+            target_saturation = float(recipe.get("saturation_target", _SATURATION_TARGETS[2]))
+        if color_pref.get("preferredTones") in _TONE_TARGETS and not (manual and "warmth_target" in recipe):
+            target_warmth = _TONE_TARGETS[color_pref["preferredTones"]]
+        else:
+            target_warmth = float(recipe.get("warmth_target", 0.0))
 
     # ── 자동 화이트밸런스 ──
     #
@@ -434,6 +546,10 @@ def build_params_with_comment(
         _AWB_BASE * stats["cast_uniformity"] * (1.0 - _AWB_TASTE_RELIEF * taste_agreement),
         3,
     )
+    # 플래시 스냅은 조명이 카메라 쪽 흰 빛 하나다 — 실내 조명의 캐스트를 더 걷어낸다
+    if recipe.get("wb_boost"):
+        auto_wb_strength = round(min(1.0, auto_wb_strength
+                                     + float(recipe["wb_boost"]) * stats["cast_uniformity"]), 3)
 
     # ── 장면에 따라 기준을 바꾼다 ──
     scene = detect_scene(stats, img)
@@ -451,11 +567,22 @@ def build_params_with_comment(
         _EXPOSURE_BAND,
     )
     contrast = _band((target_contrast - stats["contrast"]) * 1.6)
+    # 필름 계열은 측정 차이가 커도 대비·채도를 크게 세우지(또는 죽이지) 않는다
+    if "contrast_range" in recipe:
+        lo, hi = recipe["contrast_range"]
+        contrast = max(float(lo), min(float(hi), contrast))
     saturation = _band((target_saturation - stats["saturation"]) * 1.8)
+    if "saturation_range" in recipe:
+        lo, hi = recipe["saturation_range"]
+        saturation = max(float(lo), min(float(hi), saturation))
     # 화이트밸런스가 먼저 중립으로 당기므로, 그 뒤에 남는 웜니스를 기준으로 잡는다.
     # 원본 warmth를 그대로 쓰면 같은 편차를 두 번 보정하게 된다.
     warmth_after_wb = stats["warmth"] * (1.0 - _AWB_NEUTRALIZE * auto_wb_strength)
     temperature = _band((target_warmth - warmth_after_wb) * 1.2)
+    # 필름 계열은 따뜻한 사진을 크게 식히지 않는다 — 피부가 회색으로 죽는다
+    if "temperature_range" in recipe:
+        lo, hi = recipe["temperature_range"]
+        temperature = max(float(lo), min(float(hi), temperature))
 
     # 레시피의 방향성을 더한다 (트렌드 → 피사체 순으로 덮어씀)
     def pick(key: str, default: float = 0.0) -> float:
@@ -475,7 +602,9 @@ def build_params_with_comment(
     temperature = _band(
         temperature + float(recipe.get("temperature", 0.0))
         + float(subject_recipe.get("temperature", 0.0)), _STYLE_BAND)
-    contrast = _band(contrast + float(subject_recipe.get("contrast", 0.0)), _STYLE_BAND)
+    contrast = _band(contrast + float(recipe.get("contrast", 0.0))
+                     + float(subject_recipe.get("contrast", 0.0)), _STYLE_BAND)
+    brightness = _band(brightness + float(recipe.get("brightness", 0.0)), _STYLE_BAND)
 
     # 흰 영역이 넓으면 "대비가 너무 높다"는 측정도 믿을 수 없다.
     #
@@ -509,6 +638,15 @@ def build_params_with_comment(
     else:
         target_floor = float(recipe.get("shadow_floor", 0.08))
     shadows = _band((target_floor - stats["shadow_p05"]) * _SHADOW_LIFT_GAIN)
+    # 바닥이 목표보다 떠 있을 때 눌러 내릴지.
+    #
+    # 필름 계열(기본 레시피 포함)은 살짝 바랜 검정이 곧 스타일이다. 예전 기본값은
+    # 떠 있는 바닥을 무조건 눌러(실측 평균 shadows −0.18) 모든 사진을 무겁게 만들었다.
+    # 이제는 사진이 실제로 뿌옇고 평평할 때만 — 바닥이 높고(p5) 대비가 낮을 때만 —
+    # 그 정도만큼 누른다. 레퍼런스(그 사람의 실제 바닥)가 있으면 그쪽을 믿는다.
+    if (shadows < 0 and not reference
+            and recipe.get("crush_blacks", "always") == "hazy"):
+        shadows *= haze_flatness(stats)
     # 하이라이트도 쉐도우와 대칭으로 다룬다. 예전에는 "억제만" 했는데,
     # 밝은 끝이 낮아 흐릿한 사진은 눌러서 더 평평해질 뿐이다. 그런 사진은
     # 오히려 올려야 밝은 액센트가 생겨 입체감이 산다.
@@ -548,9 +686,22 @@ def build_params_with_comment(
     # 뭉개졌다. 완전히 날아간(=255) 화소는 눌러도 디테일이 돌아오지 않는다.
 
 
-    clarity = pick("clarity")
-    sharpness = pick("sharpness")
+    # 선명감·선명도는 트렌드 방향 + 피사체 방향을 더한 뒤 트렌드 상한으로 묶는다.
+    # 상한이 없으면 음식(0.25/0.22)·풍경(0.18/0.12) 레시피가 필름 룩을 쨍한
+    # HDR로 덮어쓴다. 음식은 질감이 맛이라 상한을 조금 풀어 준다.
+    texture_bonus = float(subject_recipe.get("texture_bonus", 0.0))
+    clarity = min(
+        float(recipe.get("clarity", 0.0)) + float(subject_recipe.get("clarity", 0.0)),
+        float(recipe.get("clarity_cap", 0.25)) + texture_bonus,
+    )
+    sharpness = min(
+        float(recipe.get("sharpness", 0.0)) + float(subject_recipe.get("sharpness", 0.0)),
+        float(recipe.get("sharpness_cap", 0.25)) + texture_bonus,
+    )
+    # 비네팅은 스타일의 일부인 트렌드(플래시·시네마틱)가 피사체 값보다 약해지지 않게
     vignette = pick("vignette")
+    if "vignette" in recipe:
+        vignette = max(float(recipe["vignette"]), vignette) if recipe["vignette"] > 0 else float(recipe["vignette"])
 
     # 흰 배경 사진에 비네팅을 얹으면 모서리의 흰색이 회색으로 죽는다.
     # 스튜디오 흰 배경·흰 벽에서는 스타일이 아니라 렌즈 결함처럼 보인다.
@@ -561,7 +712,8 @@ def build_params_with_comment(
 
     # 이미 흐린 사진이면 선명도를 올리고, 충분히 선명하면 건드리지 않는다
     if stats["sharpness"] < 0.25:
-        sharpness += 0.15
+        # 초점 결함 교정은 취향과 별개지만, 필름 계열에서는 반만 — 그레인이 얹히므로
+        sharpness += 0.15 if "sharpness_cap" not in recipe else 0.08
     elif stats["sharpness"] > 0.75:
         sharpness = min(sharpness, 0.05)
 
@@ -613,18 +765,21 @@ def build_params_with_comment(
     if vignette_pref != "auto":
         vignette = _VIGNETTE_LEVELS.get(vignette_pref, 0.0)
 
-    tone_preset, tone_strength = subject_recipe.get(
-        "tone_curve", recipe.get("tone_curve", ("linear", 0.0))
+    # 톤 커브는 트렌드(또는 기본 레시피)가 정한다 — 피사체보다 스타일이 상위다.
+    tone_preset, tone_strength = recipe.get(
+        "tone_curve", subject_recipe.get("tone_curve", ("linear", 0.0))
     )
-    # 트렌드가 톤 커브를 지정했으면 트렌드를 우선한다 (피사체보다 스타일이 상위)
-    if "tone_curve" in recipe and trend in _TREND_RECIPES:
-        tone_preset, tone_strength = recipe["tone_curve"]
 
     # 레퍼런스가 있으면 프리셋 대신 그 사람 사진의 밝기 분포를 따라간다.
     # 프리셋은 "필름이면 이런 곡선"이라는 일반론이고, 이쪽은 그 사람의 실제 곡선이다.
     tone_points = build_reference_tone_curve(img, reference, 0.45 * gain)
     if tone_points:
         tone_preset, tone_strength = "reference", 1.0
+
+    # 흑백: 레퍼런스 곡선은 컬러 사진의 밝기 분포라 흑백 커브를 대신하지 않는다
+    if mono and tone_points:
+        tone_points = None
+        tone_preset, tone_strength = recipe["tone_curve"]
 
     split = recipe.get("split") or {}
     shadow_hue, shadow_str = split.get("shadow", (0, 0.0))
@@ -690,9 +845,21 @@ def build_params_with_comment(
         },
     }
 
+    # 흑백: 채도를 끝까지 빼서(−1.0) 완전한 무채색으로 만든다. 게인을 곱하면
+    # −0.8이 되어 색이 20% 남는다. 색온도·화이트밸런스·스플릿은 흑백에서 의미가 없고,
+    # 남겨 두면 흑백 위에 색을 다시 칠한다 (HSL은 회색 화소를 빨강으로 본다).
+    if mono and gain > 0.0:
+        params["saturation"] = -1.0
+        params["temperature"] = 0.0
+        params["auto_wb"] = 0.0
+        params["splitToning"] = {
+            "shadow": {"hue": 0, "strength": 0.0},
+            "highlight": {"hue": 0, "strength": 0.0},
+        }
+
     # 색계열별 조정은 측정으로 나오지 않는 판단이라 모델 값을 그대로 쓴다.
     # 없으면 키를 넣지 않는다 — analysis_to_transform_params가 None으로 본다.
-    hsl = _clamp_hsl(analysis.get("hslAdjust"), gain)
+    hsl = None if mono else _clamp_hsl(analysis.get("hslAdjust"), gain)
     if hsl:
         params["hslAdjust"] = hsl
         log.info("param_engine: hslAdjust from model — %s", list(hsl.keys()))
@@ -710,8 +877,8 @@ def build_params_with_comment(
         params["reshapeParams"] = _clamp_reshape(reshape)
 
     log.info(
-        "param_engine: subject=%s trend=%s gain=%.2f | measured b=%.2f c=%.2f s=%.2f w=%.2f haze=%.2f sharp=%.2f",
-        subject or "-", trend or "-", gain,
+        "param_engine: subject=%s trend=%s source=%s gain=%.2f | measured b=%.2f c=%.2f s=%.2f w=%.2f haze=%.2f sharp=%.2f",
+        subject or "-", trend or "default", profile.get("styleSource") or "-", gain,
         stats["brightness"], stats["contrast"], stats["saturation"],
         stats["warmth"], stats["haze"], stats["sharpness"],
     )
@@ -835,14 +1002,25 @@ _TREND_LABELS = {
     "bright_airy": "밝은 감성",
     "golden_hour": "골든아워",
     "clean_minimal": "클린 미니멀",
+    "flash_digicam": "플래시 스냅",
+    "soft_pastel": "소프트 파스텔",
+    "bw_grain": "흑백 필름",
 }
 
+# 트렌드 없이 기본 레시피를 탔을 때의 이름
+_DEFAULT_LABEL = "소프트 필름"
+
+# 모든 라벨이 모음으로 끝난다 — 조사를 "와/를"로 고정해 쓴다 (describe_params)
 _CURVE_LABELS = {
     "film": "필름 커브",
     "s_curve": "S커브",
     "fade": "페이드",
     "high_contrast": "강한 대비 커브",
     "bright": "밝은 커브",
+    "soft_film": "부드러운 필름 커브",
+    "flash": "플래시 커브",
+    "pastel": "파스텔 커브",
+    "bw": "흑백 커브",
 }
 
 
@@ -862,6 +1040,9 @@ def describe_params(
         return "보정 없음 설정이라 원본 톤을 그대로 두었어요"
 
     is_portrait = subject == "인물" and params["skin_smoothing"] >= 0.1
+    mono = params["saturation"] <= -0.99
+    recipe = _TREND_RECIPES.get(trend, _DEFAULT_RECIPE)
+    hazy_only = recipe.get("crush_blacks", "always") == "hazy"
 
     # ── 측정에서 나온 이유 (눈에 띄는 것부터) ──
     reasons: list[str] = []
@@ -876,48 +1057,67 @@ def describe_params(
     elif params["shadows"] >= 0.10:
         reasons.append("뭉친 어두운 부분을 살리고")
     elif params["shadows"] <= -0.10:
-        # 바닥이 떠 있는 사진 — 검정을 되찾아 주면 깊이가 산다
-        reasons.append("떠 있는 검정을 눌러 깊이를 주고")
+        if hazy_only:
+            # 필름 계열은 뿌연 사진에서만 바닥을 누른다 ([haze_flatness])
+            reasons.append("뿌옇게 뜬 바닥을 살짝 눌러 또렷하게 하고")
+        else:
+            reasons.append("떠 있는 검정을 눌러 깊이를 주고")
     elif params["dehaze"] >= 0.10:
         reasons.append("뿌연 기운을 걷어내고")
     elif params["contrast"] >= 0.15:
         reasons.append("밋밋한 대비를 세우고")
-    elif params["contrast"] <= -0.15:
-        reasons.append("센 대비를 부드럽게 눌러")
+    elif params["contrast"] <= -0.10:
+        reasons.append("센 대비를 부드럽게 풀고")
     elif params["sharpness"] >= 0.12 and stats["sharpness"] < 0.3:
         reasons.append("흐린 초점을 다듬고")
-    elif params["saturation"] <= -0.12:
+    elif not mono and params["saturation"] <= -0.12:
         reasons.append("과한 채도를 덜어내고")
-    elif params["saturation"] >= 0.12:
+    elif not mono and params["saturation"] >= 0.12:
         reasons.append("빠진 색을 채우고")
+
+    if mono:
+        # 흑백 전환이 가장 큰 변화다 — 맨 앞에 둔다
+        reasons.insert(0, "흑백으로 옮기고")
 
     # 인물이면 피부 문장이 뒤에 붙으므로 이유는 하나만 남겨 길이를 맞춘다
     reasons = reasons[: 1 if is_portrait else 2]
 
     # ── 스타일 마무리 ──
-    trend_label = _TREND_LABELS.get(trend)
+    trend_label = _TREND_LABELS.get(trend) or (_DEFAULT_LABEL if trend not in _TREND_RECIPES else None)
     lead = f"{trend_label} 톤에 맞춰 " if trend_label else ""
 
-    if params["temperature"] >= 0.12:
-        warm_adj, warm_adv = "따뜻한", "따뜻하게"
-    elif params["temperature"] <= -0.12:
-        warm_adj, warm_adv = "차가운", "차갑게"
-    else:
-        warm_adj = warm_adv = ""
+    warm_adj = warm_adv = ""
+    if not mono:
+        if params["temperature"] >= 0.12:
+            warm_adj, warm_adv = "따뜻한", "따뜻하게"
+        elif params["temperature"] <= -0.08:
+            warm_adj, warm_adv = "깨끗하고 차가운", "차갑게"
 
     curve = _CURVE_LABELS.get(params["toneCurve"]["preset"])
     if params["toneCurve"]["strength"] < 0.15:
         curve = None
+    grain_val = params.get("grain", 0.0)
+    grain = "필름 그레인" if grain_val >= 0.18 else "고운 그레인" if grain_val >= 0.07 else None
 
-    if curve and warm_adj:
-        # "따뜻한 강한 대비 커브"처럼 수식이 세 마디 이상 겹칠 때만 쉼표로 끊는다
-        tail = (
-            f"{lead}{warm_adv}, {curve}를 얹었어요"
-            if curve.count(" ") >= 2
-            else f"{lead}{warm_adj} {curve}를 얹었어요"
-        )
+    # 목적어: "커브와 그레인을" / "커브를" / "그레인을" (라벨은 모두 모음·ㄴ 받침으로 끝남)
+    if curve and grain:
+        obj = f"{curve}와 {grain}을"
     elif curve:
-        tail = f"{lead}{curve}를 얹었어요"
+        obj = f"{curve}를"
+    elif grain:
+        obj = f"{grain}을"
+    else:
+        obj = ""
+
+    if obj and warm_adj:
+        # 수식이 길게 겹치면 부사로 떼어 낸다 ("따뜻하게, 부드러운 필름 커브와 …")
+        tail = (
+            f"{lead}{warm_adv}, {obj} 얹었어요"
+            if obj.count(" ") >= 2 or " " in warm_adj
+            else f"{lead}{warm_adj} {obj} 얹었어요"
+        )
+    elif obj:
+        tail = f"{lead}{obj} 얹었어요"
     elif warm_adv:
         tail = f"{lead}{warm_adv} 맞췄어요" if lead else f"{warm_adv} 톤을 맞췄어요"
     elif lead:
