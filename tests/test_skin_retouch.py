@@ -320,7 +320,7 @@ def test_피부_보정_토글이_분석_경로까지_전달된다(monkeypatch):
     seen = {}
 
     def fake_build(img, profile, analysis, reference=None, reshape_enabled=False,
-                   skin_retouch_enabled=True):
+                   skin_retouch_enabled=True, **_kw):
         seen["skin"] = skin_retouch_enabled
         raise RuntimeError("stop")
 

@@ -35,9 +35,13 @@ TONE_CURVE_PRESETS: dict[str, list[tuple[float, float]]] = {
     # 정면 플래시 스냅: 중간~밝은 톤을 세워 피사체가 튀어나오고, 바닥은 그대로 깊다.
     "flash": [(0, 0), (0.25, 0.20), (0.5, 0.53), (0.75, 0.84), (1, 1)],
     # 소프트 파스텔: 바닥을 크게 띄우고 전체를 밝은 쪽으로 눌러 담는다 (저대비).
-    "pastel": [(0, 0.10), (0.25, 0.32), (0.5, 0.575), (0.75, 0.795), (1, 0.955)],
+    # 바닥은 덜 띄우고(0.10 → 0.065) 흰색 끝은 거의 그대로(0.975) — 예전 0.955는 대비 감소와 겹쳐 흰색이 회색(p99 83)이 됐다.
+    "pastel": [(0, 0.065), (0.25, 0.30), (0.5, 0.575), (0.75, 0.805), (1, 0.975)],
     # 흑백 그레인: 필름 인화 같은 적당한 대비, 검정·흰색 끝만 살짝 접는다.
     "bw": [(0, 0.035), (0.25, 0.21), (0.5, 0.50), (0.75, 0.80), (1, 0.975)],
+    # 한국 감성: 바닥만 띄우고(바랜 검정) 중간톤을 살짝 밝힌다. 흰색은 거의 그대로 —
+    # "fade"처럼 흰색까지 누르면 양 끝이 같이 눌려 회색 필름이 된다.
+    "gamsung": [(0, 0.085), (0.25, 0.34), (0.5, 0.585), (0.75, 0.805), (1, 0.98)],
 }
 
 # saturation이 이 값 이하면 "흑백 변환"으로 본다 (채도를 끝까지 뺀 것).
@@ -45,7 +49,9 @@ _MONO_SATURATION = -0.99
 # 흑백 변환의 색→밝기 믹스 (LAB a·b 편차 → L 가산).
 # 채널 평균으로 뽑으면 피부가 칙칙해진다. 흑백 필름에 옅은 주황 필터를 끼운 것처럼
 # 따뜻한 색(피부·입술)은 살짝 밝게, 파랑(하늘)은 살짝 어둡게 옮긴다.
-_MONO_MIX_A = 0.22
+# a 0.22일 때 붉은 피부가 밝기 보정과 겹쳐 얼굴이 분필처럼 하얘졌다 (a가 피부 쪽 축).
+# 하늘을 어둡게 누르는 b 쪽은 그대로 둔다.
+_MONO_MIX_A = 0.08
 _MONO_MIX_B = 0.14
 _MONO_MIX_LIMIT = 18.0
 
@@ -243,6 +249,28 @@ def _mp_pool_clear() -> None:
 
 # ── 요청 스코프 MediaPipe 캐시 ──
 
+# 얼굴 2차 감지 크롭 한 변 = 머리 크기(귀 사이)의 몇 배. 얼굴이 크롭의 1/4쯤 되어
+# 근거리 검출기가 잘 잡는다 (2.5~6배 모두 같은 결과 — 실측).
+_FACE_CROP_HEADS = 4.0
+
+
+class _MappedLandmark:
+    """크롭에서 찾은 얼굴 랜드마크를 전체 사진 정규화 좌표로 옮긴 것."""
+
+    __slots__ = ("x", "y", "z")
+
+    def __init__(self, x: float, y: float, z: float) -> None:
+        self.x, self.y, self.z = x, y, z
+
+
+class _MappedFaceResult:
+    """FaceLandmarkerResult와 같은 모양 (face_landmarks만 쓴다)."""
+
+    __slots__ = ("face_landmarks",)
+
+    def __init__(self, face_landmarks: list) -> None:
+        self.face_landmarks = face_landmarks
+
 
 class MediaPipeCache:
     """요청 단위로 MediaPipe 모델 인스턴스 + 랜드마크 결과를 캐시한다.
@@ -431,11 +459,85 @@ class MediaPipeCache:
             raise
 
         if not results.face_landmarks:
+            # 전신 사진: 얼굴 검출기가 사진 전체를 작은 입력으로 줄여 보므로
+            # 100px대 얼굴이 몇 화소로 뭉개져 놓친다 — 포즈의 머리 위치로 한 번 더 찾는다
+            results = self._detect_faces_near_pose(arr_rgb, landmarker)
+
+        if results is None or not results.face_landmarks:
             self._face_results_cache[key] = None
             return None
 
         self._face_results_cache[key] = results
         return results
+
+    def _detect_faces_near_pose(self, arr_rgb: np.ndarray, landmarker: Any) -> Any:
+        """포즈 머리 키포인트 주변을 잘라 얼굴을 다시 찾는다 (전신 사진용 2차 감지).
+
+        FaceLandmarker의 얼굴 검출기는 근거리용이라 입력 전체를 128px로 줄여 본다.
+        2560px 전신 사진의 폭 100~200px 얼굴은 거기서 5~10px라 못 찾는다
+        (실측: 우주인·거리 전신 4장 모두 0개). 포즈 모델은 같은 사진에서 코·귀를
+        잡으므로, 머리 크기의 4배 정사각형을 잘라 다시 돌리면 얼굴이 크롭의 1/4이
+        되어 잡힌다 (크롭당 ~7ms). 확대는 하지 않는다 — 모델이 어차피 내부 해상도로
+        다시 줄이므로 결과가 같다 (실측).
+
+        랜드마크는 전체 사진 기준 정규화 좌표로 되돌려 1차 결과와 같은 모양으로 준다.
+        질감 보정의 최소 얼굴 폭(_SKIN_MIN_FACE_PX)보다 작은 얼굴은 버린다 —
+        예전에도 다루지 않던 크기이고, 랜드마크 오차가 커서 워프·마스크가 번진다.
+        """
+        try:
+            pose = self.get_pose_landmarks(arr_rgb)
+        except Exception as exc:
+            log.warning("face second pass: pose detection failed: %s", exc)
+            return None
+        if pose is None:
+            return None
+
+        h, w = arr_rgb.shape[:2]
+        faces: list[list[_MappedLandmark]] = []
+        centers: list[tuple[float, float, float]] = []
+        for pl in pose.pose_landmarks:
+            if len(pl) < 13:
+                continue
+            ear = math.hypot((pl[7].x - pl[8].x) * w, (pl[7].y - pl[8].y) * h)
+            shoulder = math.hypot((pl[11].x - pl[12].x) * w, (pl[11].y - pl[12].y) * h)
+            # 귀 사이 ≈ 얼굴 폭. 고개를 돌리면 귀 거리가 줄어 어깨 폭으로 받친다.
+            head = max(ear, 0.45 * shoulder)
+            if head < 0.5 * _SKIN_MIN_FACE_PX:
+                continue
+            side = int(min(max(h, w), round(_FACE_CROP_HEADS * head)))
+            cx, cy = pl[0].x * w, pl[0].y * h
+            x0 = int(np.clip(round(cx - side / 2), 0, max(0, w - side)))
+            y0 = int(np.clip(round(cy - side / 2), 0, max(0, h - side)))
+            x1, y1 = min(w, x0 + side), min(h, y0 + side)
+            if x1 - x0 < 32 or y1 - y0 < 32:
+                continue
+            crop = np.ascontiguousarray(arr_rgb[y0:y1, x0:x1])
+            try:
+                res = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=crop))
+            except Exception:
+                self._discard_landmarker("face")
+                raise
+            cw, ch = x1 - x0, y1 - y0
+            for lms in res.face_landmarks or []:
+                mapped = [
+                    _MappedLandmark((x0 + lm.x * cw) / w, (y0 + lm.y * ch) / h, lm.z)
+                    for lm in lms
+                ]
+                if len(mapped) <= 454:
+                    continue
+                face_w = abs(mapped[454].x - mapped[234].x) * w
+                if face_w < _SKIN_MIN_FACE_PX:
+                    continue
+                fx, fy = mapped[1].x * w, mapped[1].y * h
+                # 포즈가 여럿이면 크롭이 겹쳐 같은 얼굴을 두 번 잡을 수 있다
+                if any(math.hypot(fx - px, fy - py) < 0.5 * pw for px, py, pw in centers):
+                    continue
+                centers.append((fx, fy, face_w))
+                faces.append(mapped)
+        if not faces:
+            return None
+        log.info("face second pass: %d face(s) found near pose keypoints", len(faces))
+        return _MappedFaceResult(faces)
 
     def get_pose_landmarks(self, arr_rgb: np.ndarray) -> Any:
         """포즈 랜드마크 감지 결과를 캐시에서 반환하거나 새로 감지한다.
@@ -620,9 +722,51 @@ def vivid_blue_weight(rgb: np.ndarray) -> np.ndarray:
     캐스트까지 하늘로 오인하지 않게 −14부터 올려 −28에서 1이 되게 둔다.
     """
     lab = cv2.cvtColor(np.clip(rgb, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-    blue = np.clip((128.0 - lab[..., 2] - _SKY_B_START) / _SKY_B_RAMP, 0.0, 1.0)
-    bright = np.clip((lab[..., 0] - 80.0) / 50.0, 0.0, 1.0)
+    return _sky_color_weight(lab[..., 0], lab[..., 2])
+
+
+def _sky_color_weight(l8: np.ndarray, b8: np.ndarray) -> np.ndarray:
+    """vivid_blue_weight의 본체 — LAB 8비트 눈금의 L·b 채널에서 바로 계산한다."""
+    blue = np.clip((128.0 - b8 - _SKY_B_START) / _SKY_B_RAMP, 0.0, 1.0)
+    bright = np.clip((l8 - 80.0) / 50.0, 0.0, 1.0)
     return (blue * bright).astype(np.float32)
+
+
+def _sky_region_prior(color_w: np.ndarray) -> np.ndarray:
+    """하늘색 화소 중 '하늘 자리'에 있는 덩어리만 1에 가까운 부드러운 지도 (0~1).
+
+    색만 보면 파란 셔츠·간판·수영장도 하늘로 잡혀, 채도를 −0.95로 내려도 파란 옷만
+    색이 남는 부분 컬러 사진이 됐다. 보정을 '덜 거는' 쪽의 보호(화이트밸런스·웜톤·
+    채도 감소)는 실제 하늘에만 준다 — detect_regions와 같은 기준으로
+    (_keep_sky_like_components: 윗변이 상단 15% 안, 폭 15% 이상) 축소본에서 거른다.
+    조명 추정 쪽(estimate_illuminant·measure_image_stats)은 일부러 색만 본다:
+    거기서는 선명한 파랑을 '조명이 아니라 장면의 색'으로 빼는 것이라, 옷이든
+    하늘이든 빼는 게 맞다.
+    """
+    h, w = color_w.shape[:2]
+    scale = min(1.0, _SKY_PRIOR_SIDE / max(h, w))
+    sw, sh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    small = cv2.resize(color_w, (sw, sh), interpolation=cv2.INTER_AREA)
+    mask = (small > 0.25).astype(np.uint8) * 255
+    # 구름 사이로 끊긴 하늘 조각을 잇는다
+    k = max(3, int(round(max(sw, sh) * 0.03)) | 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    mask = _keep_sky_like_components(mask)
+    if not mask.any():
+        return np.zeros((h, w), np.float32)
+    # 경계는 부드럽게 (가장자리 화소는 색 가중치가 다시 한번 거른다)
+    prior = cv2.GaussianBlur(cv2.dilate(mask, np.ones((3, 3), np.uint8)).astype(np.float32) / 255.0,
+                             (0, 0), 1.0)
+    return cv2.resize(prior, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def sky_protect_weight(l8: np.ndarray, b8: np.ndarray) -> np.ndarray:
+    """보정을 약하게 걸 '실제 하늘' 가중치 (0~1). LAB 8비트 눈금의 L·b 채널."""
+    color_w = _sky_color_weight(l8, b8)
+    if not (color_w > 0.25).any():
+        return color_w
+    return color_w * _sky_region_prior(color_w)
 
 
 _SKY_B_START = 14.0        # 128 − b(8비트 눈금)가 이만큼부터 하늘로 보기 시작
@@ -632,6 +776,58 @@ _SKY_B_RAMP = 14.0
 _SKY_WB_KEEP = 0.2          # 화이트밸런스: 하늘은 20%만
 _SKY_WARM_KEEP = 0.3        # 웜톤(양수 temperature): 30%만
 _SKY_DESAT_KEEP = 0.4       # 채도 낮추기(음수 saturation): 40%만
+# 채도를 이만큼보다 더 내리면 하늘 보호를 줄여 흑백 직전(−0.99)에 0으로 만든다.
+# 강한 탈색은 사용자의 의도라, 하늘만 색이 남으면 부분 컬러처럼 보이고 −1.0(흑백)과
+# 사이에 단절이 생겼다 (실측: −0.95에서 파랑 C 66→22, 다른 색은 3.6).
+_SKY_DESAT_FADE_FROM = -0.5
+_SKY_PRIOR_SIDE = 256       # 하늘 위치 판단용 축소본의 긴 변
+
+
+# 조명(캐스트) 측정에 쓸 화소의 가중치 — 밝기 대비 채도 C*/(L*+10)가 이 구간에서
+# 1 → 0으로 줄어든다. 곱셈형 캐스트는 회색 면의 채도를 밝기에 비례해 올리므로
+# 이 비가 거의 일정하다: 형광등 푸름(×0.85/0.95/1.1) 0.2, 백열등 누렁(×1.15/1/0.72)
+# 0.4, 아주 센 백열등(×1.25/1/0.6) 0.6. 옷·소품의 원색은 1 안팎이다
+# (코랄 재킷 ≈1.0, 어두운 남색 수트 ≈1.0~1.4).
+_CAST_CHROMA_FULL, _CAST_CHROMA_ZERO = 0.45, 0.80
+# 피부색 화소(LAB 색상각 약 20~65°, a* 양수)도 뺀다. 조명이 흰색이어도 피부는
+# 붉고 노랗다 — 인물이 크면 그것만으로 '따뜻한 캐스트'가 잡혀 피부를 식혔다.
+# 백열등에 물든 회색은 색상각 70~90°(노랑 쪽)라 여기 걸리지 않는다.
+_SKIN_HUE_LO, _SKIN_HUE_HI, _SKIN_HUE_RAMP = 20.0, 65.0, 8.0
+# 남는 가중치 합이 화면의 이 비율보다 작으면(온통 원색인 사진) 예전 방식(하늘만 제외)에 섞는다.
+_CAST_MIN_COVER = 0.15
+
+
+def cast_pixel_weight(rgb: np.ndarray) -> np.ndarray:
+    """조명 색을 읽을 만한 화소일수록 1 (0~1, float32). rgb: HxWx3, 0~255.
+
+    화이트밸런스·웜니스·캐스트 고름은 '회색이어야 할 면이 얼마나 물들었나'로
+    재야 한다. 원색 옷·소품·피부·하늘은 장면의 색이지 조명의 색이 아니다.
+    실측: 코랄 재킷이 화면 1/3인 인물(원본 피부 a* 13.8 b* 15.4)이 warmth 0.59·
+    고름 0.85로 읽혀 flash_digicam에서 auto_wb 0.77 + temperature −0.33이 걸리고
+    피부가 a* −3.5(청록)가 됐다. 파란 배경은 하늘로 빠지는데 붉은 옷은 그대로
+    남아 따뜻한 쪽으로만 치우쳤다.
+    """
+    rgb8 = np.clip(rgb, 0, 255).astype(np.uint8)
+    lab = cv2.cvtColor(rgb8, cv2.COLOR_RGB2LAB).astype(np.float32)
+    a, b = lab[..., 1] - 128.0, lab[..., 2] - 128.0
+    chroma = np.hypot(a, b)
+    rel = chroma / (lab[..., 0] * (100.0 / 255.0) + 10.0)
+    neutral = np.clip((_CAST_CHROMA_ZERO - rel) / (_CAST_CHROMA_ZERO - _CAST_CHROMA_FULL), 0.0, 1.0)
+    hue = np.degrees(np.arctan2(b, a))
+    in_hue = (np.clip((hue - (_SKIN_HUE_LO - _SKIN_HUE_RAMP)) / _SKIN_HUE_RAMP, 0.0, 1.0)
+              * np.clip(((_SKIN_HUE_HI + _SKIN_HUE_RAMP) - hue) / _SKIN_HUE_RAMP, 0.0, 1.0))
+    skin = in_hue * np.clip((a - 4.0) / 4.0, 0.0, 1.0) * np.clip((chroma - 8.0) / 6.0, 0.0, 1.0)
+    weight = neutral * (1.0 - skin)
+    sky = vivid_blue_weight(rgb)
+    weight *= (sky < 0.5)
+    cover = float(weight.mean())
+    if cover < _CAST_MIN_COVER:
+        fallback = (sky < 0.5).astype(np.float32)
+        if fallback.mean() < 0.2:
+            fallback = np.ones_like(fallback)
+        mix = cover / _CAST_MIN_COVER
+        weight = weight * mix + fallback * (1.0 - mix)
+    return weight.astype(np.float32)
 
 
 def estimate_illuminant(img: Image.Image) -> tuple[float, float, float]:
@@ -640,6 +836,7 @@ def estimate_illuminant(img: Image.Image) -> tuple[float, float, float]:
     Shades-of-Gray (Minkowski p=6) — 순수 Gray World는 한 색이 넓게 깔린
     사진(잔디밭, 파란 하늘)에서 그 색을 회색으로 만들어 버리는데,
     p-노름을 쓰면 밝은 픽셀에 가중이 실려 그 실패가 완화된다.
+    원색·피부·하늘 화소는 [cast_pixel_weight]로 덜어 낸다.
     """
     small = img.convert("RGB")
     w, h = small.size
@@ -650,11 +847,13 @@ def estimate_illuminant(img: Image.Image) -> tuple[float, float, float]:
     arr = np.asarray(small, dtype=np.float32) / 255.0
     # 선명한 하늘색 화소는 조명 색이 아니라 장면의 색이다 — 추정에서 뺀다
     # (남는 화소가 너무 적으면 전체로 추정).
-    keep = vivid_blue_weight(arr * 255.0) < 0.5
-    pix = arr[keep] if keep.mean() > 0.2 else arr.reshape(-1, 3)
+    # 원색 옷·소품·피부도 조명 색이 아니다 — 가중치로 덜어 낸다.
+    wt = cast_pixel_weight(arr * 255.0).reshape(-1)
+    pix = arr.reshape(-1, 3)
+    wsum = max(float(wt.sum()), 1e-6)
     p = 6.0
     norms = np.array([
-        (np.power(pix[:, c], p).mean()) ** (1.0 / p) for c in range(3)
+        (float((np.power(pix[:, c], p) * wt).sum()) / wsum) ** (1.0 / p) for c in range(3)
     ])
     norms[norms < 1e-6] = 1e-6
 
@@ -686,7 +885,8 @@ def apply_auto_white_balance(img: Image.Image, strength: float) -> Image.Image:
 
     arr = np.asarray(img.convert("RGB"), dtype=np.float32)
     # 하늘색 화소는 게인을 조금만 건다 — 파란 하늘이 회색으로 빠지지 않게
-    keep = 1.0 - (1.0 - _SKY_WB_KEEP) * vivid_blue_weight(arr)
+    lab8 = cv2.cvtColor(np.clip(arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    keep = 1.0 - (1.0 - _SKY_WB_KEEP) * sky_protect_weight(lab8[..., 0], lab8[..., 2])
     for c, g in enumerate(gains):
         arr[..., c] *= 1.0 + (g - 1.0) * keep
 
@@ -1322,6 +1522,10 @@ def _from_lab8f(lab: np.ndarray) -> Image.Image:
     return _rgb_image(cv2.cvtColor(cv2.transform(lab, _LAB8_INV), cv2.COLOR_LAB2RGB))
 
 
+# 스플릿 토닝 쉐도우 색이 이 L(8비트) 아래에서 0으로 줄어든다
+_SPLIT_BLACK_TAPER = 28.0
+
+
 def apply_split_toning(
     img: Image.Image,
     shadow_hue: float = 0.0,
@@ -1362,6 +1566,9 @@ def apply_split_toning(
     # 쉐도우 처리 (L < 128 영역, 부드러운 그라데이션)
     if shadow_strength >= 0.01:
         shadow_mask = np.clip((128.0 - l_ch) / 128.0, 0.0, 1.0)
+        # 가장 깊은 검정은 중립으로 남긴다 — 인화지의 검정은 물들지 않는다.
+        # 없으면 검은 배경·야경 하늘이 통째로 청록·분홍 판이 된다 (마스크가 L=0에서 최대).
+        shadow_mask = shadow_mask * np.clip(l_ch / _SPLIT_BLACK_TAPER, 0.0, 1.0)
         a_s, b_s = _hue_to_ab_shift(shadow_hue)
         intensity_s = shadow_strength * 25.0  # 최대 A/B 시프트 25
         a_ch = a_ch + a_s * intensity_s * shadow_mask
@@ -1516,7 +1723,7 @@ def apply_vignette(img: Image.Image, intensity: float) -> Image.Image:
     return _from_lab8f(lab)
 
 
-# 그레인·샤픈의 기준 해상도.
+# 샤픈의 기준 해상도 (그레인은 아래 _GRAIN_FEED_BOX — 피드 크기 기준).
 #
 # 앱은 미리보기를 800px, 저장을 2560px로 렌더한다. 효과의 크기를 화소 단위로
 # 고정하면 2560px에서 만든 것은 화면에 맞게 줄이는 순간 평균되어 사라진다 —
@@ -1525,22 +1732,88 @@ def apply_vignette(img: Image.Image, intensity: float) -> Image.Image:
 _EFFECT_REFERENCE_PX = 800
 
 
+# 그레인은 인스타그램 피드 크기에서 보이는 양으로 정한다.
+#
+# 예전 그레인은 800px 기준 1화소 노이즈를 늘려 붙였다. 2560px 저장본에서 알갱이가
+# 피드 화소(1080px)보다 커서, 폰으로 줄여 보면 진폭이 100% 보기와 같거나 더 컸다
+# (실측 평탄 배경 고주파 편차: 원본 0.4, 기본 4.3, cinematic 6.7, bw 7.1 레벨) —
+# 맑은 하늘과 피부가 지저분해 보이고 스무딩을 덮었다. 실제 필름을 피드 크기로
+# 줄이면 알갱이는 화소보다 작아 대부분 평균되고 고운 결만 남는다.
+#
+# 그래서: 알갱이는 피드 화소의 1/_GRAIN_FEED_OVERSAMPLE 크기로 만들고(100%로
+# 확대하면 보이고 피드에서는 곱다), 진폭은 사진을 피드 크기로 줄였을 때의
+# 편차가 _GRAIN_FEED_SIGMA × intensity^_GRAIN_GAMMA가 되도록 맞춘다. 미리보기처럼
+# 피드보다 작은 사진은 그 크기에서 맞춘다 — 폰 화면에서 보는 양이 같다.
+_GRAIN_FEED_BOX = (1080, 1440)     # 인스타그램 피드 표시 상한 (가로, 세로)
+_GRAIN_FEED_OVERSAMPLE = 1.5       # 피드 화소 하나에 알갱이 1.5개
+_GRAIN_FEED_SIGMA = 46.0           # intensity 1.0일 때 피드 크기 편차 (밝기 레벨)
+_GRAIN_GAMMA = 1.5                 # 낮은 값은 더 곱게, 흑백 그레인은 또렷하게
+_GRAIN_SKIN_CUT = 0.5              # 피부 위 그레인 감쇠
+_GRAIN_SKY_CUT = 0.45              # 매끈한 하늘 위 그레인 감쇠
+
+
+def _ramp(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """lo에서 0, hi에서 1로 선형 변화 (lo > hi면 감소)."""
+    return np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+
+
+def _grain_protect_mask(small_rgb: np.ndarray) -> np.ndarray:
+    """피드 크기 사진에서 그레인을 덜 줄 곳(피부·매끈한 하늘)의 감쇠량 0~1.
+
+    - 피부: Lab 피부색 범위 (얼굴 감지 없이 — 전신 사진의 작은 얼굴·팔도 잡는다).
+    - 하늘: 프레임 위쪽의 매끈한 파란색 또는 밝은 무채색(구름) 면.
+    흑백 사진에는 걸지 않는다 — 색으로 가를 수 없고, 흑백 그레인은 스타일이다.
+    """
+    f = small_rgb.astype(np.float32)
+    chroma = np.abs(f[..., 0] - f[..., 1]) + np.abs(f[..., 1] - f[..., 2])
+    if float(chroma.mean()) < 2.0:
+        return np.zeros(small_rgb.shape[:2], np.float32)
+
+    # 피부: 주황 계열 색상각(25~70°)에 채도가 낮은~중간 — 코랄 옷처럼 짙은 색은 뺀다
+    lab = cv2.cvtColor(small_rgb.astype(np.float32) / 255.0, cv2.COLOR_RGB2Lab)
+    lum, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    hue_deg = np.degrees(np.arctan2(b, a))
+    chroma_ab = np.hypot(a, b)
+    skin = (_ramp(hue_deg, 18, 28) * _ramp(hue_deg, 75, 65)
+            * _ramp(chroma_ab, 6, 12) * _ramp(chroma_ab, 45, 36)
+            * _ramp(lum, 20, 32) * _ramp(lum, 95, 88))
+
+    hsv = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    hue, sat, val = hsv[..., 0], hsv[..., 1] / 255.0, hsv[..., 2] / 255.0
+    blue = _ramp(hue, 85, 95) * _ramp(hue, 138, 128) * _ramp(sat, 0.06, 0.16) * _ramp(val, 0.30, 0.45)
+    cloud = _ramp(lum, 60, 72) * _ramp(sat, 0.20, 0.10)
+    y = lum * 2.55
+    local_sd = np.sqrt(np.maximum(
+        cv2.GaussianBlur(y * y, (0, 0), 3) - cv2.GaussianBlur(y, (0, 0), 3) ** 2, 0.0))
+    smooth = _ramp(local_sd, 6.0, 2.0)
+    h = small_rgb.shape[0]
+    top = _ramp(np.arange(h, dtype=np.float32) / max(1, h - 1), 0.75, 0.45)[:, None]
+    sky = np.maximum(blue, cloud) * smooth * top
+
+    cut = np.maximum(_GRAIN_SKIN_CUT * skin, _GRAIN_SKY_CUT * sky)
+    return cv2.GaussianBlur(cut, (0, 0), 1.5)
+
+
 def apply_grain(img: Image.Image, intensity: float) -> Image.Image:
     """필름 그레인 효과. intensity: 0.0(없음) ~ 1.0(강한 노이즈).
 
-    밝기 채널에만 모노크롬 노이즈를 추가하여 자연스러운 필름 느낌을 만든다.
-    알갱이 크기는 해상도에 비례해 미리보기와 저장본의 체감을 맞춘다.
+    밝기에만 무채색 노이즈를 더한다. 알갱이 크기·진폭은 인스타그램 피드
+    크기(가로 1080px)에서 정한다 ([_GRAIN_FEED_BOX] 주석). 필름처럼 중간톤에서
+    가장 강하고 하이라이트·깊은 그림자에서 약하며, 피부와 매끈한 하늘에서는 덜하다.
     """
     if intensity < 0.01:
         return img
 
     arr = np.array(img, dtype=np.float32)
     h, w = arr.shape[:2]
-    sigma_target = intensity * 40.0   # 최대 40 밝기값 편차
+    sigma_target = _GRAIN_FEED_SIGMA * min(1.0, intensity) ** _GRAIN_GAMMA
 
-    # 기준 해상도에서 1화소짜리 노이즈를 만들고 원본 크기로 늘린다.
-    scale = max(1.0, min(h, w) / _EFFECT_REFERENCE_PX)
-    nh, nw = max(1, int(round(h / scale))), max(1, int(round(w / scale)))
+    # 피드에 보일 크기 (피드보다 작은 사진은 그대로)
+    fit = min(1.0, _GRAIN_FEED_BOX[0] / w, _GRAIN_FEED_BOX[1] / h)
+    dw, dh = max(1, int(round(w * fit))), max(1, int(round(h * fit)))
+    # 알갱이 격자: 피드 화소보다 촘촘하게, 단 사진 화소보다 촘촘할 수는 없다
+    nw = min(w, max(1, int(round(dw * _GRAIN_FEED_OVERSAMPLE))))
+    nh = min(h, max(1, int(round(dh * _GRAIN_FEED_OVERSAMPLE))))
 
     # 씨앗을 사진에서 끌어온다. 무작위로 두면 같은 사진을 두 번 렌더할 때마다
     # 그레인이 달라져 미리보기와 저장본이 절대 일치하지 않는다.
@@ -1549,25 +1822,28 @@ def apply_grain(img: Image.Image, intensity: float) -> Image.Image:
         + arr[::max(1, h // 16), ::max(1, w // 16)].astype(np.uint8).tobytes(),
         usedforsecurity=False,
     ).hexdigest()[:8]
-    noise = np.random.default_rng(int(digest, 16)).normal(
-        0.0, sigma_target, (nh, nw)
-    ).astype(np.float32)
-
+    noise = np.random.default_rng(int(digest, 16)).standard_normal((nh, nw)).astype(np.float32)
     if (nh, nw) != (h, w):
-        noise = cv2.resize(noise, (w, h), interpolation=cv2.INTER_LINEAR)
-        # 확대하면 이웃이 섞여 진폭이 줄어든다. 목표 편차로 되돌린다.
-        actual = float(noise.std())
-        if actual > 1e-6:
-            noise *= sigma_target / actual
+        noise = cv2.resize(noise, (w, h), interpolation=cv2.INTER_CUBIC)
 
-    noise = noise[:, :, np.newaxis]
+    # 진폭은 피드 크기로 줄였을 때의 편차로 맞춘다
+    feed = (dh, dw) != (h, w)
+    small_noise = cv2.resize(noise, (dw, dh), interpolation=cv2.INTER_AREA) if feed else noise
+    actual = float(small_noise.std())
+    if actual > 1e-6:
+        noise *= sigma_target / actual
 
-    # 밝은 영역보다 중간톤에 그레인이 더 잘 보이도록 가중치
-    gray = np.mean(arr, axis=2, keepdims=True) / 255.0
-    weight = 1.0 - np.abs(gray - 0.5) * 1.2  # 중간톤에서 최대
-    weight = np.clip(weight, 0.3, 1.0)
+    # 필름처럼 중간톤에서 가장 강하고 양 끝에서 약하게 (밝기 = Rec.601 luma)
+    luma = (arr[..., 0] * 0.299 + arr[..., 1] * 0.587 + arr[..., 2] * 0.114) / 255.0
+    weight = 0.15 + 0.85 * np.clip(4.0 * luma * (1.0 - luma), 0.0, 1.0)
 
-    adjusted = arr + noise * weight
+    small = cv2.resize(arr, (dw, dh), interpolation=cv2.INTER_AREA) if feed else arr
+    cut = _grain_protect_mask(np.clip(small, 0, 255).astype(np.uint8))
+    if feed:
+        cut = cv2.resize(cut, (w, h), interpolation=cv2.INTER_LINEAR)
+    weight *= 1.0 - cut
+
+    adjusted = arr + (noise * weight)[:, :, np.newaxis]
     adjusted = np.clip(adjusted, 0, 255)
 
     return Image.fromarray(adjusted.astype(np.uint8))
@@ -1935,6 +2211,23 @@ def _get_skin_faces(
             continue
         faces.append(_SkinFace(x0, y0, x1, y1, core, oval, guard, face_w))
     return faces
+
+
+def has_retouchable_face(img: Image.Image, cache: MediaPipeCache | None = None) -> bool:
+    """질감 보정(잡티·스무딩)이 실제로 걸릴 얼굴이 있는지 — 설명문이 피부를 말해도 되는지.
+
+    [_get_skin_faces]와 같은 기준(감지 + 최소 얼굴 폭)이다. 마스크는 만들지 않는다.
+    """
+    arr = np.ascontiguousarray(np.asarray(img.convert("RGB"), dtype=np.uint8))
+    point_sets = _face_point_sets(arr, cache=cache)
+    if not point_sets:
+        return False
+    for pt in point_sets:
+        oval = np.array([pt(i) for i in _SKIN_FACE_OVAL], dtype=np.int32)
+        face_w = abs(pt(454)[0] - pt(234)[0])
+        if min(face_w, cv2.boundingRect(oval)[2]) >= _SKIN_MIN_FACE_PX:
+            return True
+    return False
 
 
 def _hull_mask(pt, ids, h: int, w: int) -> np.ndarray:
@@ -4130,6 +4423,31 @@ def _soft_limit(x: np.ndarray, knee: float = _SOFT_KNEE) -> np.ndarray:
     return np.clip(y, 0.0, 255.0)
 
 
+# 채도 낮추기(음수 saturation)를 피부색 화소에는 이만큼 덜 건다 (0.5 → 절반만).
+# 뮤트 톤은 옷·배경을 가라앉히려는 것이지 피부의 혈색을 빼려는 게 아니다.
+# 실측: 기본 레시피 인물 전부 saturation −0.184가 걸려 피부 채도가 13~27% 빠지고
+# 가까운 얼굴(c2)·스튜디오 인물(meir)의 피부가 잿빛이 됐다. 흑백(−1.0)은 별도 경로라
+# 영향이 없다.
+_SKIN_DESAT_RELIEF = 0.5
+
+
+def _skin_tone_weight(l_ch: np.ndarray, a_ch: np.ndarray, b_ch: np.ndarray) -> np.ndarray:
+    """피부색일수록 1에 가까운 부드러운 가중치 (LAB 8비트 눈금, 0~1).
+
+    피부는 밝기·인종과 무관하게 LAB 색상각 약 30~80°(주황)에 채도 C* 10~35 안에 모인다.
+    색상각 55°를 중심으로 ±35°까지 부드럽게 줄이고, 거의 무채색(C*<4)·원색에 가까운
+    강한 주황(C*>50)·아주 어두운 화소는 뺀다. 얼굴 검출 없이 화소 단위로 계산한다.
+    """
+    a = a_ch - 128.0
+    b = b_ch - 128.0
+    chroma = np.hypot(a, b)
+    hue = np.degrees(np.arctan2(b, a))
+    hue_w = np.clip((1.0 - np.abs(hue - 55.0) / 35.0) * 1.6, 0.0, 1.0)
+    chroma_w = np.clip((chroma - 4.0) / 6.0, 0.0, 1.0) * np.clip((50.0 - chroma) / 12.0, 0.0, 1.0)
+    light_w = np.clip((l_ch - 40.0) / 40.0, 0.0, 1.0)
+    return (hue_w * chroma_w * light_w).astype(np.float32)
+
+
 def _apply_lab_adjustments(
     img: Image.Image,
     highlights: float = 0.0,
@@ -4275,9 +4593,8 @@ def _apply_lab_adjustments(
     # ── 8. Temperature (B 채널 + A 채널 미세 조정) ──
     sky_w = None
     if temperature >= 0.01 or (-0.99 < saturation <= -0.01):
-        # 하늘색 가중치 (LAB 8비트 눈금에서 바로 계산 — vivid_blue_weight와 같은 기준)
-        sky_w = (np.clip((128.0 - b_ch - _SKY_B_START) / _SKY_B_RAMP, 0.0, 1.0)
-                 * np.clip((l_ch - 80.0) / 50.0, 0.0, 1.0))
+        # 실제 하늘 가중치 (색 + 위치 — 파란 옷·간판은 보호하지 않는다)
+        sky_w = sky_protect_weight(l_ch, b_ch)
     if abs(temperature) >= 0.01:
         shift = temperature * 15.0
         if temperature > 0 and sky_w is not None:
@@ -4297,8 +4614,18 @@ def _apply_lab_adjustments(
     elif abs(saturation) >= 0.01:
         sat = saturation
         if saturation < 0 and sky_w is not None:
-            # 차분한 톤으로 채도를 낮춰도 하늘의 파랑은 덜 뺀다
-            sat = saturation * (1.0 - (1.0 - _SKY_DESAT_KEEP) * sky_w)
+            # 차분한 톤으로 채도를 낮춰도 하늘의 파랑은 덜 뺀다. 강한 탈색일수록 보호를
+            # 줄여 흑백 직전에 0 — 하늘만 색이 남거나 −1.0에서 뚝 끊기지 않게.
+            fade = float(np.clip((saturation - _MONO_SATURATION)
+                                 / (_SKY_DESAT_FADE_FROM - _MONO_SATURATION), 0.0, 1.0))
+            sat = saturation * (1.0 - (1.0 - _SKY_DESAT_KEEP) * fade * sky_w)
+        if saturation < 0:
+            # 피부의 혈색은 덜 뺀다 ([_skin_tone_weight]). 하늘과 같은 이유로 강한
+            # 탈색에서는 보호를 줄인다 — 피부만 색이 남는 부분 컬러가 되지 않게.
+            skin_fade = float(np.clip((saturation - _MONO_SATURATION)
+                                      / (_SKY_DESAT_FADE_FROM - _MONO_SATURATION), 0.0, 1.0))
+            sat = sat * (1.0 - _SKIN_DESAT_RELIEF * skin_fade
+                         * _skin_tone_weight(l_ch, a_ch, b_ch))
         a_ch = 128.0 + (a_ch - 128.0) * (1.0 + sat)
         b_ch = 128.0 + (b_ch - 128.0) * (1.0 + sat)
 

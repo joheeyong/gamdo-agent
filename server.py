@@ -66,6 +66,7 @@ from image_processor import (
     detect_regions,
     encode_image_base64,
     gate_auto_edits,
+    has_retouchable_face,
     sanitize_hsl_adjust,
     sanitize_tone_curve_points,
 )
@@ -382,12 +383,23 @@ def _run_analyze_and_transform(
             # 보정이 섞인다.
             before_stats = measure_image_stats(img) if reference else None
 
+            # 설명문이 "피부를 정리했다"고 말하려면 질감 보정이 걸릴 얼굴이 실제로
+            # 있어야 한다 (뒷모습·먼 전신이면 보정이 아무것도 하지 않는다).
+            face_detected = None
+            if req.skin_retouch_enabled and str(analysis.get("subjectType") or "").strip() == "인물":
+                try:
+                    with MediaPipeCache() as face_cache:
+                        face_detected = has_retouchable_face(img, cache=face_cache)
+                except Exception as exc:
+                    log.warning("analyze-and-transform: face check failed: %s", exc)
+
             # 보정 파라미터: 히스토그램 측정 + 목표값으로 산출.
             # 왜 그 값이 나왔는지 설명도 함께 만든다 (모델 호출 없음).
             analysis["recommendedParams"], params_comment = build_params_with_comment(
                 img, req.style_profile, analysis,
                 reference=reference, reshape_enabled=req.reshape_enabled,
                 skin_retouch_enabled=req.skin_retouch_enabled,
+                face_detected=face_detected,
             )
             params = analysis_to_transform_params(analysis)
             log.info("analyze-and-transform: params=%s", params)

@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from image_processor import _HSL_CHANNELS, estimate_illuminant, estimate_noise_sigma, vivid_blue_weight
+from image_processor import _HSL_CHANNELS, cast_pixel_weight, estimate_illuminant, estimate_noise_sigma, vivid_blue_weight
 
 log = logging.getLogger("gamdo-agent")
 
@@ -52,7 +52,7 @@ def measure_image_stats(img: Image.Image) -> dict[str, float]:
     - brightness: Rec.709 휘도 평균
     - contrast: 휘도의 5~95 백분위 폭 (표준편차보다 극단값에 덜 흔들린다)
     - saturation: HSV 채도 평균
-    - warmth: R-B 균형. 양수면 웜톤
+    - warmth: R-B 균형(원색·피부·하늘을 덜어 낸 회색 면 기준). 양수면 웜톤
     - highlight_clip / shadow_crush: 날아간·뭉갠 픽셀 비율
     - highlight_p95: 밝은 끝(95백분위)의 위치. 하이라이트를 누를 여지가 있는지
     - shadow_p05: 어두운 끝(5백분위)의 위치. 쉐도우를 들어올릴 여지가 있는지
@@ -86,13 +86,22 @@ def measure_image_stats(img: Image.Image) -> dict[str, float]:
     # 노을은 하늘만 붉고 그늘은 그렇지 않다(고르지 않음 → 장면의 색).
     # 선명한 하늘색 화소는 빼고 잰다. 파란 하늘(밝음)과 그늘(어두움)이 함께 파래서
     # 고른 파란 캐스트로 잡히고, 화이트밸런스가 하늘을 회색으로 만들었다.
-    not_sky = vivid_blue_weight(arr) < 0.5
-    if not_sky.mean() < 0.2:
-        not_sky = np.ones_like(not_sky)
-    lo, hi = np.percentile(luma[not_sky], [33, 67])
-    dark_px, bright_px = (luma <= lo) & not_sky, (luma >= hi) & not_sky
-    warm_dark = float((r[dark_px] - b[dark_px]).mean()) / 128.0 if dark_px.any() else 0.0
-    warm_bright = float((r[bright_px] - b[bright_px]).mean()) / 128.0 if bright_px.any() else 0.0
+    # 원색 옷·소품·피부도 뺀다 ([cast_pixel_weight]) — 코랄 재킷·붉은 국기가 화면을
+    # 채운 인물이 '고른 웜 캐스트'(0.85)로 읽혀 피부가 청록·회색으로 식었다.
+    cast_w = cast_pixel_weight(arr)
+    use = cast_w > 0.25
+    if use.mean() < 0.05:
+        use = np.ones_like(use)
+    rb = r - b
+    lo, hi = np.percentile(luma[use], [33, 67])
+    dark_px, bright_px = (luma <= lo) & use, (luma >= hi) & use
+
+    def _wmean(sel: np.ndarray) -> float:
+        wsum = float(cast_w[sel].sum())
+        return float((rb[sel] * cast_w[sel]).sum()) / wsum / 128.0 if wsum > 1e-6 else 0.0
+
+    warm_dark = _wmean(dark_px)
+    warm_bright = _wmean(bright_px)
     if warm_dark * warm_bright <= 0:
         cast_uniformity = 0.0          # 부호가 다르면 조명 탓이 아니다
     else:
@@ -105,10 +114,14 @@ def measure_image_stats(img: Image.Image) -> dict[str, float]:
         "saturation": saturation,
         # 하늘을 뺀 R−B. 넓은 파란 하늘이 사진 전체를 '차갑다'고 읽히게 해서
         # 웜톤이 최대치(+0.2)까지 얹히고 하늘이 탁해졌다 (캐스트 판단과 같은 기준).
-        "warmth": float((r - b)[not_sky].mean()) / 128.0,
+        # 원색·피부를 덜어 낸 가중 평균 — 옷 색이 아니라 빛의 색을 잰다.
+        "warmth": float((rb * cast_w).sum()) / max(float(cast_w.sum()), 1e-6) / 128.0,
         "highlight_p95": float(p95) / 255.0,
         "shadow_p05": float(p5) / 255.0,
         "highlight_clip": float((luma > 250).mean()),
+        # 밝은 화소(휘도 0.75 이상)·거의 흰 화소(0.90 이상)의 비율 — 하이키·흰 배경 판정용
+        "bright_share": float((luma >= 0.75 * 255).mean()),
+        "white_share": float((luma >= 0.90 * 255).mean()),
         "shadow_crush": float((luma < 6).mean()),
         "haze": haze,
         # 라플라시안 분산 500 정도면 충분히 선명한 사진으로 본다
@@ -229,42 +242,63 @@ def _level_index(value: str | None, default: int = 2) -> int:
 #   contrast_range — 측정 기반 대비 교정의 (하한, 상한). 필름 계열은 대비를
 #                    크게 세우지 않는다. (±밴드)
 #   contrast / brightness — 측정과 무관하게 더하는 방향성
+#   brightness_target — 프로필에 밝기 성향이 없거나 수동 선택일 때 쓰는 평균 밝기 목표
+#                  (medium 0.50). 인물이면 얼굴 밝기 목표도 이만큼 옮긴다.
+#   face_lift — 인물 얼굴(피부 L)을 원본보다 밝게 올려도 되는 폭 (0.04 ≈ L +4).
+#                  플래시처럼 밝게 튀어나온 얼굴이 스타일인 트렌드만 넓힌다.
 #   clarity / sharpness — 피사체 레시피 값에 더해진다
 #   clarity_cap / sharpness_cap — 피사체 레시피가 더해진 뒤의 상한. 음식·풍경
 #                    레시피가 필름 룩을 쨍한 HDR로 덮어쓰지 않게 한다. (0.25)
 #   vignette — 스타일로서의 비네팅 (피사체 레시피에는 없다)
 #   background_blur — 인물 배경 흐림 (없으면 0 — 기본으로는 걸지 않는다)
+#   dark_contrast_relief — 어두운 장면(dark_scene_factor)에서 양수 대비를 덜어내는 비율 (0)
 #   monochrome — True면 완전한 흑백 (saturation −1.0, 색 보정 전부 끔)
 #   split — 스플릿 토닝 {"shadow": (hue, 세기), "highlight": (hue, 세기)}
 
 _TREND_RECIPES: dict[str, dict[str, Any]] = {
     "warm_film": {
-        "warmth_target": 0.12, "saturation_target": 0.30, "saturation_range": (-0.20, 0.08),
+        "warmth_target": 0.12, "saturation_target": 0.28, "saturation_range": (-0.20, 0.04),
         "temperature_range": (-0.06, 0.25),
-        "temperature": 0.16, "shadow_floor": 0.11, "highlight_ceiling": 0.91, "saturation": -0.10,
+        "temperature": 0.16, "shadow_floor": 0.12, "highlight_ceiling": 0.91, "saturation": -0.14,
         "crush_blacks": "hazy", "contrast_target": 0.62, "contrast_range": (-0.20, 0.08),
         "clarity_cap": 0.05, "sharpness_cap": 0.08,
         "tone_curve": ("film", 0.60), "grain": 0.20,
-        "split": {"shadow": (255, 0.12), "highlight": (35, 0.15)},
+        # 필름 인화의 색 분리: 호박색 하이라이트 + 청록 그림자. 예전 (255 0.12 / 35 0.15)은
+        # 게인 뒤 a·b 2~3 시프트라 기본 레시피와 거의 같았다 (평균 ΔE 3.2).
+        # 전역 웜톤은 골든아워(채도·온도)와 겹치므로, 따뜻함을 하이라이트 쪽에 싣는다.
+        "split": {"shadow": (195, 0.34), "highlight": (45, 0.38)},
     },
     "korean_gamsung": {
-        "warmth_target": 0.04, "saturation_target": 0.26, "saturation_range": (-0.30, 0.04),
-        "temperature": 0.08, "shadow_floor": 0.13, "highlight_ceiling": 0.89, "saturation": -0.14,
-        "crush_blacks": "hazy", "contrast_target": 0.56, "contrast_range": (-0.25, 0.05),
+        # 들린 바닥 + 맑은 흰색 + 순한 채도. 예전(천장 0.89·대비 하한 −0.25·채도 −0.44)은
+        # 전역 대비를 깎아 양 끝이 같이 눌리고(p5 18·p99 85) 채도가 ×0.84, 피부 채도가
+        # ×0.71이 되어 "회색 필름"이었다. 바닥만 커브로 띄우고 흰색은 거의 그대로 둔다.
+        # 피부의 혈색이 남도록 식히는 쪽 색온도를 좁게 묶는다 (코랄 재킷 인물 −0.22).
+        "warmth_target": 0.04, "saturation_target": 0.26, "saturation_range": (-0.09, 0.0),
+        "temperature_range": (-0.06, 0.15),
+        "temperature": 0.0, "shadow_floor": 0.13, "highlight_ceiling": 0.95, "saturation": -0.10,
+        "crush_blacks": "hazy", "contrast_target": 0.60, "contrast_range": (-0.08, 0.05),
         "clarity": -0.08, "clarity_cap": 0.0, "sharpness_cap": 0.06,
-        "tone_curve": ("fade", 0.45), "grain": 0.10,
+        "tone_curve": ("gamsung", 0.75), "grain": 0.10,
+        # 뽀얀 톤: 민트빛 그림자 + 복숭아빛 하이라이트를 옅게
+        "split": {"shadow": (185, 0.26), "highlight": (15, 0.20)},
     },
     "cinematic_moody": {
         "temperature": 0.05, "shadow_floor": 0.04, "highlight_ceiling": 0.93, "saturation": -0.10,
-        "clarity": 0.20, "vignette": 0.22, "tone_curve": ("high_contrast", 0.50), "grain": 0.28,
+        "clarity": 0.20, "vignette": 0.22, "tone_curve": ("high_contrast", 0.50), "grain": 0.25,
         "split": {"shadow": (210, 0.30), "highlight": (30, 0.22)},
     },
     # 예전(2010년대 후반) 유행 — 유지하되 새 사용자에게 권하지는 않는다
     "bright_airy": {
-        "saturation_target": 0.30,
-        "temperature": 0.06, "shadow_floor": 0.15, "highlight_ceiling": 0.96, "saturation": -0.06,
-        "crush_blacks": "hazy", "clarity_cap": 0.05, "sharpness_cap": 0.08,
-        "vignette": 0.0, "tone_curve": ("bright", 0.40), "grain": 0.05,
+        # 밝은 커브를 제대로 태워(0.40 → 0.85) 중간톤을 띄우고 대비를 낮춘다.
+        # 예전에는 깔끔(clean_minimal)과 평균 ΔE 3.1 — 거의 같은 사진이었다.
+        # 밝기 목표(0.60)는 사진마다 노출을 맞추는 값이고, 커브가 이미 중간톤을 띄우므로
+        # 고정 밝기 가산(+0.05)은 두지 않는다 — 둘을 합치면 밝기가 이중으로 오른다.
+        "saturation_target": 0.30, "temperature_range": (-0.08, 0.15),
+        "brightness_target": 0.60, "face_lift": 0.06,
+        "temperature": 0.06, "shadow_floor": 0.15, "highlight_ceiling": 0.97, "saturation": -0.14,
+        "crush_blacks": "hazy", "contrast_target": 0.64, "contrast_range": (-0.06, 0.04),
+        "clarity_cap": 0.05, "sharpness_cap": 0.08,
+        "vignette": 0.0, "tone_curve": ("bright", 0.85), "grain": 0.05,
     },
     "golden_hour": {
         "warmth_target": 0.20,
@@ -274,8 +308,10 @@ _TREND_RECIPES: dict[str, dict[str, Any]] = {
         "split": {"shadow": (270, 0.12), "highlight": (40, 0.15)},
     },
     "clean_minimal": {
-        "warmth_target": 0.0,
-        "temperature": 0.05, "shadow_floor": 0.03, "highlight_ceiling": 0.97, "saturation": -0.05,
+        # 뉴트럴: 색을 얹지 않고(온도 상수 0) 진한 검정·맑은 흰색, 그레인 없음.
+        "warmth_target": 0.0, "temperature_range": (-0.12, 0.10), "brightness_target": 0.55,
+        "temperature": 0.0, "shadow_floor": 0.03, "highlight_ceiling": 0.97, "saturation": 0.0,
+        "contrast_target": 0.74,
         "clarity": 0.05, "vignette": 0.0, "tone_curve": ("linear", 0.0), "grain": 0.0,
     },
     # 정면 플래시 스냅 / Y2K 디카: 밝게 튀어나온 피사체, 깊은 바닥, 또렷한 로컬 대비,
@@ -285,24 +321,30 @@ _TREND_RECIPES: dict[str, dict[str, Any]] = {
         "temperature": -0.12, "shadow_floor": 0.03, "highlight_ceiling": 0.97, "saturation": 0.04,
         "contrast_target": 0.80, "contrast": 0.08,
         "clarity": 0.16, "sharpness": 0.08, "clarity_cap": 0.30,
-        "vignette": 0.24, "tone_curve": ("flash", 0.60), "grain": 0.15,
-        "wb_boost": 0.25,
+        "vignette": 0.24, "tone_curve": ("flash", 0.60), "grain": 0.18,
+        "wb_boost": 0.25, "face_lift": 0.07,
     },
     # 핑크·피치 파스텔: 들린 그림자, 낮은 대비, 부드러운 하이라이트.
     "soft_pastel": {
         "warmth_target": 0.04, "saturation_target": 0.30, "saturation_range": (-0.15, 0.0),
-        "temperature": 0.03, "shadow_floor": 0.16, "highlight_ceiling": 0.92, "saturation": -0.10,
-        "crush_blacks": "hazy", "contrast_target": 0.52, "contrast_range": (-0.30, 0.0),
-        "contrast": -0.06, "brightness": 0.06,
+        # 흰색은 맑게(천장 0.96), 바닥은 커브로만 띄운다. 예전에는 전역 대비 −0.36까지
+        # 깎아 검정이 우유빛(p1 22)·흰색이 회색(p99 83)이 됐다.
+        "temperature": 0.03, "shadow_floor": 0.12, "highlight_ceiling": 0.96, "saturation": -0.10,
+        "crush_blacks": "hazy", "contrast_target": 0.56, "contrast_range": (-0.16, 0.0),
+        "contrast": -0.03, "brightness": 0.06,
         "clarity": -0.10, "clarity_cap": -0.02, "sharpness_cap": 0.04,
-        "vignette": 0.0, "tone_curve": ("pastel", 0.70), "grain": 0.06,
+        "vignette": 0.0, "tone_curve": ("pastel", 0.90), "grain": 0.06,
         "temperature_range": (-0.08, 0.15),
         "split": {"shadow": (335, 0.42), "highlight": (5, 0.36)},
     },
     # 흑백 + 필름 그레인. 대비는 적당히, 그레인은 눈에 보이게.
     "bw_grain": {
+        # 전역 대비는 화면 평균을 축으로 늘인다. 어두운 배경 인물에서는 축이 바닥 근처라
+        # 얼굴만 위로 밀려 하얗게 떴다 (+0.18~0.31 → 피부 L 63 → 77). 어두운 장면에서만
+        # 양수 대비를 덜어낸다 (dark_contrast_relief) — 풍경 흑백의 대비는 그대로.
         "monochrome": True, "shadow_floor": 0.04, "highlight_ceiling": 0.95,
-        "contrast_target": 0.74, "contrast": 0.04, "clarity": 0.08, "vignette": 0.12,
+        "contrast_target": 0.74, "contrast": 0.04, "dark_contrast_relief": 0.7,
+        "clarity": 0.08, "vignette": 0.12,
         "tone_curve": ("bw", 0.60), "grain": 0.30,
     },
 }
@@ -353,8 +395,16 @@ _SUBJECT_RECIPES: dict[str, dict[str, Any]] = {
 # 측정에서 나온 교정 성분 하나가 낼 수 있는 최대치
 _CORRECTION_BAND = 0.35
 
+# temperature_range가 없는 레시피의 측정 색온도 하한. 예전에는 ±밴드(−0.35)까지
+# 열려 있어, 따뜻하게 읽힌 인물(실측 코랄 재킷)에 −0.24~−0.33이 걸려 피부가
+# 잿빛이 됐다. 스타일의 쿨 성향은 레시피 상수(flash_digicam −0.12)로 따로 더해진다.
+_TEMP_COOL_FLOOR = -0.12
+
 # 측정분에 레시피 상수를 더한 뒤의 상한. 게인을 곱하기 전에 한 번 더 묶는다.
 _STYLE_BAND = 0.45
+
+# 인물 사진에서 측정분(목표 채도와의 차이)의 채도 낮추기 중 남기는 몫 ([compute] 참고)
+_PORTRAIT_DESAT_MEASURE_KEEP = 0.5
 
 # 목표 warmth가 이 이상이면(웜 필름·골든아워·웜 취향) 스타일이 웜톤을 요구하는 것으로
 # 보고 장면의 빛을 이유로 웜톤을 덜어내지 않는다.
@@ -399,6 +449,29 @@ _HIGHLIGHT_CLIP_TOLERANCE = 0.12
 _EXPOSURE_DEADZONE = 0.06
 # 데드존을 벗어났을 때 노출 교정이 낼 수 있는 최대치
 _EXPOSURE_BAND = 0.20
+
+# 하이키(밝은 화소 비율이 이 구간 위) 사진은 평균이 높아도 노출을 내리지 않는다.
+# 흰 접시 음식·흰 벽 카페·흰 배경 인물은 원래 밝다. 평균 목표(0.50)를 좇으면
+# 실측: 음식 L 80→71, 흰 배경 인물 78→73 — 흰색이 회색이 됐다 (bright_airy 포함).
+_HIGH_KEY_LO, _HIGH_KEY_HI = 0.25, 0.50
+# 거의 흰 화소(휘도 0.90 이상) 비율이 이 구간 위면 흰 배경으로 보고
+# 하이라이트 천장·대비 측정으로 밝은 끝을 끌어내리지 않는다 (p99 98~100 → 91~93).
+_WHITE_BG_LO, _WHITE_BG_HI = 0.03, 0.12
+
+# 인물: 노출은 화면 평균이 아니라 얼굴 밝기로 정한다 (LAB L/100 중앙값).
+# 검은 배경 인물(평균 L 7)은 평균으로 보면 "어둡다"라서 brightness +0.16·
+# highlights +0.28·대비 +0.28이 걸려 얼굴이 L 62→86으로 날아갔다.
+# 얼굴이 이 목표 ± 구간 안이면 노출이 맞은 것으로 본다. 위쪽은 넓게 둔다 —
+# 밝은 피부·플래시 인물은 원래 밝다.
+_FACE_L_TARGET = 0.62
+_FACE_L_BELOW, _FACE_L_ABOVE = 0.07, 0.12
+# 얼굴 밝기가 원본보다 이만큼 넘게 오르거나(레시피 face_lift로 조정) 내려가지 않게,
+# 톤 파라미터를 합친 결과를 작은 사본으로 시뮬레이션해 넘치는 성분을 줄인다.
+_FACE_LIFT_CAP = 0.04
+_FACE_DROP_CAP = 0.05
+# 얼굴 감지·시뮬레이션 해상도 (긴 변)
+_FACE_DETECT_PX = 1024
+_FACE_SIM_PX = 384
 
 # 화이트밸런스 강도 1.0이 실제로 중화하는 비율 (채널 게인 상한 때문에 1은 아니다)
 _AWB_NEUTRALIZE = 0.8
@@ -465,6 +538,150 @@ def haze_flatness(stats: dict[str, float]) -> float:
     return round(min(1.0, lifted * flat * (0.7 + 0.3 * veil) * 1.4), 3)
 
 
+# 어두운 장면(야경·어두운 배경 인물)에서 바랜 검정을 덜어내는 비율.
+# 밝은 사진에서 살짝 뜬 검정은 필름 느낌이지만, 화면 대부분이 어두운 사진에서는
+# 같은 들림이 넓은 면적에 깔려 안개처럼 보인다. 실측: 야간 거리(sf) 기본 레시피
+# p1 L 0.8 → 9.0 — 쉐도우 목표 + 커브 바닥 + 음수 대비가 한 방향으로 쌓였다.
+# (노이즈가 적은 깨끗한 야경은 low_light로 잡히지 않아 밝기·바닥으로 따로 본다)
+_DARK_SCENE_BRIGHT = (0.22, 0.32)   # 평균 휘도가 이 구간 아래로 갈수록 어두운 장면
+_DARK_SCENE_FLOOR = (0.03, 0.08)    # p5가 이 구간 아래면 원래 검정이 깊은 사진
+_DARK_FLOOR_RELIEF = 0.7            # 쉐도우 목표 바닥을 덜어내는 비율
+_DARK_CURVE_RELIEF = 0.5            # 바닥을 띄우는 커브의 세기를 덜어내는 비율
+_DARK_CONTRAST_RELIEF = 0.6         # 음수 대비(바닥을 들어 올림)를 덜어내는 비율
+# 검정을 띄우는 톤 커브 프리셋 (x=0의 출력이 0보다 큰 것)
+_LIFTED_CURVES = frozenset({"film", "fade", "bright", "soft_film", "pastel", "gamsung"})
+
+
+def dark_scene_factor(stats: dict[str, float], low_light: bool = False) -> float:
+    """사진이 어두운 장면인 정도 (0~1). 저조도로 판정됐으면 1."""
+    if low_light:
+        return 1.0
+    dark = 1.0 - _ramp(stats["brightness"], *_DARK_SCENE_BRIGHT)
+    deep = 1.0 - _ramp(stats["shadow_p05"], *_DARK_SCENE_FLOOR)
+    return round(dark * deep, 3)
+
+class _FaceTone:
+    """노출 판단용 얼굴 피부 정보 — 작은 사본과 그 위의 피부 마스크."""
+
+    __slots__ = ("small", "mask", "l0")
+
+    def __init__(self, small: Image.Image, mask: np.ndarray, l0: float):
+        self.small = small    # 시뮬레이션용 RGB 사본 (긴 변 _FACE_SIM_PX)
+        self.mask = mask      # bool — 얼굴 피부 (눈·눈썹·입술 제외)
+        self.l0 = l0          # 원본 피부 L 중앙값 (0~1)
+
+
+def _face_l(img: Image.Image, mask: np.ndarray) -> float:
+    lab_l = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2LAB)[..., 0]
+    return float(np.median(lab_l[mask])) / 255.0
+
+
+def _measure_face_tone(img: Image.Image) -> _FaceTone | None:
+    """얼굴을 찾아 피부 밝기를 잰다. 없거나 실패하면 None (평균 기준으로 돌아간다)."""
+    try:
+        import image_processor as ip
+
+        det = img.convert("RGB")
+        if max(det.size) > _FACE_DETECT_PX:
+            det.thumbnail((_FACE_DETECT_PX, _FACE_DETECT_PX), Image.BILINEAR)
+        arr = np.ascontiguousarray(np.asarray(det))
+        h, w = arr.shape[:2]
+        with ip.MediaPipeCache() as cache:
+            point_sets = ip._face_point_sets(arr, cache=cache)
+        if not point_sets:
+            return None
+        mask = np.zeros((h, w), np.uint8)
+        for pt in point_sets:
+            mask = cv2.bitwise_or(mask, ip.build_face_skin_mask(pt, h, w))
+        small = det.copy()
+        small.thumbnail((_FACE_SIM_PX, _FACE_SIM_PX), Image.BILINEAR)
+        m = cv2.resize(mask, small.size, interpolation=cv2.INTER_AREA) > 127
+        if m.sum() < 30:
+            return None
+        return _FaceTone(small, m, _face_l(small, m))
+    except Exception:
+        log.exception("param_engine: face tone measurement failed")
+        return None
+
+
+_FACE_TONE_KEYS = ("brightness", "highlights", "shadows", "contrast")
+
+
+def _simulate_face_l(face: _FaceTone, p: dict[str, float], tone: dict[str, Any]) -> float:
+    """톤 파라미터를 작은 사본에 실제 렌더 함수로 적용해 얼굴 L을 잰다."""
+    from image_processor import _apply_lab_adjustments
+
+    out = _apply_lab_adjustments(
+        face.small,
+        highlights=p["highlights"], shadows=p["shadows"],
+        tone_curve_preset=tone.get("preset") or "linear",
+        tone_curve_strength=float(tone.get("strength") or 0.0),
+        tone_curve_points=tone.get("points"),
+        brightness=p["brightness"], contrast=p["contrast"], clarity=p["clarity"],
+    )
+    return _face_l(out, face.mask)
+
+
+def _cap_face_tone(params: dict[str, Any], face: _FaceTone, lo: float, hi: float) -> None:
+    """합친 톤 보정 뒤 얼굴 L이 [lo, hi]를 벗어나면 넘치게 만든 성분을 줄인다.
+
+    brightness·highlights·대비는 각각 따로 보면 온건해도 한 얼굴에 겹친다.
+    대비는 화면 평균을 축으로 늘리므로 검은 배경이면 얼굴(평균보다 훨씬 밝다)을
+    크게 끌어올린다. 그래서 개별 값이 아니라 실제 렌더 결과로 판단한다.
+    톤 커브는 스타일 자체라 건드리지 않고, 그것만으로도 넘치면 brightness로 되돌린다.
+    """
+    tone = params.get("toneCurve") or {}
+    cur = {k: float(params.get(k, 0.0)) for k in _FACE_TONE_KEYS + ("clarity",)}
+    f = _simulate_face_l(face, cur, tone)
+    if lo <= f <= hi:
+        return
+    up = f > hi
+    bound = hi if up else lo
+
+    def ok(v: float) -> bool:
+        return v <= bound if up else v >= bound
+
+    base = dict(cur, **{k: 0.0 for k in _FACE_TONE_KEYS})
+    f_base = _simulate_face_l(face, base, tone)
+    # 얼굴을 넘치는 방향으로 민 성분만 줄인다
+    culprits = []
+    for k in _FACE_TONE_KEYS:
+        if abs(cur[k]) < 1e-6:
+            continue
+        effect = _simulate_face_l(face, dict(base, **{k: cur[k]}), tone) - f_base
+        if (effect > 0.002) if up else (effect < -0.002):
+            culprits.append(k)
+
+    def scaled(s: float) -> dict[str, float]:
+        return dict(cur, **{k: cur[k] * s for k in culprits})
+
+    if culprits:
+        s_lo, s_hi = 0.0, 1.0
+        if ok(_simulate_face_l(face, scaled(0.0), tone)):
+            for _ in range(7):
+                mid = (s_lo + s_hi) / 2
+                if ok(_simulate_face_l(face, scaled(mid), tone)):
+                    s_lo = mid
+                else:
+                    s_hi = mid
+        cur = scaled(s_lo)
+    if not ok(_simulate_face_l(face, cur, tone)):
+        # 톤 커브·남은 성분만으로도 넘친다 — brightness로 되돌린다
+        b0 = cur["brightness"]
+        b_lo, b_hi = (b0, b0 - _EXPOSURE_BAND) if up else (b0, b0 + _EXPOSURE_BAND)
+        for _ in range(7):
+            mid = (b_lo + b_hi) / 2
+            if ok(_simulate_face_l(face, dict(cur, brightness=mid), tone)):
+                b_hi = mid
+            else:
+                b_lo = mid
+        cur["brightness"] = b_hi
+    log.info("param_engine: face L %.3f → capped to [%.3f, %.3f] — %s",
+             f, lo, hi, {k: round(cur[k], 3) for k in _FACE_TONE_KEYS})
+    for k in _FACE_TONE_KEYS:
+        params[k] = _clamp(cur[k])
+
+
 def build_recommended_params(
     img: Image.Image,
     style_profile: dict[str, Any] | None,
@@ -488,6 +705,7 @@ def build_params_with_comment(
     reference: dict[str, Any] | None = None,
     reshape_enabled: bool = False,
     skin_retouch_enabled: bool = True,
+    face_detected: bool | None = None,
 ) -> tuple[dict[str, Any], str]:
     """측정값 + 프로필 + 모델의 스타일 방향으로 recommendedParams와 설명을 만든다.
 
@@ -501,6 +719,11 @@ def build_params_with_comment(
 
     설명은 왜 이 값이 나왔는지를 한 문장으로 적은 것이다. 값을 정한 근거가
     여기 다 있으므로 모델에게 따로 물어볼 필요가 없다.
+
+    face_detected: 질감 보정이 걸릴 얼굴이 사진에 있는지 (호출 측이 감지한 결과).
+    False면 설명문에서 피부 문장을 뺀다 — 뒷모습·먼 전신처럼 얼굴이 없으면 피부
+    보정은 아무것도 하지 않는데 "피부는 자연스럽게 정리했어요"라고 말하고 있었다.
+    None(모름)이면 예전처럼 파라미터만 보고 판단한다.
     """
     profile = normalize_style_profile(style_profile)
     analysis = analysis or {}
@@ -538,7 +761,11 @@ def build_params_with_comment(
         target_saturation = reference["saturation"]
         target_warmth = reference["warmth"]
     else:
-        target_brightness = _BRIGHTNESS_TARGETS[_level_index(color_pref.get("brightnessTendency"))]
+        if color_pref.get("brightnessTendency") in _LEVEL5 and not (manual and "brightness_target" in recipe):
+            target_brightness = _BRIGHTNESS_TARGETS[_level_index(color_pref.get("brightnessTendency"))]
+        else:
+            # 밝기 성향이 없거나 스타일을 직접 골랐으면 레시피 목표 (bright_airy는 더 밝게)
+            target_brightness = float(recipe.get("brightness_target", _BRIGHTNESS_TARGETS[2]))
         if color_pref.get("contrast") in _LEVEL5 and not (manual and "contrast_target" in recipe):
             target_contrast = _CONTRAST_TARGETS[_level_index(color_pref.get("contrast"))]
         else:
@@ -586,6 +813,7 @@ def build_params_with_comment(
 
     # ── 장면에 따라 기준을 바꾼다 ──
     scene = detect_scene(stats, img)
+    dark = dark_scene_factor(stats, scene["low_light"])
 
     # 차이를 슬라이더 범위로 옮기는 배율. 측정 스케일과 슬라이더 스케일이 달라 실측으로 맞춘 값들이다.
     #
@@ -599,6 +827,26 @@ def build_params_with_comment(
         _deadzone(target_brightness - stats["brightness"], _EXPOSURE_DEADZONE) * 1.2,
         _EXPOSURE_BAND,
     )
+    # 하이키·흰 배경 정도 (0~1)
+    high_key = _ramp(stats.get("bright_share", 0.0), _HIGH_KEY_LO, _HIGH_KEY_HI)
+    white_bg = max(high_key, _ramp(stats.get("white_share", 0.0), _WHITE_BG_LO, _WHITE_BG_HI))
+    # 인물이면 노출은 얼굴이 정한다. 목표 평균의 성향(레시피·프로필)만큼 얼굴 목표도 옮긴다.
+    face = (_measure_face_tone(img)
+            if subject == "인물" and gain > 0.0 else None)
+    face_target = _FACE_L_TARGET + (target_brightness - _BRIGHTNESS_TARGETS[2]) * 0.5
+    if face is not None:
+        want = min(max(face.l0, face_target - _FACE_L_BELOW), face_target + _FACE_L_ABOVE)
+        if abs(want - face.l0) > 1e-3 and 0.02 < face.l0 < 0.98:
+            # brightness는 L 감마(1/(1+b), 음수면 1-1.5b)다 — 얼굴을 want로 옮기는 값을 바로 푼다
+            g = math.log(want) / math.log(face.l0)
+            brightness = _band(1.0 / g - 1.0 if g <= 1.0 else (1.0 - g) / 1.5, _EXPOSURE_BAND)
+        else:
+            brightness = 0.0
+        log.info("param_engine: face L %.3f target %.3f → brightness %.3f",
+                 face.l0, face_target, brightness)
+    elif brightness < 0:
+        # 하이키는 원래 밝다 — 평균이 높다고 내리지 않는다
+        brightness *= 1.0 - high_key
     contrast = _band((target_contrast - stats["contrast"]) * 1.6)
     # 필름 계열은 측정 차이가 커도 대비·채도를 크게 세우지(또는 죽이지) 않는다
     if "contrast_range" in recipe:
@@ -608,14 +856,22 @@ def build_params_with_comment(
     if "saturation_range" in recipe:
         lo, hi = recipe["saturation_range"]
         saturation = max(float(lo), min(float(hi), saturation))
+    # 인물 사진에서 "채도가 목표보다 높다"는 측정은 대개 옷·배경·소품의 색이다
+    # (피부를 빼고 재도 값이 거의 같다 — 실측 c1 0.50→0.57, c2 0.44→0.44, meir 0.54→0.55).
+    # 그건 고칠 결함이 아니라 찍은 사람이 고른 색이라, 측정분의 채도 낮추기는 절반만 둔다
+    # (범위로 묶은 뒤에 — 먼저 줄이면 선명한 사진은 여전히 범위 바닥에 붙는다).
+    # 전부 두면 기본 레시피 인물이 전부 바닥(−0.15)에 붙어 피부까지 잿빛이 됐다.
+    # 레퍼런스(그 사람 피드의 실제 채도)가 있으면 그게 취향이라 그대로 따른다.
+    if saturation < 0 and subject == "인물" and not reference:
+        saturation *= _PORTRAIT_DESAT_MEASURE_KEEP
     # 화이트밸런스가 먼저 중립으로 당기므로, 그 뒤에 남는 웜니스를 기준으로 잡는다.
     # 원본 warmth를 그대로 쓰면 같은 편차를 두 번 보정하게 된다.
     warmth_after_wb = stats["warmth"] * (1.0 - _AWB_NEUTRALIZE * auto_wb_strength)
     temperature = _band((target_warmth - warmth_after_wb) * 1.2)
-    # 필름 계열은 따뜻한 사진을 크게 식히지 않는다 — 피부가 회색으로 죽는다
-    if "temperature_range" in recipe:
-        lo, hi = recipe["temperature_range"]
-        temperature = max(float(lo), min(float(hi), temperature))
+    # 필름 계열은 따뜻한 사진을 크게 식히지 않는다 — 피부가 회색으로 죽는다.
+    # 범위가 없는 레시피도 식히는 쪽은 _TEMP_COOL_FLOOR까지만 (고른 캐스트는 auto_wb가 맡는다).
+    lo, hi = recipe.get("temperature_range", (_TEMP_COOL_FLOOR, _CORRECTION_BAND))
+    temperature = max(float(lo), min(float(hi), temperature))
 
     # 레시피의 방향성을 더한다 (트렌드 → 피사체 순으로 덮어씀)
     def pick(key: str, default: float = 0.0) -> float:
@@ -664,6 +920,9 @@ def build_params_with_comment(
         contrast = round(contrast * max(
             _WHITE_TEMPERATURE_FLOOR,
             1.0 - stats["highlight_clip"] / _WHITE_TEMPERATURE_TOLERANCE), 3)
+    # 날아가지 않은 흰 배경(휘도 0.90~0.98)도 p95를 끌어올려 같은 오판을 만든다
+    if contrast < 0:
+        contrast = round(contrast * (1.0 - white_bg), 3)
 
     # 흰 영역이 넓은 사진에서는 색온도를 덜 얹는다.
     #
@@ -685,6 +944,7 @@ def build_params_with_comment(
         target_floor = float(reference["luma_percentiles"][1])   # p5
     else:
         target_floor = float(recipe.get("shadow_floor", 0.08))
+        target_floor *= 1.0 - _DARK_FLOOR_RELIEF * dark
     shadows = _band((target_floor - stats["shadow_p05"]) * _SHADOW_LIFT_GAIN)
     # 바닥이 목표보다 떠 있을 때 눌러 내릴지.
     #
@@ -727,6 +987,16 @@ def build_params_with_comment(
     if scene["low_light"]:
         # 저조도: 대비를 세우면 노이즈와 뭉갬이 같이 도드라진다
         contrast *= 0.6
+    if contrast < 0:
+        # 음수 대비는 평균을 축으로 검정을 들어 올린다 — 어두운 장면에서는 안개가 된다
+        contrast *= 1.0 - _DARK_CONTRAST_RELIEF * dark
+    else:
+        contrast *= 1.0 - float(recipe.get("dark_contrast_relief", 0.0)) * dark
+
+    # 하이키·흰 배경: 밝은 끝이 흰 배경 자체다. 천장 목표(역광 보정 포함)로 누르면
+    # 흰색이 연회색이 될 뿐이다.
+    if highlights < 0:
+        highlights = round(highlights * (1.0 - white_bg), 3)
 
     # 날아간 하이라이트·뭉갠 쉐도우가 많으면 그만큼 더 되살린다
     # 클리핑 보너스는 제거했다. 천장 목표가 이미 "너무 밝다"를 다루는데
@@ -826,6 +1096,8 @@ def build_params_with_comment(
     tone_preset, tone_strength = recipe.get(
         "tone_curve", subject_recipe.get("tone_curve", ("linear", 0.0))
     )
+    if tone_preset in _LIFTED_CURVES:
+        tone_strength = float(tone_strength) * (1.0 - _DARK_CURVE_RELIEF * dark)
 
     # 레퍼런스가 있으면 프리셋 대신 그 사람 사진의 밝기 분포를 따라간다.
     # 프리셋은 "필름이면 이런 곡선"이라는 일반론이고, 이쪽은 그 사람의 실제 곡선이다.
@@ -931,6 +1203,8 @@ def build_params_with_comment(
         params["hslAdjust"] = hsl
         log.info("param_engine: hslAdjust from model — %s", list(hsl.keys()))
     _damp_warm_stacking(params, analysis)
+    if is_portrait:
+        _guard_skin_cooling(params, img)
 
     # 얼굴/체형은 눈이 필요한 판단이라 모델이 인물 사진에서만 제안한다.
     # 스키마상 최상위에 오지만, 옛 응답 형식(recommendedParams 안)도 받아준다.
@@ -944,6 +1218,14 @@ def build_params_with_comment(
     if isinstance(reshape, dict) and is_portrait and reshape_enabled:
         params["reshapeParams"] = _clamp_reshape(reshape)
 
+    # 얼굴 밝기가 합친 톤 보정으로 넘치게 오르거나 내려가지 않게 한다.
+    # 원래 어둡거나 밝은 얼굴은 목표 구간까지는 움직일 수 있다.
+    if face is not None:
+        lift = float(recipe.get("face_lift", _FACE_LIFT_CAP))
+        face_hi = max(face.l0, face_target - _FACE_L_BELOW) + lift
+        face_lo = min(face.l0, face_target + _FACE_L_ABOVE) - _FACE_DROP_CAP
+        _cap_face_tone(params, face, face_lo, face_hi)
+
     # 눈에 안 보이는 값은 0으로 — 렌더 단계를 건너뛰고, 앱의 '적용된 변형'에도
     # 실제로 한 보정만 남는다 (게인까지 곱한 최종값 기준).
     _drop_negligible(params, img)
@@ -954,7 +1236,7 @@ def build_params_with_comment(
         stats["brightness"], stats["contrast"], stats["saturation"],
         stats["warmth"], stats["haze"], stats["sharpness"],
     )
-    return params, describe_params(stats, trend, subject, params, gain)
+    return params, describe_params(stats, trend, subject, params, gain, face_detected=face_detected)
 
 
 # 이 값보다 작으면 결과가 눈에 띄게 달라지지 않는 파라미터의 최소 효과 크기.
@@ -1250,6 +1532,77 @@ def _damp_warm_stacking(params: dict[str, Any], analysis: dict[str, Any]) -> Non
             analysis["regionParams"] = new_regions
 
 
+# 화이트밸런스 + 식히는 temperature가 피부의 a*(붉음)·b*(노랑)를 이 비율 아래로
+# 떨어뜨리면 두 값을 함께 줄인다. 실측: 원본 피부 a* 13.8 b* 15.4가 a* −3.5(청록)·
+# a* 0.4 b* 5(잿빛)가 됐다. 뉴트럴~쿨 스타일도 피부가 빨간기를 잃으면 병색으로 보인다.
+_SKIN_A_KEEP = 0.70
+_SKIN_B_KEEP = 0.55
+# 피부색 화소가 화면의 이 비율보다 적으면 판단하지 않는다
+_SKIN_GUARD_MIN_FRAC = 0.005
+
+
+def _skin_ab_after(skin_rgb: np.ndarray, gains: tuple[float, float, float],
+                   wb: float, temperature: float) -> tuple[float, float]:
+    """피부 화소(N×3, 0~255)에 렌더러와 같은 WB 게인과 temperature를 건 뒤의 평균 a*, b*."""
+    rgb = skin_rgb.copy()
+    if wb >= 0.01:
+        for c, g in enumerate(gains):
+            rgb[:, c] *= max(0.75, min(1.25, 1.0 + (g - 1.0) * min(1.0, wb)))
+    lab = cv2.cvtColor(np.clip(np.rint(rgb), 0, 255).astype(np.uint8)[None], cv2.COLOR_RGB2LAB)[0]
+    a = lab[:, 1].astype(np.float32) - 128.0
+    b = lab[:, 2].astype(np.float32) - 128.0
+    # adjust_color_temperature: b += 15t, a += 4.5t (8비트 LAB 눈금)
+    return float(a.mean() + 4.5 * temperature), float(b.mean() + 15.0 * temperature)
+
+
+def _guard_skin_cooling(params: dict[str, Any], img: Image.Image) -> None:
+    """계획된 auto_wb + 음수 temperature가 피부를 청록·잿빛으로 식히면 함께 덜어낸다.
+
+    렌더 전에 피부색 화소(색상각 20~65°, a* 양수, 밝기 대비 채도가 옷 원색만큼
+    높지 않은 화소)만 골라 같은 게인·시프트를 걸어 보고, a*가 _SKIN_A_KEEP·b*가
+    _SKIN_B_KEEP 아래로 떨어지면 둘을 같은 비율로 줄인다(이분 탐색). 양수
+    temperature(덥히기)와 피부를 덥히는 WB는 건드리지 않는다.
+    """
+    wb = float(params.get("auto_wb") or 0.0)
+    temp = float(params.get("temperature") or 0.0)
+    cool_t = min(0.0, temp)
+    if wb < 0.01 and cool_t > -0.01:
+        return
+    small = img.convert("RGB")
+    small.thumbnail((256, 256), Image.BILINEAR)
+    arr = np.asarray(small, dtype=np.float32).reshape(-1, 3)
+    lab = cv2.cvtColor(arr.astype(np.uint8)[None], cv2.COLOR_RGB2LAB)[0].astype(np.float32)
+    L = lab[:, 0] * (100.0 / 255.0)
+    a, b = lab[:, 1] - 128.0, lab[:, 2] - 128.0
+    hue = np.degrees(np.arctan2(b, a))
+    rel = np.hypot(a, b) / (L + 10.0)
+    skin = (hue > 20) & (hue < 65) & (a > 5) & (rel > 0.12) & (rel < 0.60) & (L > 25) & (L < 92)
+    if skin.mean() < _SKIN_GUARD_MIN_FRAC:
+        return
+    skin_rgb = arr[skin]
+    a0, b0 = float(a[skin].mean()), float(b[skin].mean())
+    gains = estimate_illuminant(img) if wb >= 0.01 else (1.0, 1.0, 1.0)
+
+    def ok(k: float) -> bool:
+        a1, b1 = _skin_ab_after(skin_rgb, gains, wb * k, cool_t * k)
+        return a1 >= _SKIN_A_KEEP * a0 and b1 >= _SKIN_B_KEEP * b0
+
+    if ok(1.0):
+        return
+    lo, hi = 0.0, 1.0
+    for _ in range(8):
+        mid = (lo + hi) / 2
+        if ok(mid):
+            lo = mid
+        else:
+            hi = mid
+    log.info("param_engine: skin guard — auto_wb %.2f→%.2f, temperature %.3f→%.3f (skin a %.1f b %.1f)",
+             wb, wb * lo, temp, cool_t * lo if temp < 0 else temp, a0, b0)
+    params["auto_wb"] = round(wb * lo, 3)
+    if temp < 0:
+        params["temperature"] = round(temp * lo, 3)
+
+
 # 워프 계수가 커진 만큼 모델이 범위를 벗어난 값을 주면 얼굴이 뭉개진다.
 # 프롬프트 권장 상한(0.5)에서 한 번 더 자른다.
 _RESHAPE_MAX = 0.5
@@ -1354,6 +1707,7 @@ _CURVE_LABELS = {
     "flash": "플래시 커브",
     "pastel": "파스텔 커브",
     "bw": "흑백 커브",
+    "gamsung": "감성 페이드",
 }
 
 
@@ -1363,16 +1717,20 @@ def describe_params(
     subject: str,
     params: dict[str, Any],
     gain: float,
+    face_detected: bool | None = None,
 ) -> str:
     """왜 이 보정값이 나왔는지 한 문장으로 설명한다.
 
     값을 정한 근거(측정값·프로필·피사체)가 모두 여기 있으므로
     모델에게 설명을 시키지 않는다 — 공짜이고, 실제 근거와 어긋날 일도 없다.
+    face_detected=False면 피부 보정이 걸릴 얼굴이 없으므로 피부 문장을 쓰지 않는다.
     """
     if gain <= 0.0:
         return "보정 없음 설정이라 원본 톤을 그대로 두었어요"
 
-    is_portrait = subject == "인물" and params["skin_smoothing"] >= 0.1
+    is_portrait = (
+        subject == "인물" and params["skin_smoothing"] >= 0.1 and face_detected is not False
+    )
     mono = params["saturation"] <= -0.99
     recipe = _TREND_RECIPES.get(trend, _DEFAULT_RECIPE)
     hazy_only = recipe.get("crush_blacks", "always") == "hazy"
