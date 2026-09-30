@@ -4,8 +4,10 @@
 5장에 크롭이 붙었고 서버는 그대로 적용했다. 4:3 가로 사진의 좌우 40%가 말없이
 잘려 사용자가 잡은 구도가 사라졌다. 지금은:
   - 비율은 인스타가 받지 않는 사진(3:4보다 길거나 1.91:1보다 넓음)에만 자동 적용
-  - 모델 크롭·비율은 suggested_* 로만 남고, 앱이 apply_suggested_crop을 보낼 때만 적용
-  - 1° 미만 수평 보정은 하지 않는다
+  - 모델 크롭은 프레임을 60% 이상 남기면 자동 적용(apply_suggested_crop=True, 앱에서
+    원래 구도로 되돌릴 수 있음), 그보다 과하면 suggested_* 제안으로만
+  - 크롭을 자동 적용할 때 모델 비율(4:5 등)은 겹쳐 얹지 않는다
+  - 수평 보정은 감지기 하한(0.4°) 이상이면 한다 (1°로 올렸다가 사용자 보고로 되돌림)
 """
 
 import base64
@@ -72,16 +74,30 @@ def test_too_tall_and_too_wide_get_nearest_supported_ratio():
 
 
 @pytest.mark.parametrize("size", [(400, 300), (300, 400)])
-def test_normal_photos_keep_full_frame_despite_model_crop_and_ratio(client, monkeypatch, size):
-    """실측 패턴(4:5 + 크롭)을 모델이 줘도 4:3·3:4 사진은 원본 프레임 그대로."""
+def test_moderate_crop_is_applied_but_model_ratio_is_not_stacked(client, monkeypatch, size):
+    """불필요한 가장자리를 정리하는 크롭(면적 0.72)은 적용하되, 4:5를 겹쳐 얹지 않는다."""
     edits, out = _analyze(client, monkeypatch, size, {
         "crop": {"x": 0.12, "y": 0.0, "width": 0.72, "height": 1.0},
         "instagram_ratio": "4:5",
     }, subject="카페/일상")
-    assert out == size
-    assert "crop" not in edits and "instagram_ratio" not in edits
-    # 제안으로는 남는다
+    assert edits["apply_suggested_crop"] is True
     assert edits["suggested_crop"]["width"] == pytest.approx(0.72)
+    assert "suggested_ratio" not in edits and "instagram_ratio" not in edits
+    assert out[0] == pytest.approx(size[0] * 0.72, abs=2)
+    # 세로 사진은 크롭 결과가 3:4보다 길어지면 인스타 범위로 높이만 다시 맞춘다
+    assert out[1] == size[1] or out[0] / out[1] == pytest.approx(0.75, abs=0.01)
+
+
+@pytest.mark.parametrize("size", [(400, 300), (300, 400)])
+def test_aggressive_crop_stays_a_suggestion(client, monkeypatch, size):
+    """프레임의 60% 미만만 남기는 크롭은 구도를 통째로 바꾸므로 제안으로만."""
+    edits, out = _analyze(client, monkeypatch, size, {
+        "crop": {"x": 0.2, "y": 0.1, "width": 0.6, "height": 0.7},
+        "instagram_ratio": "4:5",
+    }, subject="카페/일상")
+    assert out == size
+    assert "apply_suggested_crop" not in edits
+    assert edits["suggested_crop"]["width"] == pytest.approx(0.6)
     assert edits["suggested_ratio"] == "4:5"
 
 
@@ -151,15 +167,22 @@ def test_applied_suggestion_without_ratio_rechecks_postable_range():
 # ── 수평 ──
 
 
-def test_sub_degree_measured_tilt_is_skipped(client, monkeypatch):
-    # 측정이 0.6°로 확신하면, 모델 예비값(2°)으로도 넘어가지 않는다
+def test_small_measured_tilt_is_corrected(client, monkeypatch):
+    # 지평선이 있으면 0.6°도 눈에 띈다 — 예전처럼 잡아 준다
     edits, out = _analyze(client, monkeypatch, (400, 300), {"straighten": 2.0}, tilt=0.6)
+    assert edits["straighten"] == pytest.approx(0.6)
+    assert out != (400, 300)
+
+
+def test_measured_tilt_below_detector_floor_is_skipped(client, monkeypatch):
+    # 측정이 0.3°로 '거의 수평'이라 확신하면 모델 예비값(2°)으로 넘어가지 않는다
+    edits, out = _analyze(client, monkeypatch, (400, 300), {"straighten": 2.0}, tilt=0.3)
     assert edits["straighten"] is None
     assert out == (400, 300)
 
 
-def test_sub_degree_model_tilt_is_skipped(client, monkeypatch):
-    edits, out = _analyze(client, monkeypatch, (400, 300), {"straighten": -0.7})
+def test_tiny_model_tilt_is_skipped(client, monkeypatch):
+    edits, out = _analyze(client, monkeypatch, (400, 300), {"straighten": -0.3})
     assert edits["straighten"] is None
     assert out == (400, 300)
 

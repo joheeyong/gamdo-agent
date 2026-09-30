@@ -318,9 +318,10 @@ def api_transform_photo(
 # ── 분석 + 변형 통합 API ──
 
 
-# 자동 수평 보정의 하한(도). 이보다 작은 기울기는 눈에 띄지 않는데, 회전하면
-# 빈 모서리를 없애려고 테두리를 잘라야 해 구도와 해상도를 잃는다.
-_MIN_AUTO_STRAIGHTEN = 1.0
+# 자동 수평 보정의 하한(도). 기울기 감지기(param_engine._MIN_TILT)와 같은 값이다.
+# 한때 1.0°로 올렸다가, 지평선·건물 모서리가 있는 사진의 0.5~0.9° 기울기를
+# 더는 잡지 못한다는 사용자 보고로 되돌렸다 — 직선이 있으면 이 정도도 눈에 띈다.
+_MIN_AUTO_STRAIGHTEN = 0.4
 
 
 def _run_analyze_and_transform(
@@ -435,9 +436,9 @@ def _run_analyze_and_transform(
                     log.info("analyze-and-transform: using model tilt %.2f°", llm_tilt)
                 except (TypeError, ValueError):
                     auto_edits["straighten"] = None
-            # 구도를 바꾸는 편집(크롭·비율)은 모델 말대로 자동 적용하지 않는다.
-            # 인스타가 받지 않는 비율만 맞추고, 모델 크롭은 제안(suggested_*)으로
-            # 남겨 앱에서 사용자가 고르게 한다.
+            # 구도를 바꾸는 편집(크롭·비율)은 서버가 거른다. 인스타가 받지 않는
+            # 비율만 맞추고, 모델 크롭은 프레임을 충분히 남길 때만 자동 적용한다
+            # (앱에서 원래 구도로 되돌릴 수 있다). 과한 크롭·비율은 제안으로만.
             gate_auto_edits(auto_edits, img.size, allow_vertical_crop=subject != "인물")
             analysis["autoEdits"] = auto_edits
             params_comment = prefix_tilt_comment(params_comment, measured_tilt)

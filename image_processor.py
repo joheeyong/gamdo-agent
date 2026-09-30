@@ -2330,6 +2330,11 @@ _ASPECT_TOLERANCE = 0.02
 # 모델 크롭 제안이 이 면적 비율보다 많이 남기면(=조금만 자르면) 버린다.
 # 가장자리 몇 %를 깎는 크롭은 구도를 바꾸지 못하고 해상도만 잃는다.
 _SUGGEST_CROP_MAX_AREA = 0.85
+# 모델 크롭을 자동 적용하는 최소 남는 면적. 가장자리의 불필요한 영역을 정리하는
+# 크롭(카페 0.77, 음식 0.75, 인물 0.72~0.8)은 적용하고, 구도를 통째로 바꾸는
+# 과한 크롭은 제안으로만 둔다. 한때 자동 적용을 아예 껐다가, 불필요한 영역을
+# 잘라 주던 동작이 사라졌다는 사용자 보고로 되살렸다.
+_AUTO_CROP_MIN_AREA = 0.60
 
 
 def apply_instagram_ratio(
@@ -2443,9 +2448,11 @@ def gate_auto_edits(
     구도를 말없이 바꾸는 것이라, 서버가 판단한다:
       - instagram_ratio: 인스타가 받지 않는 비율일 때만 자동 적용 (가장 덜 자르는
         허용 비율로). 모델이 고른 비율이 실제로 사진을 자르면 suggested_ratio로.
-      - crop: 자동 적용하지 않는다. 의미 있게 자르는 것만 suggested_crop으로.
+      - crop: 의미 있게 자르는 것만 suggested_crop으로 남기고, 프레임을
+        [_AUTO_CROP_MIN_AREA] 이상 남기면 apply_suggested_crop=True로 바로 적용한다.
+        이때 모델 비율은 얹지 않는다 — 크롭 위에 4:5까지 겹치면 풍경이 39%만 남았다.
     suggested_* 는 [apply_auto_edits]가 apply_suggested_crop=True일 때만 쓴다
-    (앱의 '추천 구도로 자르기'). 들어온 dict를 제자리에서 고치고 돌려준다.
+    (앱의 '추천 구도로 자르기 / 원래 구도로'). 들어온 dict를 제자리에서 고치고 돌려준다.
     """
     model_crop = auto_edits.pop("crop", None)
     model_ratio = auto_edits.pop("instagram_ratio", None)
@@ -2460,6 +2467,9 @@ def gate_auto_edits(
     suggestion = suggest_crop(model_crop, allow_vertical_crop)
     if suggestion is not None:
         auto_edits["suggested_crop"] = suggestion
+        if suggestion["width"] * suggestion["height"] >= _AUTO_CROP_MIN_AREA:
+            auto_edits["apply_suggested_crop"] = True
+            return auto_edits
     if (
         isinstance(model_ratio, str)
         and model_ratio != needed
