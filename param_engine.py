@@ -25,7 +25,10 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from image_processor import _HSL_CHANNELS, cast_pixel_weight, estimate_illuminant, estimate_noise_sigma, vivid_blue_weight
+from image_processor import (
+    _HSL_CHANNELS, _INPAINT_MAX_AREA, cast_pixel_weight, estimate_illuminant,
+    estimate_noise_sigma, vivid_blue_weight,
+)
 
 log = logging.getLogger("gamdo-agent")
 
@@ -1420,6 +1423,42 @@ def _nonzero(raw: Any) -> bool:
         return False
 
 
+# 국소 보정의 이유(reason)가 이런 말이면, 톤을 만질 대상이 아니라 지울 대상이다.
+# 실측: 창문 너머 도시 사진에서 모델이 천장 조명의 유리 반사를 "유리에 비친 조명 반사"로
+# 정확히 짚고도 local_* 로 어둡게만 해, 반사가 사라지지 않고 타원 얼룩으로 남았다.
+_REMOVAL_REASON_WORDS = ("반사", "비친", "비쳐", "비침", "글레어", "플레어", "먼지",
+                         "얼룩", "물방울", "반점", "자국")
+
+
+def _local_to_removal(
+    analysis: dict[str, Any], name: str, spec: dict[str, Any],
+) -> bool:
+    """반사·얼룩을 짚은 작은 국소 보정을 remove_areas(인페인팅)로 옮긴다. 옮겼으면 True.
+
+    인페인팅은 작은 영역만 자연스럽게 메우므로 image_processor와 같은 크기 한도를 쓴다.
+    그보다 크면 지우지 않고 원래대로 국소 보정으로 둔다.
+    """
+    reason = str(spec.get("reason") or "")
+    if not any(w in reason for w in _REMOVAL_REASON_WORDS):
+        return False
+    box = _local_box(spec)
+    if box is None:
+        return False
+    x0, y0 = max(0.0, box[0]), max(0.0, box[1])
+    x1, y1 = min(1.0, box[2]), min(1.0, box[3])
+    w, h = x1 - x0, y1 - y0
+    if w <= 0 or h <= 0 or w * h > _INPAINT_MAX_AREA:
+        return False
+    auto = analysis.get("autoEdits")
+    auto = dict(auto) if isinstance(auto, dict) else {}
+    areas = [a for a in (auto.get("remove_areas") or []) if isinstance(a, dict)]
+    areas.append({"x": round(x0, 4), "y": round(y0, 4), "width": round(w, 4), "height": round(h, 4)})
+    auto["remove_areas"] = areas
+    analysis["autoEdits"] = auto
+    log.info("param_engine: region %s → remove_areas (%s, 면적 %.2f%%)", name, reason, w * h * 100)
+    return True
+
+
 def _prune_region_params(
     analysis: dict[str, Any], params: dict[str, Any], is_portrait: bool, gain: float,
 ) -> None:
@@ -1443,6 +1482,8 @@ def _prune_region_params(
             continue
         if name == "background" and is_portrait:
             log.info("param_engine: region background 버림 — 인물의 몸까지 덮는 전역 보정")
+            continue
+        if name.startswith("local") and _local_to_removal(analysis, name, spec):
             continue
         vals: dict[str, Any] = {}
         for key, raw in spec.items():
