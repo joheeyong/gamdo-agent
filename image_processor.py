@@ -607,6 +607,33 @@ def apply_denoise(img: Image.Image, strength: float) -> Image.Image:
         return img
 
 
+def vivid_blue_weight(rgb: np.ndarray) -> np.ndarray:
+    """선명한 하늘색일수록 1에 가까운 가중치 (0~1, float32). rgb: HxWx3, 0~255.
+
+    파란 하늘은 장면의 색이지 조명의 캐스트가 아니다. 하늘이 넓은 야외 사진은
+    밝은 곳(하늘)과 어두운 곳(그늘)이 함께 파래서 '고른 파란 캐스트'로 잡혔고,
+    화이트밸런스 0.62가 걸려 하늘 채도가 24.4 → 15.1(−38%)로 빠졌다. 웜톤을
+    얹을 때도(+0.19에서 −11%) 하늘이 회색 쪽으로 밀렸다. 이 가중치로 하늘색 화소는
+    캐스트 판단에서 빼고, 화이트밸런스·웜톤·채도 감소를 약하게만 적용한다.
+    기준: LAB(8비트 눈금)에서 b가 128보다 충분히 낮고(파랑) 어둡지 않은 화소.
+    실측 하늘은 b* −15~−40, 그늘·형광등의 파란 캐스트는 회색 면에서 −5~−12라,
+    캐스트까지 하늘로 오인하지 않게 −14부터 올려 −28에서 1이 되게 둔다.
+    """
+    lab = cv2.cvtColor(np.clip(rgb, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    blue = np.clip((128.0 - lab[..., 2] - _SKY_B_START) / _SKY_B_RAMP, 0.0, 1.0)
+    bright = np.clip((lab[..., 0] - 80.0) / 50.0, 0.0, 1.0)
+    return (blue * bright).astype(np.float32)
+
+
+_SKY_B_START = 14.0        # 128 − b(8비트 눈금)가 이만큼부터 하늘로 보기 시작
+_SKY_B_RAMP = 14.0
+
+# 하늘색 화소에 걸 보정의 몫 (1 − 보호율). 0이면 하늘은 전혀 안 바뀐다.
+_SKY_WB_KEEP = 0.2          # 화이트밸런스: 하늘은 20%만
+_SKY_WARM_KEEP = 0.3        # 웜톤(양수 temperature): 30%만
+_SKY_DESAT_KEEP = 0.4       # 채도 낮추기(음수 saturation): 40%만
+
+
 def estimate_illuminant(img: Image.Image) -> tuple[float, float, float]:
     """장면의 조명 색을 추정해 중립으로 만드는 RGB 게인을 반환한다.
 
@@ -621,9 +648,13 @@ def estimate_illuminant(img: Image.Image) -> tuple[float, float, float]:
         small = small.resize((max(1, int(w * ratio)), max(1, int(h * ratio))), Image.BILINEAR)
 
     arr = np.asarray(small, dtype=np.float32) / 255.0
+    # 선명한 하늘색 화소는 조명 색이 아니라 장면의 색이다 — 추정에서 뺀다
+    # (남는 화소가 너무 적으면 전체로 추정).
+    keep = vivid_blue_weight(arr * 255.0) < 0.5
+    pix = arr[keep] if keep.mean() > 0.2 else arr.reshape(-1, 3)
     p = 6.0
     norms = np.array([
-        (np.power(arr[..., c], p).mean()) ** (1.0 / p) for c in range(3)
+        (np.power(pix[:, c], p).mean()) ** (1.0 / p) for c in range(3)
     ])
     norms[norms < 1e-6] = 1e-6
 
@@ -654,8 +685,10 @@ def apply_auto_white_balance(img: Image.Image, strength: float) -> Image.Image:
         return img
 
     arr = np.asarray(img.convert("RGB"), dtype=np.float32)
+    # 하늘색 화소는 게인을 조금만 건다 — 파란 하늘이 회색으로 빠지지 않게
+    keep = 1.0 - (1.0 - _SKY_WB_KEEP) * vivid_blue_weight(arr)
     for c, g in enumerate(gains):
-        arr[..., c] *= g
+        arr[..., c] *= 1.0 + (g - 1.0) * keep
 
     log.info("auto_wb: strength=%.2f gains=(%.3f, %.3f, %.3f)", strength, *gains)
     # 반올림해서 되돌린다. astype만 하면 소수점이 버려져 게인을 거의 안 건
@@ -4240,8 +4273,16 @@ def _apply_lab_adjustments(
         b_ch = b_ch * (1.0 - haze_amount * 0.3) + 128.0 * haze_amount * 0.3
 
     # ── 8. Temperature (B 채널 + A 채널 미세 조정) ──
+    sky_w = None
+    if temperature >= 0.01 or (-0.99 < saturation <= -0.01):
+        # 하늘색 가중치 (LAB 8비트 눈금에서 바로 계산 — vivid_blue_weight와 같은 기준)
+        sky_w = (np.clip((128.0 - b_ch - _SKY_B_START) / _SKY_B_RAMP, 0.0, 1.0)
+                 * np.clip((l_ch - 80.0) / 50.0, 0.0, 1.0))
     if abs(temperature) >= 0.01:
         shift = temperature * 15.0
+        if temperature > 0 and sky_w is not None:
+            # 웜톤은 하늘에 약하게 — 파랑에 노랑을 얹으면 회색이 된다
+            shift = shift * (1.0 - (1.0 - _SKY_WARM_KEEP) * sky_w)
         b_ch = b_ch + shift
         a_ch = a_ch + shift * 0.3
 
@@ -4254,8 +4295,12 @@ def _apply_lab_adjustments(
         a_ch = np.full_like(a_ch, 128.0)
         b_ch = np.full_like(b_ch, 128.0)
     elif abs(saturation) >= 0.01:
-        a_ch = 128.0 + (a_ch - 128.0) * (1.0 + saturation)
-        b_ch = 128.0 + (b_ch - 128.0) * (1.0 + saturation)
+        sat = saturation
+        if saturation < 0 and sky_w is not None:
+            # 차분한 톤으로 채도를 낮춰도 하늘의 파랑은 덜 뺀다
+            sat = saturation * (1.0 - (1.0 - _SKY_DESAT_KEEP) * sky_w)
+        a_ch = 128.0 + (a_ch - 128.0) * (1.0 + sat)
+        b_ch = 128.0 + (b_ch - 128.0) * (1.0 + sat)
 
     # ── LAB → BGR → RGB 1회 역변환 ──
     # 하드 클립 대신 끝을 접는다 ([_soft_limit] 참고).

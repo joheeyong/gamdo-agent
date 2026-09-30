@@ -120,8 +120,10 @@ def test_white_balance_rounds_instead_of_truncating():
     out = np.asarray(ip.apply_auto_white_balance(img, 0.5), np.float32)
     gains = [max(0.75, min(1.25, 1.0 + (g - 1.0) * 0.5)) for g in ip.estimate_illuminant(img)]
     src = np.asarray(img, np.float32)
+    # 선명한 하늘색 화소는 게인을 덜 건다 (ip._SKY_WB_KEEP)
+    keep = 1.0 - (1.0 - ip._SKY_WB_KEEP) * ip.vivid_blue_weight(src)
     for c in range(3):
-        expected = np.clip(np.rint(src[..., c] * np.float32(gains[c])), 0, 255)
+        expected = np.clip(np.rint(src[..., c] * (1.0 + (np.float32(gains[c]) - 1.0) * keep)), 0, 255)
         assert abs(out[..., c].mean() - expected.mean()) < 0.02   # 절삭이면 ≈ −0.5
 
 

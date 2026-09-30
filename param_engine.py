@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from image_processor import _HSL_CHANNELS, estimate_illuminant, estimate_noise_sigma
+from image_processor import _HSL_CHANNELS, estimate_illuminant, estimate_noise_sigma, vivid_blue_weight
 
 log = logging.getLogger("gamdo-agent")
 
@@ -84,8 +84,13 @@ def measure_image_stats(img: Image.Image) -> dict[str, float]:
     # 색 틀어짐이 사진 전체에 고른지 — 조명 탓인지 장면 탓인지 가른다.
     # 백열등 실내는 밝은 곳도 어두운 곳도 다 누렇지만(고름 → 교정 대상),
     # 노을은 하늘만 붉고 그늘은 그렇지 않다(고르지 않음 → 장면의 색).
-    lo, hi = np.percentile(luma, [33, 67])
-    dark_px, bright_px = luma <= lo, luma >= hi
+    # 선명한 하늘색 화소는 빼고 잰다. 파란 하늘(밝음)과 그늘(어두움)이 함께 파래서
+    # 고른 파란 캐스트로 잡히고, 화이트밸런스가 하늘을 회색으로 만들었다.
+    not_sky = vivid_blue_weight(arr) < 0.5
+    if not_sky.mean() < 0.2:
+        not_sky = np.ones_like(not_sky)
+    lo, hi = np.percentile(luma[not_sky], [33, 67])
+    dark_px, bright_px = (luma <= lo) & not_sky, (luma >= hi) & not_sky
     warm_dark = float((r[dark_px] - b[dark_px]).mean()) / 128.0 if dark_px.any() else 0.0
     warm_bright = float((r[bright_px] - b[bright_px]).mean()) / 128.0 if bright_px.any() else 0.0
     if warm_dark * warm_bright <= 0:
@@ -98,7 +103,9 @@ def measure_image_stats(img: Image.Image) -> dict[str, float]:
         "brightness": float(luma.mean()) / 255.0,
         "contrast": float(p95 - p5) / 255.0,
         "saturation": saturation,
-        "warmth": float(r.mean() - b.mean()) / 128.0,
+        # 하늘을 뺀 R−B. 넓은 파란 하늘이 사진 전체를 '차갑다'고 읽히게 해서
+        # 웜톤이 최대치(+0.2)까지 얹히고 하늘이 탁해졌다 (캐스트 판단과 같은 기준).
+        "warmth": float((r - b)[not_sky].mean()) / 128.0,
         "highlight_p95": float(p95) / 255.0,
         "shadow_p05": float(p5) / 255.0,
         "highlight_clip": float((luma > 250).mean()),
@@ -1176,6 +1183,10 @@ def _prune_region_params(
                 continue   # 전역 밝기가 이미 같은 쪽으로 얼굴을 올린다
             if name == "background" and same_dir:
                 v *= _REGION_GLOBAL_DAMP
+            if name == "sky" and key == "saturation" and v < 0:
+                # 하늘은 채도를 지키거나 높이는 자리다 (프롬프트도 그렇게 요구한다).
+                # 모델이 −0.1을 줘서 전역 채도 감소와 겹쳐 하늘이 회색으로 빠졌다.
+                continue
             if abs(v) < _REGION_MIN_EFFECT:
                 continue
             vals[key] = v
