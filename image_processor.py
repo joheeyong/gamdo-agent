@@ -4448,6 +4448,93 @@ def _skin_tone_weight(l_ch: np.ndarray, a_ch: np.ndarray, b_ch: np.ndarray) -> n
     return (hue_w * chroma_w * light_w).astype(np.float32)
 
 
+# ── Oklab 색상각 고정 (파랑이 보라로 도는 문제) ──
+#
+# CIELAB은 파랑 영역에서 색상이 고르지 않다. a·b를 같은 비율로 줄이거나(채도)
+# a·b를 둔 채 L만 올리면(밝기·톤 커브) CIELAB 색상각은 그대로지만 눈에는 보라로
+# 돈다. 실측(기본 레시피, c5 로열블루 드레스): RGB (6,24,122) → (48,42,123), R>G.
+# Oklab 색상각으로 +15°. 채도 −0.184만으로 +9.6°, 밝기 +0.16만으로 +6.5°.
+# 빨강·초록·주황·피부는 같은 연산에서 2° 안쪽이다.
+# 그래서 L·채도 연산이 끝난 뒤, "L·채도 연산 전" 화소의 Oklab 색상각을 되돌려 씌운다.
+# 밝기(Oklab L)와 채도(Oklab C)는 새 값을 그대로 쓰므로 보정량은 바뀌지 않는다.
+# 색온도처럼 일부러 색상을 옮기는 연산은 기준 화소에 이미 들어 있어 유지된다.
+
+_LAB_WHITE = np.float32([0.950456, 1.0, 1.088754])   # cv2 CIELAB의 D65 백색점
+_XYZ_TO_LRGB = np.float32([[3.240479, -1.53715, -0.498535],
+                           [-0.969256, 1.875991, 0.041556],
+                           [0.055648, -0.204043, 1.057311]])
+_OK_M1 = np.float32([[0.4122214708, 0.5363325363, 0.0514459929],
+                     [0.2119034982, 0.6806995451, 0.1073969566],
+                     [0.0883024619, 0.2817188376, 0.6299787005]])
+_OK_M2 = np.float32([[0.2104542553, 0.7936177850, -0.0040720468],
+                     [1.9779984951, -2.4285922050, 0.4505937099],
+                     [0.0259040371, 0.7827717662, -0.8086757660]])
+_OK_M1_INV = np.linalg.inv(_OK_M1).astype(np.float32)
+_OK_M2_INV = np.linalg.inv(_OK_M2).astype(np.float32)
+# CIELAB의 정규화 XYZ(백색점으로 나눈 값) → 선형 sRGB
+_LABXYZ_TO_LRGB = (_XYZ_TO_LRGB @ np.diag(_LAB_WHITE)).astype(np.float32)
+_LAB_EPS = 6.0 / 29.0
+# CIELAB(8비트 눈금) → (fx, fy, fz): fy=(L*+16)/116, fx=fy+a*/500, fz=fy−b*/200 (아핀)
+_LAB8_TO_F = np.float32([
+    [100.0 / 255.0 / 116.0, 1.0 / 500.0, 0.0, 16.0 / 116.0 - 128.0 / 500.0],
+    [100.0 / 255.0 / 116.0, 0.0, 0.0, 16.0 / 116.0],
+    [100.0 / 255.0 / 116.0, 0.0, -1.0 / 200.0, 16.0 / 116.0 + 128.0 / 200.0],
+])
+# 이보다 채도(Oklab C)가 낮은 기준 화소는 색상각이 잡음이라 건드리지 않는다
+_HUE_LOCK_MIN_C = 0.004
+
+
+def _lab8_to_oklab(l8: np.ndarray, a8: np.ndarray, b8: np.ndarray) -> np.ndarray:
+    """CIELAB(8비트 눈금, float) → Oklab (sRGB 색역으로 자른 뒤)."""
+    f = cv2.transform(cv2.merge([l8, a8, b8]).astype(np.float32), _LAB8_TO_F)
+    xyz = cv2.pow(f, 3)
+    dark = f <= _LAB_EPS   # 아주 어두운 쪽의 선형 구간 (드물다)
+    if dark.any():
+        xyz[dark] = (3.0 * _LAB_EPS * _LAB_EPS) * (f[dark] - 4.0 / 29.0)
+    # 색역 밖 값은 화면에 나갈 모습(채널별 자르기)으로 본다 — 매우 어두운 곳을 L만
+    # 내리면 a·b가 그대로라 선형 RGB가 음수가 되는데, 이 값 그대로 Oklab 채도를 재면
+    # 실제보다 훨씬 커서 색상을 되돌릴 때 그림자가 파랗게 떴다(flash_digicam 숲).
+    rgb = cv2.transform(xyz, _LABXYZ_TO_LRGB)
+    np.clip(rgb, 0.0, 1.0, out=rgb)
+    # 자른 뒤라 LMS ≥ 0 — np.cbrt보다 빠른 cv2.pow로 세제곱근
+    return cv2.transform(cv2.pow(cv2.transform(rgb, _OK_M1), 1.0 / 3.0), _OK_M2)
+
+
+def _oklab_to_lin_rgb(ok: np.ndarray) -> np.ndarray:
+    lms = cv2.transform(ok, _OK_M2_INV)
+    return cv2.transform(lms * lms * lms, _OK_M1_INV)
+
+
+def _lin_rgb_to_lab8(rgb: np.ndarray) -> np.ndarray:
+    """선형 sRGB(0~1) → CIELAB(8비트 눈금, float)."""
+    return cv2.transform(cv2.cvtColor(rgb, cv2.COLOR_LRGB2Lab), _LAB8_FWD)
+
+
+def _keep_oklab_hue(ref: tuple[np.ndarray, np.ndarray, np.ndarray],
+                    new: tuple[np.ndarray, np.ndarray, np.ndarray]
+                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """new(L·a·b, 8비트 눈금)의 Oklab 밝기·채도는 두고 색상각만 ref의 것으로 되돌린다.
+
+    sRGB 색역을 벗어난 값은 예전처럼 채널별로 자른다. 같은 밝기·색상에서 채도를
+    줄여 경계에 맞추는 방식도 재 봤지만, 채도 올리기·쿨톤 스타일(flash_digicam)의
+    선명한 파랑·빨강이 눈에 띄게 탁해졌다(glover 우주복 Oklab C 0.181 → 0.122).
+    채도를 낮추는 기본 레시피에서는 파랑이 색역 안에 있어 자르기와 무관하다.
+    """
+    ok_ref = _lab8_to_oklab(*ref)
+    ok_new = _lab8_to_oklab(*new)
+    c_ref = np.hypot(ok_ref[..., 1], ok_ref[..., 2])
+    c_new = np.hypot(ok_new[..., 1], ok_new[..., 2])
+    sel = c_ref > _HUE_LOCK_MIN_C
+    scale = c_new / np.maximum(c_ref, _HUE_LOCK_MIN_C)
+    # 거의 무채색인 기준 화소는 새 값의 a·b를 그대로 둔다 (왕복 변환만 거친다)
+    ok_new[..., 1] = np.where(sel, ok_ref[..., 1] * scale, ok_new[..., 1])
+    ok_new[..., 2] = np.where(sel, ok_ref[..., 2] * scale, ok_new[..., 2])
+    rgb = _oklab_to_lin_rgb(ok_new)
+    np.clip(rgb, 0.0, 1.0, out=rgb)
+    lab = _lin_rgb_to_lab8(rgb)
+    return lab[..., 0], lab[..., 1], lab[..., 2]
+
+
 def _apply_lab_adjustments(
     img: Image.Image,
     highlights: float = 0.0,
@@ -4528,6 +4615,7 @@ def _apply_lab_adjustments(
     l_ch = lab[:, :, 0]
     a_ch = lab[:, :, 1]
     b_ch = lab[:, :, 2]
+    l_ref = l_ch.copy()  # Oklab 색상각 고정의 기준 밝기 ([_keep_oklab_hue])
 
     # ── 1. Highlights (L 채널) ──
     if abs(highlights) >= 0.01:
@@ -4604,6 +4692,7 @@ def _apply_lab_adjustments(
         a_ch = a_ch + shift * 0.3
 
     # ── 9. Saturation (A, B 채널) ──
+    a_pre_sat, b_pre_sat = a_ch, b_ch
     if saturation <= _MONO_SATURATION:
         # 흑백 변환 — 색을 밝기로 옮긴 뒤 a·b를 완전히 중립으로 둔다.
         # 스케일(1+saturation)로 두면 -0.99가 1% 색을 남겨 완전한 흑백이 아니다.
@@ -4631,9 +4720,15 @@ def _apply_lab_adjustments(
 
     # ── LAB → BGR → RGB 1회 역변환 ──
     # 하드 클립 대신 끝을 접는다 ([_soft_limit] 참고).
-    lab[:, :, 0] = _soft_limit(l_ch)
-    lab[:, :, 1] = _soft_limit(a_ch)
-    lab[:, :, 2] = _soft_limit(b_ch)
+    l_out, a_out, b_out = _soft_limit(l_ch), _soft_limit(a_ch), _soft_limit(b_ch)
+    if saturation > _MONO_SATURATION and (abs(saturation) >= 0.01 or not np.array_equal(l_out, l_ref)):
+        # L·채도 연산이 돌려 놓은 Oklab 색상각을 되돌린다 (파랑 → 보라 방지).
+        # 기준 = 원래 밝기 + 채도 직전의 a·b (색온도·안개의 의도된 색 이동 포함).
+        l_out, a_out, b_out = _keep_oklab_hue((l_ref, a_pre_sat, b_pre_sat),
+                                              (l_out, a_out, b_out))
+    lab[:, :, 0] = l_out
+    lab[:, :, 1] = a_out
+    lab[:, :, 2] = b_out
 
     # float LAB 그대로 역변환한 뒤 반올림한다. 예전처럼 8비트 LAB로 절삭(astype)하면
     # L·a·b가 각각 평균 0.5씩 깎이고(어둡고 푸르게), 색온도 등이 남긴 소수점이

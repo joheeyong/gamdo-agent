@@ -61,7 +61,9 @@ def _mean_de(a, b) -> float:
 
 def test_formerly_similar_styles_are_distinct():
     # 합성 이미지 두 장의 평균 ΔE 하한 (예전 값). 실사진 10장에서는 5.1 / 5.1 / 4.5 (예전 3.4 / 3.3 / 3.3)
-    pairs = [("default", "warm_film", 3.2),        # 예전 2.5
+    # default/warm_film은 3.23 → 3.15: 두 스타일 모두 짙은 파랑 옷이 보라로 돌던 몫(채도를 더 빼는
+    # warm_film이 더 돌았다)이 Oklab 색상 고정으로 사라진 만큼이다 (test_blue_hue.py).
+    pairs = [("default", "warm_film", 3.1),        # 예전 2.5
              ("clean_minimal", "bright_airy", 4.5),  # 예전 3.9
              ("warm_film", "golden_hour", 4.3)]      # 예전 3.8
     imgs = [(_scene(), "혼합"), (_lowkey_portrait(), "인물")]
