@@ -20,7 +20,7 @@ claude                            # 대화형으로 실행해 /login. 헤드리�
 cp .env.example .env              # 아래 표 참고
 
 # 서버 실행
-python server.py                  # → http://localhost:8000 , 문서: /docs
+python server.py                  # → http://localhost:8000 , 문서: /docs (GAMDO_ENABLE_DOCS=1일 때)
 
 # 테스트
 .venv/bin/pytest -q
@@ -42,6 +42,7 @@ python server.py                  # → http://localhost:8000 , 문서: /docs
 | `GAMDO_MAX_QUEUED_JOBS` | `20` | 대기 중인 작업 상한. 넘으면 새 작업은 503 `busy`. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | (선택) | 헤드리스 서버에서 `claude` CLI 로그인 대신 쓰는 토큰. |
 | `PORT` | `8000` | `python server.py` 실행 포트. |
+| `GAMDO_ENABLE_DOCS` | 꺼짐 | `1`/`true`/`yes`면 API 문서(`/docs`, `/redoc`, `/openapi.json`)를 연다. 문서는 인증 없이 열리므로 운영에서는 끈다. |
 
 ## 인증
 
@@ -78,7 +79,7 @@ python server.py                  # → http://localhost:8000 , 문서: /docs
 ## API
 
 모든 응답은 `{"success": bool, ..., "error": str | null}` 형식이다. 처리 중 오류는 대부분
-HTTP 200 + `success: false`로, 인증 오류는 위의 HTTP 상태 코드로 온다. 자세한 스키마는 `/docs`.
+HTTP 200 + `success: false`로, 인증 오류는 위의 HTTP 상태 코드로 온다. 자세한 스키마는 `/docs` (`GAMDO_ENABLE_DOCS=1`일 때).
 
 | 메서드 | 경로 | 인증 | 설명 |
 | --- | --- | --- | --- |

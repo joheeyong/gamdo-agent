@@ -94,7 +94,18 @@ def _redact(text: object) -> str:
     """로그·에러 응답에 남기기 전에 토큰류 값을 가린다."""
     return _SECRET_PARAM_RE.sub(r"\1***", str(text))
 
-app = FastAPI(title="GAMDO Agent", version="0.1.0")
+def _docs_kwargs() -> dict:
+    """API 문서(/docs, /redoc, /openapi.json) 노출 여부.
+
+    문서 페이지는 인증 없이 열려 엔드포인트·요청 스키마를 모두 보여 준다.
+    운영에서는 끄고, 개발할 때만 GAMDO_ENABLE_DOCS=1로 켠다.
+    """
+    if os.getenv("GAMDO_ENABLE_DOCS", "").strip().lower() in auth._TRUTHY:
+        return {}
+    return {"docs_url": None, "redoc_url": None, "openapi_url": None}
+
+
+app = FastAPI(title="GAMDO Agent", version="0.1.0", **_docs_kwargs())
 
 app.add_middleware(
     CORSMiddleware,

@@ -214,3 +214,26 @@ def test_apply_transform_garbage_curve_is_ignored(client):
     assert body["success"], body.get("error")
     assert body["params_applied"]["tone_curve_points"] is None
     assert body["params_applied"]["hsl_adjust"] is None
+
+
+# ── API 문서 노출 ──
+
+
+def _docs_app() -> TestClient:
+    return TestClient(FastAPI(**server._docs_kwargs()))
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no"])
+def test_docs_disabled_by_default(monkeypatch, value):
+    monkeypatch.setenv("GAMDO_ENABLE_DOCS", value)
+    c = _docs_app()
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert c.get(path).status_code == 404
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES"])
+def test_docs_enabled_by_env(monkeypatch, value):
+    monkeypatch.setenv("GAMDO_ENABLE_DOCS", value)
+    c = _docs_app()
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert c.get(path).status_code == 200
