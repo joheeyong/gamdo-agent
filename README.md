@@ -45,12 +45,20 @@ deploy/macos/uninstall.sh                               # 셋 다 끄고 등록 
 | `com.gamdo.server` | `uvicorn server:app` (8000번, 자동 리로드 없음) | `server.log` |
 | `com.gamdo.ngrok` | 앱의 기본 서버 주소(고정 ngrok 도메인) → 8000번 | `~/Library/Logs/gamdo/ngrok.log` |
 | `com.gamdo.caffeinate` | `caffeinate -ims` — 서버가 다시 켜지는 사이에도 잠들지 않게 | - |
+| `com.gamdo.claudecheck` | `ops/claude_check.py` — 로그인할 때와 매일 09:00에 Claude CLI 인증 점검 | `~/Library/Logs/gamdo/claude_check.log` |
 
 - 템플릿은 `deploy/macos/*.plist.template`이고, `install.sh`가 이 저장소 경로·ngrok·claude 위치로 채운다.
   launchd는 로그인 셸의 PATH를 모르므로 claude CLI가 있는 폴더를 PATH로 넘긴다.
 - 노트북 덮개를 닫으면 잠자기 방지와 상관없이 잠든다. 재부팅 뒤에는 로그인해야 켜진다.
-- 상태 확인(`/health`)은 Claude 로그인까지는 보지 않는다. `CLAUDE_CODE_OAUTH_TOKEN`은
-  `claude setup-token`으로 만든 1년짜리라, 만료 전에 새로 만들어 `.env`를 바꾸고 서버를 다시 시작한다.
+- `/health`는 서버만 본다. Claude 로그인·토큰 상태는 정기 점검이 본다:
+  - 서버와 같은 환경으로 `claude -p`에 짧은 요청(haiku)을 보내 응답을 확인한다.
+  - 인증 실패(401·로그인 안 됨)·응답 없음·토큰 만료 30일 전이면 macOS 알림을 띄운다.
+  - 결과는 `~/Library/Logs/gamdo/claude_check.json`, 밖에서는 `GET /health/claude`
+    (`ok`·`kind`·`checked_at`·`token_days_left`만, 오류 원문은 싣지 않음).
+  - 수동 실행: `.venv/bin/python ops/claude_check.py` (`--no-notify`로 알림 없이).
+- `CLAUDE_CODE_OAUTH_TOKEN`은 `claude setup-token`으로 만든 1년짜리다. `.env`에
+  `CLAUDE_CODE_OAUTH_TOKEN_ISSUED=YYYY-MM-DD`(발급일)를 두면 만료가 가까울 때 알린다.
+  교체: 새 토큰을 `.env`에 넣고 발급일을 바꾼 뒤 `launchctl kickstart -k gui/$(id -u)/com.gamdo.server`.
 
 ## 환경변수
 
@@ -110,6 +118,7 @@ HTTP 200 + `success: false`로, 인증 오류는 위의 HTTP 상태 코드로 �
 | 메서드 | 경로 | 인증 | 설명 |
 | --- | --- | --- | --- |
 | GET | `/health` | 면제 | 상태 확인 |
+| GET | `/health/claude` | 면제 | 마지막 Claude CLI 점검 결과 (`ok`·`kind`·`checked_at`·`token_days_left`) |
 | POST | `/api/analyze-user` | 필요 | 게시글/피드/스토리 → 스타일 프로필. `user_id`가 있으면 대표 사진 3장을 저장 |
 | POST | `/api/transform-photo` | 필요 | 스타일 프로필 기준 사진 보정 가이드 (분석만) |
 | POST | `/api/analyze-and-transform` | 필요 | 사진 분석 + 보정 이미지 생성. `user_id`의 대표 사진을 목표값으로 사용 (동기, 구버전 앱용) |

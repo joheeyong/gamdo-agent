@@ -1,5 +1,5 @@
 #!/bin/sh
-# 감도 서버를 macOS launchd에 등록한다 — 서버·ngrok 터널·잠자기 방지.
+# 감도 서버를 macOS launchd에 등록한다 — 서버·ngrok 터널·잠자기 방지·Claude 정기 점검.
 #
 # 셋 다 로그인하면 자동으로 켜지고, 꺼지면 launchd가 다시 띄운다.
 #
@@ -32,7 +32,7 @@ if [ $DRY_RUN -eq 1 ]; then
 fi
 mkdir -p "$TARGET" "$LOG_DIR"
 
-for name in caffeinate server ngrok; do
+for name in caffeinate server ngrok claudecheck; do
   src="$HERE/com.gamdo.$name.plist.template"
   dst="$TARGET/com.gamdo.$name.plist"
   sed -e "s#__AGENT_DIR__#$AGENT_DIR#g" \

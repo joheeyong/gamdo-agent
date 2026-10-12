@@ -1,6 +1,7 @@
 """GAMDO Agent Server — FastAPI + Claude Code CLI."""
 
 import base64
+import json
 import logging
 import math
 import os
@@ -274,6 +275,29 @@ def _check_user(ctx: AuthContext | None, user_id: str | None) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "gamdo-agent"}
+
+
+# ops/claude_check.py(launchd com.gamdo.claudecheck)가 남기는 Claude CLI 점검 결과
+_CLAUDE_STATUS_PATH = os.getenv(
+    "GAMDO_CLAUDE_STATUS_PATH",
+    os.path.join(os.path.expanduser("~"), "Library", "Logs", "gamdo", "claude_check.json"),
+)
+_CLAUDE_STATUS_KEYS = ("ok", "kind", "checked_at", "token_days_left")
+
+
+@app.get("/health/claude")
+def health_claude():
+    """마지막 Claude CLI 점검 결과. /health는 서버만 보므로 인증이 풀린 것은 여기서 본다.
+
+    인증 면제 엔드포인트라 비밀값·오류 원문은 싣지 않는다 (원문은 상태 파일에만).
+    점검 기록이 없으면 ok=null.
+    """
+    try:
+        with open(_CLAUDE_STATUS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {"ok": None, "kind": None, "checked_at": None, "token_days_left": None}
+    return {k: data.get(k) for k in _CLAUDE_STATUS_KEYS}
 
 
 @app.post("/api/analyze-user", response_model=AnalyzeUserResponse)

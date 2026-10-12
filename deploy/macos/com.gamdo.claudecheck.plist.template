@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Claude CLI 인증 정기 점검 (ops/claude_check.py). 로그인할 때와 매일 09:00에 돈다.
+       잠들어 있어 09:00를 놓치면 깨어날 때 실행된다. 실패·만료 임박이면 macOS 알림. -->
+  <key>Label</key><string>com.gamdo.claudecheck</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__AGENT_DIR__/.venv/bin/python</string>
+    <string>__AGENT_DIR__/ops/claude_check.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>__AGENT_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>__PATH__</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+  <key>StandardOutPath</key><string>__LOG_DIR__/claude_check.log</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/claude_check.log</string>
+</dict>
+</plist>
