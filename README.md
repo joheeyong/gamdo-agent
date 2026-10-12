@@ -26,6 +26,32 @@ python server.py                  # → http://localhost:8000 , 문서: /docs (G
 .venv/bin/pytest -q
 ```
 
+## macOS에서 상시 실행 (launchd)
+
+개발 Mac 한 대를 서버로 쓸 때의 설정이다. 서버·ngrok 터널·잠자기 방지를 launchd에
+등록하면 로그인할 때 자동으로 켜지고, 오류로 꺼져도 launchd가 몇 초 안에 다시 띄운다.
+
+```bash
+# 전제: .venv 설치, .env에 CLAUDE_CODE_OAUTH_TOKEN, ngrok 로그인(ngrok config add-authtoken)
+NGROK_URL=https://<고정 도메인>.ngrok-free.dev deploy/macos/install.sh
+deploy/macos/install.sh --dry-run          # 등록하지 않고 만들어질 파일만 확인
+
+launchctl kickstart -k gui/$(id -u)/com.gamdo.server   # 서버 코드 변경 반영
+deploy/macos/uninstall.sh                               # 셋 다 끄고 등록 해제
+```
+
+| 등록 이름 | 하는 일 | 로그 |
+| --- | --- | --- |
+| `com.gamdo.server` | `uvicorn server:app` (8000번, 자동 리로드 없음) | `server.log` |
+| `com.gamdo.ngrok` | 앱의 기본 서버 주소(고정 ngrok 도메인) → 8000번 | `~/Library/Logs/gamdo/ngrok.log` |
+| `com.gamdo.caffeinate` | `caffeinate -ims` — 서버가 다시 켜지는 사이에도 잠들지 않게 | - |
+
+- 템플릿은 `deploy/macos/*.plist.template`이고, `install.sh`가 이 저장소 경로·ngrok·claude 위치로 채운다.
+  launchd는 로그인 셸의 PATH를 모르므로 claude CLI가 있는 폴더를 PATH로 넘긴다.
+- 노트북 덮개를 닫으면 잠자기 방지와 상관없이 잠든다. 재부팅 뒤에는 로그인해야 켜진다.
+- 상태 확인(`/health`)은 Claude 로그인까지는 보지 않는다. `CLAUDE_CODE_OAUTH_TOKEN`은
+  `claude setup-token`으로 만든 1년짜리라, 만료 전에 새로 만들어 `.env`를 바꾸고 서버를 다시 시작한다.
+
 ## 환경변수
 
 | 이름 | 기본값 | 설명 |

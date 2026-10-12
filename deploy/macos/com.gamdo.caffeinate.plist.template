@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- 서버를 돌리는 동안 Mac이 잠들지 않게 한다 (전원 연결 시 시스템 잠자기 포함).
+       서버와 따로 두어, 서버가 다시 시작되는 사이에도 잠자기 방지가 풀리지 않는다. -->
+  <key>Label</key><string>com.gamdo.caffeinate</string>
+  <key>ProgramArguments</key>
+  <array><string>/usr/bin/caffeinate</string><string>-ims</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>

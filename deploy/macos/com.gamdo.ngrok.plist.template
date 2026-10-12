@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- 앱의 기본 서버 주소(고정 ngrok 주소)를 이 Mac의 8000번 포트로 잇는다. -->
+  <key>Label</key><string>com.gamdo.ngrok</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NGROK_BIN__</string><string>http</string>
+    <string>--url=__NGROK_URL__</string>
+    <string>8000</string><string>--log=stdout</string><string>--log-format=logfmt</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>__PATH__</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>__LOG_DIR__/ngrok.log</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/ngrok.log</string>
+</dict>
+</plist>
