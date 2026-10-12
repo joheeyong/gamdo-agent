@@ -20,6 +20,7 @@ import httpx
 
 import auth
 import jobs
+from body_check import calibrate_body_reshape
 from models import (
     AnalyzeAndTransformRequest,
     AnalyzeAndTransformResponse,
@@ -336,6 +337,39 @@ def api_transform_photo(
 _MIN_AUTO_STRAIGHTEN = 0.4
 
 
+def _calibrate_body(params: dict, img, cache, analysis: dict, tag: str) -> None:
+    """모델이 제안한 체형 값을 측정·자체 검사로 다듬어 params에 다시 쓴다.
+
+    자동 보정 경로에서만 부른다. 사용자가 슬라이더로 고른 값(apply-transform)은
+    그대로 둔다. 다듬은 값은 응답 params로 앱에 가므로 슬라이더도 실제 적용값을
+    가리킨다. 분석 JSON의 recommendedParams에도 같은 값을 남겨, 기록을 다시
+    열거나 auto-transform으로 다시 그릴 때 같은 결과가 나오게 한다.
+    """
+    leg = float(params.get("leg_stretch", 0.0) or 0.0)
+    shoulder = float(params.get("shoulder_width", 0.0) or 0.0)
+    waist = float(params.get("waist_slim", 0.0) or 0.0)
+    if leg < 0.01 and waist < 0.01 and abs(shoulder) < 0.01:
+        return
+    try:
+        cal = calibrate_body_reshape(img, leg, shoulder, waist, cache=cache)
+    except Exception as exc:  # 검사 실패가 보정 전체를 막지 않게 — 체형만 끈다
+        log.warning("%s: body check failed, body reshape off: %s", tag, exc)
+        params["leg_stretch"] = params["shoulder_width"] = params["waist_slim"] = 0.0
+        return
+    params["leg_stretch"] = cal.leg_stretch
+    params["shoulder_width"] = cal.shoulder_width
+    params["waist_slim"] = cal.waist_slim
+    rec = analysis.get("recommendedParams")
+    if isinstance(rec, dict) and isinstance(rec.get("reshapeParams"), dict):
+        rec["reshapeParams"].update(
+            leg_stretch=cal.leg_stretch,
+            shoulder_width=cal.shoulder_width,
+            waist_slim=cal.waist_slim,
+        )
+    for note in cal.notes:
+        log.info("%s: body %s", tag, note)
+
+
 def _run_analyze_and_transform(
     req: AnalyzeAndTransformRequest,
     on_stage=None,
@@ -504,7 +538,11 @@ def _run_analyze_and_transform(
                     log.info("analyze-and-transform: applying autoEdits=%s", auto_edits)
                     img = apply_auto_edits(img, auto_edits)
 
-                # 8. 슬라이더 변형 적용
+                # 8. 체형: 모델 제안을 실제 비율 측정과 배경 휨 검사로 다듬는다.
+                #    기하 보정(회전·크롭)이 끝난, 실제로 그릴 이미지 위에서 잰다.
+                _calibrate_body(params, img, mp_cache, analysis, "analyze-and-transform")
+
+                # 9. 슬라이더 변형 적용
                 transformed = apply_all_transforms(img, cache=mp_cache, **params)
             result_b64 = encode_image_base64(transformed)
 
@@ -654,8 +692,12 @@ def api_auto_transform(
                 log.info("auto-transform: applying autoEdits=%s", auto_edits)
                 img = apply_auto_edits(img, auto_edits)
 
-            # 4. 슬라이더 변형 적용
-            transformed = apply_all_transforms(img, **params)
+            # 4. 체형 값이 있으면(옛 분석 JSON) 분석 직후와 같은 측정·검사를 거친다
+            with MediaPipeCache() as mp_cache:
+                _calibrate_body(params, img, mp_cache, analysis, "auto-transform")
+
+                # 5. 슬라이더 변형 적용
+                transformed = apply_all_transforms(img, cache=mp_cache, **params)
             result_b64 = encode_image_base64(transformed)
 
         log.info("auto-transform: success")

@@ -4374,6 +4374,82 @@ def _build_body_controls(
     return pts, disp, sigma, max_move, sh_half
 
 
+def _select_main_pose(results) -> tuple[Any | None, list]:
+    """가장 큰(키가 큰) 사람 하나와 나머지 사람들. 감지가 없으면 (None, [])."""
+    poses = list(getattr(results, "pose_landmarks", None) or [])
+    best, best_h = None, 0.0
+    for lms in poses:
+        ys = [lm.y for lm in lms]
+        ph = max(ys) - min(ys)
+        if ph > best_h:
+            best_h, best = ph, lms
+    others = [p for p in poses if p is not best]
+    return best, others
+
+
+def _pose_accessors(pose, w: int, h: int):
+    """랜드마크 번호 → 픽셀 좌표, 가시도 함수 한 쌍."""
+
+    def pt(idx: int) -> tuple[float, float]:
+        lm = pose[idx]
+        return lm.x * w, lm.y * h
+
+    def vis(idx: int) -> float:
+        v = getattr(pose[idx], "visibility", None)
+        return 1.0 if v is None else float(v)
+
+    return pt, vis
+
+
+def _leg_span(pt, vis) -> tuple[float, float, float] | None:
+    """(힙 y, 발목 y, 발끝 y). 발목이 안 보이면 None.
+
+    Pose: 23/24 힙, 27/28 발목, 29/30 뒤꿈치, 31/32 발끝.
+    """
+    ankles = [i for i in (27, 28) if vis(i) >= 0.5]
+    if not ankles:
+        return None
+    hip_y = (pt(23)[1] + pt(24)[1]) / 2.0
+    ankle_y = max(pt(i)[1] for i in ankles)
+    feet = [pt(i)[1] for i in (29, 30, 31, 32) if vis(i) >= 0.3]
+    foot_y = max(feet) if feet else ankle_y + 0.06 * (ankle_y - hip_y)
+    return hip_y, ankle_y, max(foot_y, ankle_y)
+
+
+def _torso_reshape(
+    arr: np.ndarray, pt, vis, person: np.ndarray | None,
+    shoulder_width: float, waist_slim: float,
+) -> tuple[np.ndarray, tuple | None, tuple[np.ndarray, np.ndarray] | None]:
+    """허리·어깨 국소 워프를 한 번의 remap으로 적용한다.
+
+    반환: (결과 배열, 적용한 roi(x0, y0, x1, y1), roi 안의 최종 역워프 변위장).
+    변형이 없으면 (arr, None, None). 변위장은 보정 후 자체 검사가 배경 직선의
+    휨을 재는 데 쓴다.
+    """
+    h, w = arr.shape[:2]
+    pts, disp, sigma, max_move, sh_half = _build_body_controls(
+        pt, vis, person, shoulder_width, waist_slim,
+    )
+    if max_move <= 0.0:
+        return arr, None, None
+    arr_pts = np.array(pts, np.float32)
+    arr_disp = np.array(disp, np.float32)
+    margin = 3.5 * sigma
+    roi = (arr_pts[:, 0].min() - margin, arr_pts[:, 1].min() - margin,
+           arr_pts[:, 0].max() + margin, arr_pts[:, 1].max() + margin)
+    band = max(4.0 * max_move, _SUPPORT_BAND_MIN * min(h, w))
+    out, field = _remap_region(
+        arr, roi,
+        lambda xs, ys: _gaussian_field(xs, ys, arr_pts, arr_disp, sigma),
+        _field_step(2.0 * sh_half), person, band,
+    )
+    if field is None:
+        return out, None, None
+    x0, y0 = max(0, int(roi[0])), max(0, int(roi[1]))
+    x1, y1 = min(w, int(math.ceil(roi[2]))), min(h, int(math.ceil(roi[3])))
+    return out, (x0, y0, x1, y1), field
+
+
 def apply_body_reshape(
     img: Image.Image,
     leg_stretch: float = 0.0,
@@ -4422,60 +4498,25 @@ def apply_body_reshape(
         if not results.pose_landmarks:
             return img
 
-    # 가장 큰(키가 큰) 바디만 선택
-    best_pose = None
-    best_height = 0.0
-    for pose_lms in results.pose_landmarks:
-        ys = [lm.y for lm in pose_lms]
-        pose_h = max(ys) - min(ys)
-        if pose_h > best_height:
-            best_height = pose_h
-            best_pose = pose_lms
-
+    best_pose, _others = _select_main_pose(results)
     if best_pose is None:
         return img
-
-    pose = best_pose
-
-    def _pt(idx: int) -> tuple[float, float]:
-        lm = pose[idx]
-        return lm.x * w, lm.y * h
-
-    def _vis(idx: int) -> float:
-        v = getattr(pose[idx], "visibility", None)
-        return 1.0 if v is None else float(v)
+    _pt, _vis = _pose_accessors(best_pose, w, h)
 
     result_arr = arr_rgb
 
     # ── 허리·어깨: 실루엣 기준 국소 워프 (한 번의 remap) ──
     if abs(shoulder_width) >= 0.01 or waist_slim >= 0.01:
         person = _cached_person_mask(cache, arr_rgb)
-        pts, disp, sigma, max_move, sh_half = _build_body_controls(
-            _pt, _vis, person, shoulder_width, waist_slim,
+        result_arr, _roi, _field = _torso_reshape(
+            result_arr, _pt, _vis, person, shoulder_width, waist_slim,
         )
-        if max_move > 0.0:
-            arr_pts = np.array(pts, np.float32)
-            arr_disp = np.array(disp, np.float32)
-            margin = 3.5 * sigma
-            roi = (arr_pts[:, 0].min() - margin, arr_pts[:, 1].min() - margin,
-                   arr_pts[:, 0].max() + margin, arr_pts[:, 1].max() + margin)
-            band = max(4.0 * max_move, _SUPPORT_BAND_MIN * min(h, w))
-            result_arr, _ = _remap_region(
-                result_arr, roi,
-                lambda xs, ys: _gaussian_field(xs, ys, arr_pts, arr_disp, sigma),
-                _field_step(2.0 * sh_half), person, band,
-            )
 
     # ── leg_stretch: 행 단위 세로 늘리기 ──
     if leg_stretch >= 0.01:
-        # Pose: 23/24 힙, 27/28 발목, 29/30 뒤꿈치, 31/32 발끝
-        ankles = [i for i in (27, 28) if _vis(i) >= 0.5]
-        if ankles:
-            hip_y = (_pt(23)[1] + _pt(24)[1]) / 2.0
-            ankle_y = max(_pt(i)[1] for i in ankles)
-            feet = [_pt(i)[1] for i in (29, 30, 31, 32) if _vis(i) >= 0.3]
-            foot_y = max(feet) if feet else ankle_y + 0.06 * (ankle_y - hip_y)
-            foot_y = max(foot_y, ankle_y)
+        span = _leg_span(_pt, _vis)
+        if span is not None:
+            hip_y, ankle_y, foot_y = span
             mapping = _leg_row_map(h, hip_y, ankle_y, foot_y, leg_stretch)
             if mapping is not None:
                 row_map, r0 = mapping
