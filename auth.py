@@ -193,3 +193,31 @@ def create_firebase_token(uid: str) -> str | None:
 
     token = fb_auth.create_custom_token(uid, app=app)
     return token.decode("utf-8") if isinstance(token, bytes) else str(token)
+
+
+# ── Meta signed_request (연결 해제·데이터 삭제 콜백) ──
+
+
+def parse_signed_request(signed_request: str | None, app_secret: str) -> dict | None:
+    """Meta가 보내는 signed_request를 검증해 payload를 돌려준다. 실패하면 None.
+
+    형식: base64url(HMAC-SHA256(app_secret, payload_b64)) + "." + base64url(json payload).
+    서명이 맞지 않으면 누구나 남의 user_id로 삭제를 요청할 수 있으므로 반드시 검증한다.
+    """
+    if not signed_request or not app_secret or len(signed_request) > 4096:
+        return None
+    try:
+        sig_b64, payload_b64 = signed_request.split(".", 1)
+        sig = _b64d(sig_b64)
+        payload = json.loads(_b64d(payload_b64))
+    except (ValueError, binascii.Error, UnicodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("algorithm", "")).upper() != "HMAC-SHA256" or not payload_b64.isascii():
+        return None
+    expected = hmac.new(app_secret.encode("utf-8"), payload_b64.encode("ascii"), hashlib.sha256).digest()
+    if not hmac.compare_digest(sig, expected):
+        return None
+    return payload
+

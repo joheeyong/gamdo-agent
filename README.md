@@ -84,7 +84,8 @@ deploy/macos/uninstall.sh                               # 셋 다 끄고 등록 
 
 - **세션 토큰**: `v1.<base64url(payload)>.<base64url(HMAC-SHA256(secret, "v1."+payload_b64))>`,
   payload `{"uid": "<instagram user_id>", "iat": <unix초>, "exp": <unix초>}`, 유효기간 30일.
-- **인증 면제**: `/health`, `/api/instagram/callback`, `/api/instagram/exchange-token`,
+- **인증 면제**: `/health`, `/health/claude`, `/api/instagram/callback`, `/api/instagram/exchange-token`,
+  `/api/instagram/deauthorize`, `/api/instagram/data-deletion` (뒤의 둘은 Meta 서명 검증),
   `/api/session`, `/api/instagram/media`, `/api/instagram/stories` (뒤의 둘은 요청의 IG
   access_token 자체가 자격증명).
 - **그 외 엔드포인트**
@@ -133,6 +134,9 @@ HTTP 200 + `success: false`로, 인증 오류는 위의 HTTP 상태 코드로 �
 | POST | `/api/instagram/stories` | 면제 | Instagram 스토리 목록 프록시 |
 | POST | `/api/session` | 면제 | IG long-lived 토큰 → 감도 세션 재발급 |
 | POST | `/api/firebase-token` | 세션 필수 | Firebase 커스텀 토큰 (uid = Instagram user_id) |
+| DELETE | `/api/me/data` | 세션 필수 | 앱의 'Instagram 연결 해제' — 세션 사용자의 서버 데이터(대표 사진) 삭제 |
+| POST | `/api/instagram/deauthorize` | Meta 서명 | Meta 연결 해제 콜백 (`signed_request`) → 해당 사용자 데이터 삭제 |
+| POST | `/api/instagram/data-deletion` | Meta 서명 | Meta 데이터 삭제 콜백 → 삭제 후 `{url, confirmation_code}` |
 
 ### POST `/api/instagram/exchange-token`
 
@@ -166,6 +170,19 @@ HTTP 200 + `success: false`로, 인증 오류는 위의 HTTP 상태 코드로 �
 - IG 토큰 무효/만료 → 401 `instagram_token_invalid` (앱은 로그아웃 처리)
 - Instagram 장애·응답 이상 → 502 `instagram_unavailable` (앱은 로그아웃하지 않는다)
 - 세션 비밀키 미설정 → 503 `session_not_configured`
+
+### 사용자 데이터 삭제 (Meta 앱 심사)
+
+서버가 사용자별로 오래 두는 것은 대표 사진 폴더(`reference_images/<user_id>`)뿐이다
+(분석 캐시·작업 기록은 메모리에서 30분 안에 사라진다). 세 경로 모두 이 폴더를 지운다.
+
+- 앱: `DELETE /api/me/data` (세션). 앱은 이어서 Firebase `users/<uid>`도 지운다.
+- Meta 콜백: 본문 `signed_request`(form)를 `INSTAGRAM_CLIENT_SECRET`으로 HMAC-SHA256 검증한다.
+  서명이 틀리면 400이고 아무것도 지우지 않는다. 데이터 삭제 콜백은
+  `GAMDO_DELETION_STATUS_URL`(기본 `https://gamdo-app-2026.web.app/data-deletion.html`)에
+  확인 코드를 붙여 돌려준다.
+- Meta 앱 설정에 등록할 값: 연결 해제 콜백 `<서버>/api/instagram/deauthorize`,
+  데이터 삭제 요청 `<서버>/api/instagram/data-deletion`.
 
 ### POST `/api/firebase-token`
 

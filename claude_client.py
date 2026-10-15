@@ -912,6 +912,22 @@ def _save_reference_images(
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def delete_user_data(user_id: str) -> bool:
+    """사용자의 서버 저장 데이터(대표 사진)를 지운다. 지울 것이 있었으면 True.
+
+    서버가 사용자별로 영구 저장하는 것은 대표 사진 폴더뿐이다. 분석 캐시·작업 기록은
+    메모리에만 있고 30분 안에 사라진다. 안전하지 않은 user_id는 아무것도 지우지 않는다.
+    """
+    import shutil
+
+    user_dir = _user_ref_dir(user_id)
+    if user_dir is None or not os.path.isdir(user_dir):
+        return False
+    shutil.rmtree(user_dir, ignore_errors=True)
+    log.info("deleted reference images for user %s", user_id)
+    return True
+
+
 def get_reference_image_paths(user_id: str) -> list[str]:
     """사용자의 대표 사진 파일 경로 목록을 반환한다."""
     user_dir = _user_ref_dir(user_id)

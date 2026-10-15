@@ -6,9 +6,10 @@ import logging
 import math
 import os
 import re
+import secrets
 import threading
 from dataclasses import dataclass
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, Query, Request
@@ -46,7 +47,7 @@ from models import (
     TransformPhotoRequest,
     TransformPhotoResponse,
 )
-from claude_client import analyze_user, get_reference_image_paths, transform_photo
+from claude_client import analyze_user, delete_user_data, get_reference_image_paths, transform_photo
 from param_engine import (
     build_params_with_comment,
     detect_tilt_angle,
@@ -870,6 +871,56 @@ def api_instagram_callback(code: str = Query(...), state: str = Query(default=""
     if state:
         query["state"] = state
     return RedirectResponse(url=f"{INSTAGRAM_APP_REDIRECT}?{urlencode(query)}")
+
+
+# ── 사용자 데이터 삭제 (Meta 앱 심사: 연결 해제·데이터 삭제 요청) ──
+
+# 데이터 삭제 콜백에 돌려줄 '삭제 상태 확인' 페이지. 확인 코드를 쿼리로 붙인다.
+DELETION_STATUS_URL = os.getenv(
+    "GAMDO_DELETION_STATUS_URL", "https://gamdo-app-2026.web.app/data-deletion.html"
+)
+
+
+async def _signed_request_user(request: Request) -> str | None:
+    """Meta 콜백 본문(application/x-www-form-urlencoded)의 signed_request에서 user_id."""
+    body = (await request.body()).decode("utf-8", errors="replace")
+    values = parse_qs(body).get("signed_request") or []
+    payload = auth.parse_signed_request(values[0] if values else None, INSTAGRAM_CLIENT_SECRET)
+    if payload is None:
+        return None
+    uid = str(payload.get("user_id") or "").strip()
+    return uid or None
+
+
+@app.delete("/api/me/data")
+def api_delete_my_data(ctx: AuthContext = Depends(require_session)):
+    """앱의 '연결 해제·데이터 삭제'. 세션의 사용자 데이터만 지운다."""
+    deleted = delete_user_data(ctx.uid)
+    log.info("me/data: delete requested (deleted=%s)", deleted)
+    return {"success": True, "deleted": deleted, "error": None}
+
+
+@app.post("/api/instagram/deauthorize")
+async def api_instagram_deauthorize(request: Request):
+    """Meta 연결 해제 콜백. 사용자가 인스타그램에서 감도 연결을 끊으면 Meta가 부른다."""
+    uid = await _signed_request_user(request)
+    if uid is None:
+        return JSONResponse(status_code=400, content={"success": False, "error": "invalid signed_request"})
+    delete_user_data(uid)
+    log.info("instagram/deauthorize: user data deleted")
+    return {"success": True}
+
+
+@app.post("/api/instagram/data-deletion")
+async def api_instagram_data_deletion(request: Request):
+    """Meta 데이터 삭제 요청 콜백. 지운 뒤 확인 코드와 상태 확인 URL을 돌려준다 (Meta 규격)."""
+    uid = await _signed_request_user(request)
+    if uid is None:
+        return JSONResponse(status_code=400, content={"error": "invalid signed_request"})
+    delete_user_data(uid)
+    code = secrets.token_hex(8)
+    log.info("instagram/data-deletion: user data deleted (confirmation=%s)", code)
+    return {"url": f"{DELETION_STATUS_URL}?code={code}", "confirmation_code": code}
 
 
 @app.post("/api/instagram/exchange-token", response_model=InstagramExchangeTokenResponse)
