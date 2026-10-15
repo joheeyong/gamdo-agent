@@ -224,3 +224,62 @@ def test_apply_transform_with_suggestion_flag(client):
         "auto_edits": {**edits, "apply_suggested_crop": True}}).json()
     # 200x300(2:3)은 인스타 범위 밖이라 크롭 뒤 3:4로 다시 맞춘다
     assert _size_of(on["image_base64"]) == (200, 266)
+
+
+# ── 자른 이유 (앱에 표시) ──
+
+
+def test_crop_reason_follows_kept_suggestion():
+    edits = gate_auto_edits(
+        {"crop": {"x": 0.1, "y": 0.0, "width": 0.7, "height": 1.0},
+         "crop_reason": "  가장자리 손가락을\n뺐어요 "},
+        (400, 300), allow_vertical_crop=True)
+    assert edits["apply_suggested_crop"] is True
+    assert edits["crop_reason"] == "가장자리 손가락을 뺐어요"
+
+
+def test_crop_reason_dropped_with_discarded_crop():
+    # 가장자리만 깎는 크롭은 버려지고, 그 이유도 남지 않는다
+    edits = gate_auto_edits(
+        {"crop": {"x": 0.02, "y": 0.0, "width": 0.96, "height": 1.0},
+         "crop_reason": "여백 정리"},
+        (400, 300), allow_vertical_crop=True)
+    assert "suggested_crop" not in edits
+    assert "crop_reason" not in edits
+
+
+def test_crop_reason_follows_ratio_suggestion():
+    edits = gate_auto_edits(
+        {"instagram_ratio": "4:5", "crop_reason": "세로로 인물이 돋보이게"},
+        (400, 300), allow_vertical_crop=True)
+    assert edits["suggested_ratio"] == "4:5"
+    assert edits["crop_reason"] == "세로로 인물이 돋보이게"
+
+
+def test_long_or_non_text_crop_reason_is_cleaned():
+    crop = {"x": 0.1, "y": 0.0, "width": 0.7, "height": 1.0}
+    edits = gate_auto_edits({"crop": dict(crop), "crop_reason": "가" * 100},
+                            (400, 300), allow_vertical_crop=True)
+    assert len(edits["crop_reason"]) == 40 and edits["crop_reason"].endswith("…")
+    edits = gate_auto_edits({"crop": dict(crop), "crop_reason": {"x": 1}},
+                            (400, 300), allow_vertical_crop=True)
+    assert "crop_reason" not in edits
+
+
+def test_forced_ratio_has_server_reason(client, monkeypatch):
+    edits, _ = _analyze(client, monkeypatch, (270, 480), {"crop_reason": "모델이 지어낸 이유"})
+    assert edits["instagram_ratio"] == "3:4"
+    assert edits["ratio_reason"] == "인스타그램이 받지 않는 비율이라 3:4로 맞췄어요"
+    # 크롭 제안이 없으면 모델 이유는 붙지 않는다
+    assert "crop_reason" not in edits
+
+
+def test_no_ratio_reason_when_portrait_keeps_frame(client, monkeypatch):
+    edits, out = _analyze(client, monkeypatch, (270, 480), {}, subject="인물")
+    assert out == (270, 480)
+    assert "ratio_reason" not in edits
+
+
+def test_stale_reasons_from_model_are_replaced():
+    edits = gate_auto_edits({"ratio_reason": "지어낸 이유"}, (400, 300), allow_vertical_crop=True)
+    assert "ratio_reason" not in edits

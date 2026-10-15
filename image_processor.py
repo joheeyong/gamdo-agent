@@ -2764,6 +2764,28 @@ def suggest_crop(crop: object, allow_vertical_crop: bool = True) -> dict | None:
             "width": round(cw, 4), "height": round(ch, 4)}
 
 
+# 앱에 그대로 보이는 크롭 이유의 최대 길이. 프롬프트는 20자를 요구하지만
+# 모델이 넘길 때를 대비해 여유를 두고 자른다.
+_CROP_REASON_MAX_LEN = 40
+
+
+def _clean_reason(reason: object) -> str | None:
+    """모델이 쓴 크롭 이유를 한 줄 짧은 문장으로 정리한다. 쓸 게 없으면 None."""
+    if not isinstance(reason, str):
+        return None
+    text = " ".join(reason.split())
+    if not text:
+        return None
+    if len(text) > _CROP_REASON_MAX_LEN:
+        text = text[: _CROP_REASON_MAX_LEN - 1].rstrip() + "…"
+    return text
+
+
+def ratio_reason(ratio: str) -> str:
+    """인스타 비율 자동 맞춤의 이유 (서버 규칙이라 모델이 아니라 여기서 쓴다)."""
+    return f"인스타그램이 받지 않는 비율이라 {ratio}로 맞췄어요"
+
+
 def gate_auto_edits(
     auto_edits: dict, size: tuple[int, int], allow_vertical_crop: bool
 ) -> dict:
@@ -2779,20 +2801,30 @@ def gate_auto_edits(
         이때 모델 비율은 얹지 않는다 — 크롭 위에 4:5까지 겹치면 풍경이 39%만 남았다.
     suggested_* 는 [apply_auto_edits]가 apply_suggested_crop=True일 때만 쓴다
     (앱의 '추천 구도로 자르기 / 원래 구도로'). 들어온 dict를 제자리에서 고치고 돌려준다.
+
+    자른 이유도 함께 남겨 앱이 보여 준다: 제안 크롭·비율에는 모델의 crop_reason을,
+    자동 비율 맞춤에는 ratio_reason을. 크롭이 버려지면 이유도 버린다.
     """
     model_crop = auto_edits.pop("crop", None)
     model_ratio = auto_edits.pop("instagram_ratio", None)
     auto_edits.pop("suggested_crop", None)
     auto_edits.pop("suggested_ratio", None)
     auto_edits.pop("apply_suggested_crop", None)
+    model_reason = _clean_reason(auto_edits.pop("crop_reason", None))
+    auto_edits.pop("ratio_reason", None)
 
     needed = required_instagram_ratio(size)
     if needed is not None:
         auto_edits["instagram_ratio"] = needed
+        # 인물처럼 위아래를 못 자르면 실제로는 그대로라 이유를 달지 않는다
+        if _ratio_would_crop(size, needed, allow_vertical_crop):
+            auto_edits["ratio_reason"] = ratio_reason(needed)
 
     suggestion = suggest_crop(model_crop, allow_vertical_crop)
     if suggestion is not None:
         auto_edits["suggested_crop"] = suggestion
+        if model_reason:
+            auto_edits["crop_reason"] = model_reason
         if suggestion["width"] * suggestion["height"] >= _AUTO_CROP_MIN_AREA:
             auto_edits["apply_suggested_crop"] = True
             return auto_edits
@@ -2802,6 +2834,8 @@ def gate_auto_edits(
         and _ratio_would_crop(size, model_ratio, allow_vertical_crop)
     ):
         auto_edits["suggested_ratio"] = model_ratio
+        if model_reason:
+            auto_edits["crop_reason"] = model_reason
     return auto_edits
 
 
