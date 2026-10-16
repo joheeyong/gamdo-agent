@@ -105,6 +105,56 @@ def test_CLI가_없으면_실패로_기록(monkeypatch, tmp_path):
     assert cc.main(["--no-notify"]) == 1
 
 
+def test_이미지_점검은_색을_맞혀야_통과(monkeypatch):
+    seen = {}
+
+    def fake_inline(prompt, system, images, timeout):
+        seen["images"] = images
+        return "Blue."
+    monkeypatch.setattr(cc, "_call_claude_inline", fake_inline)
+    assert cc.run_vision_check("blue") == (True, "이미지 전달 정상")
+    assert len(seen["images"]) == 1
+
+
+def test_이미지를_못_받으면_이미지_점검_실패(monkeypatch):
+    monkeypatch.setattr(cc, "_call_claude_inline", lambda *a, **k: "I don't see any image.")
+    ok, detail = cc.run_vision_check("red")
+    assert not ok and "red" in detail
+
+
+def test_이미지_점검_중_CLI_오류도_실패(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("claude CLI inline: result 이벤트가 없음")
+    monkeypatch.setattr(cc, "_call_claude_inline", boom)
+    ok, detail = cc.run_vision_check("green")
+    assert not ok and "result" in detail
+
+
+def test_인증이_통과해야_이미지_점검을_하고_실패는_vision으로_기록(monkeypatch, tmp_path):
+    monkeypatch.setattr(cc.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, _cli_json(), ""))
+    monkeypatch.setattr(cc, "run_vision_check", lambda: (False, "이미지 점검: red 이미지를 'blue'(으)로 답함"))
+    path = tmp_path / "s.json"
+    monkeypatch.setattr(cc, "STATUS_PATH", path)
+    assert cc.main(["--no-notify"]) == 1
+    saved = json.loads(path.read_text())
+    assert (saved["ok"], saved["kind"]) == (False, "vision")
+    titles = [t for t, _ in cc.alerts_for(saved)]
+    assert titles == ["감도 서버: 사진 전달 실패"]
+
+
+def test_인증_실패면_이미지_점검을_건너뛴다(monkeypatch, tmp_path):
+    out = _cli_json(is_error=True, api_error_status=401, result="Failed to authenticate.")
+    monkeypatch.setattr(cc.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 1, out, ""))
+
+    def must_not_run():
+        raise AssertionError("인증 실패인데 이미지 점검을 했다")
+    monkeypatch.setattr(cc, "run_vision_check", must_not_run)
+    monkeypatch.setattr(cc, "STATUS_PATH", tmp_path / "s.json")
+    assert cc.main(["--no-notify"]) == 1
+
+
 # ── GET /health/claude ──
 
 

@@ -5,8 +5,11 @@
 분석에 실패하고 나서야 알게 된다. 이 스크립트는
 
   1. 서버와 같은 환경(child_env)으로 claude CLI에 아주 짧은 요청을 보내 응답을 확인하고,
-  2. 실패하거나 토큰 만료가 가까우면 macOS 알림을 띄우고,
-  3. 결과를 상태 파일(JSON)에 남긴다 — 서버의 GET /health/claude가 이 파일을 보여 준다.
+  2. 인증이 통과하면 서버와 같은 경로(_call_claude_inline, 같은 모델)로 단색 이미지
+     한 장을 보내 색을 맞히는지 본다 — CLI 업데이트로 이미지 전달이 깨지면 인증은
+     멀쩡해도 분석이 전부 실패하기 때문이다,
+  3. 실패하거나 토큰 만료가 가까우면 macOS 알림을 띄우고,
+  4. 결과를 상태 파일(JSON)에 남긴다 — 서버의 GET /health/claude가 이 파일을 보여 준다.
 
 launchd(com.gamdo.claudecheck)가 로그인할 때와 매일 오전 9시에 실행한다.
 
@@ -20,9 +23,12 @@ launchd(com.gamdo.claudecheck)가 로그인할 때와 매일 오전 9시에 실�
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
+import io
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -35,7 +41,7 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
-from claude_client import child_env  # noqa: E402
+from claude_client import _call_claude_inline, child_env  # noqa: E402
 
 STATUS_PATH = Path(os.getenv(
     "GAMDO_CLAUDE_STATUS_PATH",
@@ -58,9 +64,15 @@ CMD = [
     "--tools", "",
 ]
 
+# 이미지 전달 점검용 색. 무작위로 골라 이미지 없이 찍어 맞힐 확률을 1/4로 낮춘다.
+_VISION_COLORS = {"red": (220, 30, 30), "green": (30, 170, 60),
+                  "blue": (30, 70, 220), "yellow": (240, 210, 30)}
+_VISION_PROMPT = ("Look at the attached image. It is filled with one solid color. "
+                  "Reply with exactly one lowercase word from: red, green, blue, yellow.")
+
 
 def classify(returncode: int, stdout: str, stderr: str) -> tuple[bool, str, str]:
-    """(성공, 종류, 설명). 종류: ok | auth | error.
+    """(성공, 종류, 설명). 종류: ok | auth | error (vision은 run_check가 붙인다).
 
     --output-format json 응답은 실패해도 JSON이다: is_error, result(오류 메시지),
     api_error_status(HTTP 상태). 인증 판정은 상태 코드와 오류 메시지로만 한다.
@@ -85,6 +97,30 @@ def classify(returncode: int, stdout: str, stderr: str) -> tuple[bool, str, str]
     return False, ("auth" if auth else "error"), detail[:200]
 
 
+def _solid_jpeg_b64(rgb: tuple[int, int, int]) -> str:
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), rgb).save(buf, "JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def run_vision_check(color: str | None = None) -> tuple[bool, str]:
+    """서버의 분석 경로로 단색 이미지를 보내 색을 맞히는지 본다. (성공, 설명)."""
+    color = color or random.choice(list(_VISION_COLORS))
+    try:
+        answer = _call_claude_inline(_VISION_PROMPT, "", [_solid_jpeg_b64(_VISION_COLORS[color])],
+                                     timeout=TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return False, f"이미지 점검: {TIMEOUT_S}초 안에 응답 없음"
+    except Exception as e:  # CLI 실패·result 없음 등
+        return False, f"이미지 점검 실패: {e}"[:200]
+    word = answer.strip().strip(".").lower()
+    if word == color:
+        return True, "이미지 전달 정상"
+    return False, f"이미지 점검: {color} 이미지를 '{answer.strip()[:40]}'(으)로 답함"
+
+
 def token_days_left(today: dt.date | None = None) -> int | None:
     issued = os.getenv("CLAUDE_CODE_OAUTH_TOKEN_ISSUED", "").strip()
     if not issued:
@@ -107,6 +143,9 @@ def run_check() -> dict:
         ok, kind, detail = False, "error", "claude CLI를 찾지 못함 (PATH 확인)"
     except subprocess.TimeoutExpired:
         ok, kind, detail = False, "error", f"{TIMEOUT_S}초 안에 응답 없음"
+    if ok:
+        ok, detail = run_vision_check()
+        kind = "ok" if ok else "vision"
     return {
         "ok": ok,
         "kind": kind,
@@ -142,6 +181,10 @@ def alerts_for(status: dict) -> list[tuple[str, str]]:
         if status["kind"] == "auth":
             out.append(("감도 서버: Claude 인증 실패",
                         "사진 분석이 멈췄습니다. claude setup-token으로 새 토큰을 만들어 .env를 바꾸세요."))
+        elif status["kind"] == "vision":
+            out.append(("감도 서버: 사진 전달 실패",
+                        "인증은 정상이지만 Claude가 사진을 받지 못합니다. claude CLI 업데이트를 확인하세요. "
+                        + status["detail"]))
         else:
             out.append(("감도 서버: Claude 응답 없음", status["detail"]))
     days = status.get("token_days_left")
