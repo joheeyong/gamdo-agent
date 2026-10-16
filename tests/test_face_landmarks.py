@@ -44,13 +44,18 @@ def test_eye_contours_match_mediapipe_sides():
 def test_iris_center_belongs_to_same_eye_as_contour():
     """홍채 중심과 윤곽이 같은 눈이어야 한다.
 
-    MediaPipe 규약: 468~472 = LEFT iris, 473~477 = RIGHT iris.
-    각 구간의 첫 인덱스가 중심이다.
+    MediaPipe 규약(FaceLandmarksConnections): LEFT_IRIS = 474~477 고리(중심 473),
+    RIGHT_IRIS = 469~472 고리(중심 468).
     """
-    assert _LEFT_EYE_CENTER == 468, "LEFT 윤곽에는 LEFT 홍채 중심이 와야 한다"
-    assert _RIGHT_EYE_CENTER == 473, "RIGHT 윤곽에는 RIGHT 홍채 중심이 와야 한다"
-    assert 468 <= _LEFT_EYE_CENTER <= 472
-    assert 473 <= _RIGHT_EYE_CENTER <= 477
+    from mediapipe.tasks.python.vision.face_landmarker import FaceLandmarksConnections as C
+
+    def ring(conns):
+        return {i for c in conns for i in (c.start, c.end)}
+
+    left_ring, right_ring = ring(C.FACE_LANDMARKS_LEFT_IRIS), ring(C.FACE_LANDMARKS_RIGHT_IRIS)
+    # 중심은 자기 고리 바로 앞 번호다
+    assert _LEFT_EYE_CENTER == min(left_ring) - 1 == 473
+    assert _RIGHT_EYE_CENTER == min(right_ring) - 1 == 468
 
 
 def test_left_and_right_eye_sets_are_disjoint():

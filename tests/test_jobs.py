@@ -316,8 +316,29 @@ def test_sync_endpoint_unchanged(client, monkeypatch):
 
     monkeypatch.setattr(server, "transform_photo", boom)
     r = client.post("/api/analyze-and-transform", json={"image_base64": _photo_b64()})
-    # 동기 엔드포인트는 예전처럼 str(e)를 그대로 싣는다
+    # 예외 문자열(CLI 출력·내부 경로가 섞일 수 있다)은 내보내지 않는다
     assert r.json() == {
         "success": False, "analysis": None, "image_base64": None,
-        "params": None, "params_comment": None, "error": "raw reason",
+        "params": None, "params_comment": None, "error": jobs.DEFAULT_ERROR_MESSAGE,
     }
+
+    # 사용자 탓인 이미지 거부 사유는 그대로 보여 준다 (모델 호출 전에 거른다)
+    monkeypatch.setattr(server, "transform_photo", lambda **kw: pytest.fail("모델 호출 전에 걸러야 함"))
+    r = client.post("/api/analyze-and-transform", json={"image_base64": "bm90IGFuIGltYWdl"})
+    assert r.json()["error"] == "이미지를 읽을 수 없습니다"
+
+
+def test_drop_owner_removes_only_finished_jobs_of_that_user():
+    store = jobs.JobStore(max_workers=1)
+    try:
+        a = store.submit("ka", "u1", lambda on_stage: {"v": 1})
+        b = store.submit("kb", "u2", lambda on_stage: {"v": 2})
+        for _ in range(200):
+            if all(store.get(s.job_id).status == jobs.DONE for s in (a, b)):
+                break
+            time.sleep(0.01)
+        assert store.drop_owner("u1") == 1
+        assert store.get(a.job_id) is None
+        assert store.get(b.job_id) is not None
+    finally:
+        store.shutdown(wait=True)

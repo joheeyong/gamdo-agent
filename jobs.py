@@ -1,8 +1,8 @@
 """비동기 분석 작업(Job) 저장소 + 실행기.
 
-analyze-and-transform은 30~70초 걸린다. 긴 HTTP 연결 하나에 묶어 두면 앱이
+analyze-and-transform은 수십 초 걸린다. 긴 HTTP 연결 하나에 묶어 두면 앱이
 백그라운드로 가서 소켓이 끊길 때 결과를 잃는다. 작업을 여기에 맡기고 앱은
-job_id로 폴링한다 (계약: scratchpad/jobs_contract.md).
+job_id로 폴링한다 (POST /api/jobs/analyze-and-transform → GET /api/jobs/{id}).
 
 - 인메모리·단일 프로세스. 서버 재시작(reload 포함) 시 작업은 사라진다.
 - 같은 요청(dedupe key)이 진행 중이거나 완료 후 보관 중이면 그 작업을 돌려준다.
@@ -35,7 +35,9 @@ ERROR = "error"
 DEFAULT_ERROR_MESSAGE = "사진 분석에 실패했습니다. 잠시 후 다시 시도해 주세요."
 
 JOB_TTL_SECONDS = 30 * 60
-MAX_TOTAL_JOBS = 200
+# 완료 작업은 결과 사진(base64, 장당 수 MB)을 TTL 동안 들고 있다. 200개면
+# 수백 MB가 메모리에 남는다. 사용자가 결과를 받아 가는 데는 이 정도면 충분하다.
+MAX_TOTAL_JOBS = 60
 
 
 def _now() -> float:
@@ -215,6 +217,18 @@ class JobStore:
             self._cleanup(now)
             job = self._jobs.get(job_id)
             return self._snapshot(job, now) if job else None
+
+    def drop_owner(self, owner: str) -> int:
+        """그 사용자의 끝난 작업(결과 사진 포함)을 지운다. 진행 중 작업은 끝나는 대로
+        TTL에 맡긴다 — 실행 중인 워커를 멈출 방법이 없다. 지운 개수를 돌려준다."""
+        if not owner:
+            return 0
+        with self._lock:
+            mine = [j for j in self._jobs.values()
+                    if j.owner == owner and j.finished_at is not None]
+            for j in mine:
+                self._remove(j)
+        return len(mine)
 
     def set_stage(self, job_id: str, stage: str) -> None:
         with self._lock:

@@ -98,19 +98,29 @@ def _flag_value(cmd, flag):
     return cmd[cmd.index(flag) + 1]
 
 
-def test_call_claude_restricts_available_tools(monkeypatch):
-    seen = _capture_cmd(monkeypatch)
-    cc._call_claude("p", "s", image_paths=["/x.jpg"], tools="Read")
-    cmd = seen["cmd"]
-    # --allowedTools만으로는 다른 도구가 사라지지 않는다 — --tools가 있어야 한다
-    assert _flag_value(cmd, "--tools") == "Read"
-    assert "--strict-mcp-config" in cmd
+def test_no_read_tool_path_left():
+    """Read 도구 경로는 없앴다. 권한 확인을 건너뛰는 상태의 Read는 게시글 텍스트에
+    심은 지시로 다른 사용자의 대표 사진까지 읽을 수 있었다."""
+    assert not hasattr(cc, "_call_claude")
+    assert not hasattr(cc, "_transform_photo_read")
 
 
-def test_call_claude_no_tools(monkeypatch):
-    seen = _capture_cmd(monkeypatch)
-    cc._call_claude("p", "s", tools="")
-    assert _flag_value(seen["cmd"], "--tools") == ""
+def test_analyze_user_sends_grid_inline_without_tools(monkeypatch, tmp_path):
+    monkeypatch.setattr(cc, "_TEMP_DIR", str(tmp_path))
+    seen = {}
+
+    def fake_inline(prompt, system, images, **k):
+        seen["prompt"], seen["images"] = prompt, images
+        return '{"styleProfile": {}, "referenceImageIndices": []}'
+
+    monkeypatch.setattr(cc, "_call_claude_inline", fake_inline)
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(buf, "JPEG")
+    import base64
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    cc.analyze_user([{"text": "t", "image_base64": b64}], [], [], user_id="")
+    assert len(seen["images"]) == 1
+    assert "Read" not in seen["prompt"] and str(tmp_path) not in seen["prompt"]
 
 
 # ── image_url 허용 목록 ──
@@ -240,7 +250,7 @@ def test_reference_indices_odd_types(monkeypatch, tmp_path, indices):
     monkeypatch.setattr(cc, "_TEMP_DIR", str(tmp_path))
     captured = {}
     monkeypatch.setattr(
-        cc, "_call_claude",
+        cc, "_call_claude_inline",
         lambda *a, **k: '{"styleProfile": {}, "referenceImageIndices": %s}'
         % ("null" if indices is None else ('"1"' if indices == "1" else str(indices).lower())),
     )

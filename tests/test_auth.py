@@ -210,9 +210,7 @@ def test_non_ascii_bearer_does_not_crash(client, monkeypatch):
 
 PROTECTED = [
     ("post", "/api/analyze-user", {}),
-    ("post", "/api/transform-photo", {"style_profile": {}, "image_base64": "x"}),
     ("post", "/api/analyze-and-transform", {"image_base64": "x"}),
-    ("post", "/api/auto-transform", {"image_base64": "x", "analysis": {}}),
     ("post", "/api/apply-transform", {"image_base64": "x"}),
     ("get", "/api/reference-images/123", None),
 ]

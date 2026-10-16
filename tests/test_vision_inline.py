@@ -2,7 +2,7 @@
 
 Read 도구로 파일을 읽게 하면 "도구 호출 → 결과 → 답변"으로 모델 왕복이
 한 번 더 생긴다. 인라인 경로는 도구를 하나도 열지 않고 한 번에 끝낸다.
-실패하면 예전 Read 경로로 넘어가야 분석이 멈추지 않는다.
+Read 경로는 없앴다 — 실패를 다시 시도하면 최악 대기만 두 배가 됐다.
 """
 
 import base64
@@ -44,9 +44,8 @@ def _stream_stdout(text: str, **extra) -> str:
 @pytest.fixture(autouse=True)
 def _no_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(cc, "_analysis_cache_get", lambda key: None)
-    monkeypatch.setattr(cc, "_analysis_cache_put", lambda key, value: None)
+    monkeypatch.setattr(cc, "_analysis_cache_put", lambda key, value, user_id="": None)
     monkeypatch.setattr(cc, "_TEMP_DIR", str(tmp_path))
-    monkeypatch.setattr(cc, "_VISION_INPUT_MODE", "inline")
 
 
 def _capture_run(monkeypatch, stdout: str, returncode: int = 0):
@@ -102,7 +101,6 @@ def test_inline_nonzero_exit_raises(monkeypatch):
 
 def test_transform_photo_inline_skips_read_and_downsizes(monkeypatch):
     calls = _capture_run(monkeypatch, _stream_stdout(_ANALYSIS))
-    monkeypatch.setattr(cc, "_call_claude", lambda *a, **k: pytest.fail("Read 경로를 타면 안 됨"))
 
     result = cc.transform_photo({}, _jpeg_b64())
     assert result["subjectType"] == "풍경"
@@ -130,24 +128,75 @@ def test_transform_photo_sends_reference_strip_second(monkeypatch, tmp_path):
     assert "두 번째 이미지는 대표 사진 모음" in msg["message"]["content"][0]["text"]
 
 
-def test_transform_photo_falls_back_to_read_when_inline_fails(monkeypatch):
-    _capture_run(monkeypatch, "", returncode=1)
-    read_calls = []
-
-    def fake_call_claude(prompt, system, image_paths=None, tools=None, **k):
-        read_calls.append((prompt, image_paths, tools))
-        return _ANALYSIS
-
-    monkeypatch.setattr(cc, "_call_claude", fake_call_claude)
-    result = cc.transform_photo({}, _jpeg_b64(800, 600))
-    assert result["subjectType"] == "풍경"
-    prompt, image_paths, tools = read_calls[0]
-    assert tools == "Read" and len(image_paths) == 1
-    assert "Read로 읽고" in prompt
+def test_transform_photo_does_not_retry_when_inline_fails(monkeypatch):
+    calls = _capture_run(monkeypatch, "", returncode=1)
+    with pytest.raises(RuntimeError):
+        cc.transform_photo({}, _jpeg_b64(800, 600))
+    assert len(calls) == 1
 
 
-def test_read_mode_env_skips_inline(monkeypatch):
-    monkeypatch.setattr(cc, "_VISION_INPUT_MODE", "read")
-    monkeypatch.setattr(cc.subprocess, "run", lambda *a, **k: pytest.fail("인라인 경로를 타면 안 됨"))
-    monkeypatch.setattr(cc, "_call_claude", lambda *a, **k: _ANALYSIS)
-    assert cc.transform_photo({}, _jpeg_b64(800, 600))["subjectType"] == "풍경"
+def _model_returns(monkeypatch, *responses):
+    seq = list(responses)
+    calls = []
+
+    def fake_inline(prompt, system, images, **k):
+        calls.append((prompt, images, k))
+        return seq.pop(0)
+
+    monkeypatch.setattr(cc, "_call_claude_inline", fake_inline)
+    return calls
+
+
+def test_repair_keeps_unchecked_keys(monkeypatch):
+    """복구 응답이 autoEdits 등을 빠뜨려도 원래 값이 남는다."""
+    first = json.loads(_ANALYSIS)
+    del first["toneReport"]
+    first["autoEdits"] = {"crop": {"x": 0.1, "y": 0, "width": 0.8, "height": 1}}
+    repaired = json.loads(_ANALYSIS)  # autoEdits 없음
+    calls = _model_returns(monkeypatch, json.dumps(first), json.dumps(repaired))
+    result = cc.transform_photo({}, _jpeg_b64(80, 60))
+    assert result["autoEdits"] == first["autoEdits"]
+    assert result["toneReport"]["styleCategory"] == "x"
+    assert "warnings" not in result
+    # 복구 호출은 이미지 없이, 짧은 시간 상한으로
+    assert calls[1][1] == [] and calls[1][2]["timeout"] == cc._REPAIR_TIMEOUT
+
+
+def test_unknown_subject_type_falls_back_and_is_not_cached(monkeypatch):
+    bad = json.loads(_ANALYSIS)
+    bad["subjectType"] = "인물 사진"
+    _model_returns(monkeypatch, json.dumps(bad), json.dumps(bad))
+    stored = []
+    monkeypatch.setattr(cc, "_analysis_cache_put", lambda *a, **k: stored.append(a))
+    result = cc.transform_photo({}, _jpeg_b64(80, 60))
+    assert result["subjectType"] == "혼합"
+    assert result["warnings"]
+    assert stored == []  # 기본값으로 메운 결과는 캐시하지 않는다
+
+
+def test_subject_type_whitespace_is_normalized(monkeypatch):
+    ok = json.loads(_ANALYSIS)
+    ok["subjectType"] = " 인물 "
+    _model_returns(monkeypatch, json.dumps(ok))
+    assert cc.transform_photo({}, _jpeg_b64(80, 60))["subjectType"] == "인물"
+
+
+def test_fallback_replaces_null_values():
+    parsed = {"toneReport": {"overallMood": None, "styleCategory": "x", "narrative": "y"}}
+    problems = cc._validate_analysis(parsed)
+    cc._apply_analysis_fallbacks(parsed, problems)
+    assert parsed["toneReport"]["overallMood"] == ""
+    assert parsed["toneReport"]["styleCategory"] == "x"
+
+
+def test_disabled_toggles_tell_model_to_skip(monkeypatch):
+    calls = _model_returns(monkeypatch, _ANALYSIS)
+    cc.transform_photo({}, _jpeg_b64(80, 60), reshape_enabled=False, skin_retouch_enabled=False)
+    prompt = calls[0][0]
+    assert "reshapeParams를 생략" in prompt and "blemish_removal·skin_smoothing을 생략" in prompt
+
+
+def test_toggles_change_cache_key():
+    on = cc._analysis_cache_key("img", {}, "", (True, True))
+    off = cc._analysis_cache_key("img", {}, "", (False, True))
+    assert on != off

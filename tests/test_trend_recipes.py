@@ -246,3 +246,33 @@ def test_prompts_have_no_unsourced_engagement_statistics():
         assert not re.search(r"\d+\s*%\s*[↑↓]", text), name
         for stat in ("저장률 34", "공유 27", "좋아요 24", "댓글 46", "조회수 21", "댓글 45"):
             assert stat not in text, (name, stat)
+
+
+def test_reshape_prompt_judges_by_proportion_not_gender():
+    """체형 보정은 보이는 비율로만 정한다 — 겉모습으로 성별을 짐작하면 틀릴 수 있다."""
+    reshape = prompts.TRANSFORM_PHOTO_PROMPT.split("=== reshapeParams")[1].split("=== 출력 규칙")[0]
+    for word in ("여성", "남성"):
+        assert word not in reshape
+    assert "비율" in reshape
+
+
+def test_reshape_prompt_angle_direction():
+    """아래에서 올려 찍으면 다리가 길어 보인다 — 짧아 보이는 건 내려 찍을 때다."""
+    text = prompts.TRANSFORM_PHOTO_PROMPT
+    assert "아래에서 올려 찍은 각도(다리가 짧아 보임)" not in text
+    assert "내려 찍" in text
+
+
+def test_transform_prompt_does_not_ask_for_global_sliders():
+    """전체 보정값은 서버가 계산한다 — 프롬프트 어디서도 모델에게 올리라고 하면 안 된다."""
+    assert "전체 brightness/shadows로" not in prompts.TRANSFORM_PHOTO_PROMPT
+
+
+def test_analyze_prompt_does_not_send_image_urls():
+    """분석 도구는 Read뿐이라 URL을 열 수 없다. 사진은 그리드로 따로 붙는다."""
+    import claude_client
+    text = claude_client._format_items([{"text": "hi", "image_url": "https://cdn.example/x.jpg?sig=1"}])
+    assert "https://" not in text
+    # 그리드 인덱스와 어긋나는 사진 표시도 달지 않는다
+    assert "(사진)" not in text
+    assert "URL" not in prompts.ANALYZE_USER_PROMPT

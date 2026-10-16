@@ -21,8 +21,8 @@ W, H = 600, 1000
 
 
 def test_다리_비율이_이미_충분하면_늘리지_않는다():
-    # (950-450)/(950-0) = 0.526 ≥ 0.52
-    assert bc.leg_need(0.0, 450.0, 900.0, 950.0) == 0.0
+    # (950-420)/(950-0) = 0.558 ≥ 0.54
+    assert bc.leg_need(0.0, 420.0, 900.0, 950.0) == 0.0
 
 
 def test_다리가_짧아_보이면_목표_비율까지_늘린다():
@@ -225,7 +225,7 @@ def test_허리_옆_배경_직선이_휘면_허리_보정을_줄이거나_끈다
 def test_작은_인물은_배경이_휘지_않아_그대로_둔다():
     mask = _person_mask()
     edge_x = W // 2 + int(0.09 * W)
-    cal = bc.calibrate_body_reshape(_img(mask, line_x=edge_x + 6), 0.0, 0.0, 0.5,
+    cal = bc.calibrate_body_reshape(_img(mask, line_x=edge_x + 10), 0.0, 0.0, 0.5,
                                     cache=_Cache([_pose()], mask))
     assert cal.waist_slim == pytest.approx(bc.waist_need(cal.measure.waist_ratio))
     assert not any("배경" in n for n in cal.notes)

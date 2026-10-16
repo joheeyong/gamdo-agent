@@ -30,12 +30,14 @@ TONE_CURVE_PRESETS: dict[str, list[tuple[float, float]]] = {
     "bright": [(0, 0.04), (0.25, 0.30), (0.5, 0.56), (0.75, 0.80), (1, 1)],
     # ── 2026 트렌드 커브 ──
     # 소프트 필름: 검정을 살짝 띄우고(바랜 바닥) 흰색 끝을 부드럽게 접는다.
-    # S커브와 달리 중간톤 기울기가 1보다 조금 낮아 대비가 순해진다.
+    # 중간톤(0.25~0.75)의 기울기는 1 그대로이고, 대비는 양 끝(바닥 기울기 0.74,
+    # 어깨 0.80)에서만 순해진다. S커브처럼 중간톤을 세우지 않는다.
     "soft_film": [(0, 0.07), (0.25, 0.255), (0.5, 0.505), (0.75, 0.755), (1, 0.955)],
     # 정면 플래시 스냅: 중간~밝은 톤을 세워 피사체가 튀어나오고, 바닥은 그대로 깊다.
     "flash": [(0, 0), (0.25, 0.20), (0.5, 0.53), (0.75, 0.84), (1, 1)],
-    # 소프트 파스텔: 바닥을 크게 띄우고 전체를 밝은 쪽으로 눌러 담는다 (저대비).
-    # 바닥은 덜 띄우고(0.10 → 0.065) 흰색 끝은 거의 그대로(0.975) — 예전 0.955는 대비 감소와 겹쳐 흰색이 회색(p99 83)이 됐다.
+    # 소프트 파스텔: 중간톤을 밝은 쪽으로 끌어올려 담는다 (저대비).
+    # 바닥은 예전보다 덜 띄우고(0.10 → 0.065, 감성 커브 0.085보다 낮다) 흰색 끝은 거의
+    # 그대로(0.975) — 예전 0.955는 대비 감소와 겹쳐 흰색이 회색(p99 83)이 됐다.
     "pastel": [(0, 0.065), (0.25, 0.30), (0.5, 0.575), (0.75, 0.805), (1, 0.975)],
     # 흑백 그레인: 필름 인화 같은 적당한 대비, 검정·흰색 끝만 살짝 접는다.
     "bw": [(0, 0.035), (0.25, 0.21), (0.5, 0.50), (0.75, 0.80), (1, 0.975)],
@@ -585,6 +587,10 @@ _MAX_SHORT_EDGE = 2560
 _MAX_PROCESS_PIXELS = 16_000_000
 
 
+class ImageRejected(ValueError):
+    """사용자에게 그대로 보여도 되는 이미지 거부 사유(깨짐·과대 크기)."""
+
+
 def decode_base64_image(b64: str) -> Image.Image:
     """Base64 문자열을 PIL Image로 디코딩.
 
@@ -594,7 +600,7 @@ def decode_base64_image(b64: str) -> Image.Image:
     img = Image.open(io.BytesIO(data))
     w, h = img.size
     if w <= 0 or h <= 0 or w * h > _MAX_DECODE_PIXELS:
-        raise ValueError(f"처리할 수 없는 이미지 크기입니다 ({w}x{h})")
+        raise ImageRejected(f"처리할 수 없는 이미지 크기입니다 ({w}x{h})")
     img = img.convert("RGB")
 
     scale = min(1.0, _MAX_SHORT_EDGE / min(w, h), (_MAX_PROCESS_PIXELS / (w * h)) ** 0.5)
@@ -603,6 +609,23 @@ def decode_base64_image(b64: str) -> Image.Image:
         log.info("decode: %dx%d → %dx%d (해상도 상한)", w, h, *new_size)
         img = img.resize(new_size, Image.LANCZOS)
     return img
+
+
+def check_base64_image(b64: str) -> None:
+    """픽셀을 풀지 않고 헤더만 읽어, 처리할 수 없는 이미지면 ValueError를 낸다.
+
+    분석은 Claude 호출(수십 초, 유료) 뒤에야 이미지를 디코딩한다. 깨졌거나
+    너무 큰 이미지가 그 호출을 다 쓰고 나서야 실패하지 않도록 앞에서 거른다.
+    """
+    try:
+        data = base64.b64decode(b64)
+        with Image.open(io.BytesIO(data)) as img:
+            w, h = img.size
+            img.verify()
+    except Exception as exc:
+        raise ImageRejected("이미지를 읽을 수 없습니다") from exc
+    if w <= 0 or h <= 0 or w * h > _MAX_DECODE_PIXELS:
+        raise ImageRejected(f"처리할 수 없는 이미지 크기입니다 ({w}x{h})")
 
 
 def encode_image_base64(img: Image.Image, fmt: str = "JPEG", quality: int = 92) -> str:
@@ -625,7 +648,6 @@ def estimate_noise_sigma(img: Image.Image) -> float:
     """이미지의 노이즈 표준편차를 추정한다 (0~255 스케일).
 
     Immerkær(1996)의 라플라시안 기반 추정 — 평탄한 영역의 고주파 성분만
-    남기는 3x3 커널로 합성곱한 뒤 평균 절대값을 취한다. 사진 내용(엣지)에
     남기는 3x3 커널로 합성곱한 뒤 평균 절대값을 취한다.
 
     화면 전체 평균을 내면 안 된다. 코코아 가루·스펀지·잎사귀 같은 고운 질감도
@@ -897,7 +919,7 @@ def apply_auto_white_balance(img: Image.Image, strength: float) -> Image.Image:
 
 
 def estimate_keystone(img: Image.Image, max_correction: float = 0.35) -> float:
-    """수직 원근 왜곡(키스톤)의 세기를 추정한다. -1~1, 확신 없으면 0.
+    """수직 원근 왜곡(키스톤)의 세기를 추정한다. ±0.35로 묶인 값, 확신 없으면 0.
 
     건물을 아래에서 올려다보면 위쪽이 좁아진다. 화면 좌우의 "수직에 가까운"
     선들이 위로 갈수록 서로 모이는지를 보고 그 정도를 잰다.
@@ -949,7 +971,7 @@ def estimate_keystone(img: Image.Image, max_correction: float = 0.35) -> float:
     # 위가 좁으면 왼쪽 선은 오른쪽으로, 오른쪽 선은 왼쪽으로 기운다.
     convergence = (right_slope - left_slope) / 2.0
 
-    # 기울기(dx/dy)를 [apply_keystone]이 쓰는 단위로 바꾼다.
+    # 기울기(dx/dy)를 [_keystone_with_matrix]가 쓰는 단위로 바꾼다.
     # 한 변이 전체 높이에 걸쳐 convergence*h 만큼 안으로 들어오므로,
     # 좁아진 쪽을 그만큼 넓히려면 폭 대비 2*convergence*h/w 가 필요하다.
     amount = 2.0 * convergence * h / w
@@ -976,15 +998,10 @@ def _compose_geometry(
     return added if base is None else added @ base
 
 
-def apply_keystone(img: Image.Image, amount: float) -> Image.Image:
-    """수직 원근을 편다. amount는 [estimate_keystone]의 반환값."""
-    return _keystone_with_matrix(img, amount)[0]
-
-
 def _keystone_with_matrix(
     img: Image.Image, amount: float
 ) -> tuple[Image.Image, np.ndarray | None]:
-    """[apply_keystone]과 같지만 원본→결과 좌표 변환 행렬도 돌려준다.
+    """수직 원근(키스톤)을 보정하고, 원본→결과 좌표 변환 행렬도 돌려준다.
 
     위쪽(또는 아래쪽) 변을 늘려 좌우 수직선을 평행하게 만든 뒤,
     회전 보정과 같이 검은 여백 없이 내접 영역만 남긴다.
@@ -1039,8 +1056,8 @@ _BLUR_MIN_SUBJECT = 0.08
 # 이 비중 이상이면 온전한 세기로 건다. 사이 구간은 선형으로 올린다.
 _BLUR_FULL_SUBJECT = 0.18
 
-# strength 1.0에서의 흐림 반경(sigma)을 짧은 변 대비로. 실측 sigma:
-#   0.19(기본) → 2.5,  0.5 → 6.5,  1.0 → 13.0
+# strength 1.0에서의 흐림 반경(sigma)을 짧은 변 대비로. 짧은 변 약 1080px에서 실측 sigma:
+#   0.19 → 2.5,  0.5 → 6.5,  1.0 → 13.0  (지금 자동 보정의 기본값은 0 — 꺼져 있다)
 # 예전에는 이 계수를 sigma가 아니라 커널 크기에 곱했다. OpenCV가 커널에서
 # 유도하는 sigma는 그 6분의 1이라, 기본 세기에서 sigma가 0.8 — 눈에 보이지
 # 않았다. 인물 사진마다 켜지는 기능이 사실상 아무 일도 하지 않았다.
@@ -1183,7 +1200,7 @@ def adjust_brightness(img: Image.Image, factor: float) -> Image.Image:
 
     l_ch = lab[:, :, 0] / 255.0
 
-    # factor → gamma 변환: +1.0 → gamma 0.4(밝게), -1.0 → gamma 2.5(어둡게)
+    # factor → gamma 변환: +1.0 → gamma 0.5(밝게), -1.0 → gamma 2.5(어둡게)
     gamma = 1.0 / (1.0 + factor) if factor >= 0 else 1.0 - factor * 1.5
     gamma = max(0.2, min(5.0, gamma))
 
@@ -1229,107 +1246,6 @@ def adjust_contrast(
     result_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
     result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
 
-    return Image.fromarray(result_rgb)
-
-
-def adjust_clarity(img: Image.Image, factor: float) -> Image.Image:
-    """선명감(Clarity) 조절. factor: -1.0 ~ +1.0 (0 = 원본).
-
-    Lightroom의 Clarity와 동일 개념 — 중간톤의 로컬 대비만 강화한다.
-    LAB L채널에서 가우시안 블러(로컬 평균)를 빼 하이패스 디테일을 추출하고,
-    중간톤 마스크를 적용하여 밝은/어두운 극단은 건드리지 않는다.
-    A/B 채널은 보존되므로 색상 왜곡이 없다.
-    """
-    if abs(factor) < 0.01:
-        return img
-
-    arr = np.array(img, dtype=np.uint8)
-    arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    lab = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-
-    l_ch = lab[:, :, 0]
-
-    # 로컬 평균 (큰 커널 가우시안 블러 → 저주파 성분)
-    h, w = l_ch.shape[:2]
-    ksize = max(9, int(min(h, w) * 0.015)) | 1  # 해상도 적응형 커널
-    l_blur = cv2.GaussianBlur(l_ch, (ksize, ksize), 0)
-
-    # 하이패스 디테일 = 원본 - 로컬 평균
-    detail = l_ch - l_blur
-
-    # 중간톤 마스크: 모든 톤에 최소 30% 적용, 중간톤에 100% 적용
-    midtone_mask = 0.3 + 0.7 * (1.0 - np.abs(l_ch - 128.0) / 128.0)
-
-    # factor 비례로 디테일 증폭 (양수: 로컬 대비 강화, 음수: 소프트)
-    l_ch = l_ch + detail * factor * 0.8 * midtone_mask
-    lab[:, :, 0] = np.clip(l_ch, 0, 255)
-
-    result_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-    result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-
-    return Image.fromarray(result_rgb)
-
-
-def apply_dehaze(img: Image.Image, factor: float) -> Image.Image:
-    """안개 제거(Dehaze). factor: -1.0 ~ +1.0 (0 = 원본).
-
-    Dark Channel Prior 기반 디헤이즈.
-    양수: 안개/연무 제거 (대비·채도 복원), 음수: 안개 추가 (몽환적 효과).
-    LAB 색공간에서 L채널은 디헤이즈, A/B 채널은 채도 복원을 수행한다.
-    """
-    if abs(factor) < 0.01:
-        return img
-
-    arr = np.array(img, dtype=np.uint8)
-    arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-
-    if factor > 0:
-        # ── 양수: Dark Channel Prior 디헤이즈 ──
-        b, g, r = cv2.split(arr_bgr)
-        # Dark channel: 각 픽셀 주변에서 RGB 최솟값의 로컬 최솟값
-        dark = np.minimum(np.minimum(b, g), r).astype(np.float32)
-        ksize = max(7, int(min(arr_bgr.shape[:2]) * 0.01)) | 1
-        dark = cv2.erode(dark, np.ones((ksize, ksize), np.uint8))
-
-        # Atmospheric light 추정: dark channel 상위 0.1% 밝기의 평균
-        num_pixels = dark.size
-        n_bright = max(1, int(num_pixels * 0.001))
-        flat_dark = dark.flatten()
-        indices = np.argpartition(flat_dark, -n_bright)[-n_bright:]
-        # 해당 인덱스들에서 원본의 밝기 평균
-        arr_f = arr_bgr.astype(np.float32)
-        flat_img = arr_f.reshape(-1, 3)
-        atm = flat_img[indices].mean(axis=0)  # [B, G, R]
-        atm = np.clip(atm, 1.0, 255.0)
-
-        # Transmission 추정
-        norm = arr_f / atm[np.newaxis, np.newaxis, :]
-        dark_norm = np.min(norm, axis=2)
-        dark_norm_blur = cv2.GaussianBlur(dark_norm, (ksize * 2 + 1, ksize * 2 + 1), 0)
-        # factor 비례로 제거 강도 조절 (0.0~0.95)
-        omega = factor * 0.95
-        transmission = 1.0 - omega * dark_norm_blur
-        transmission = np.clip(transmission, 0.1, 1.0)
-
-        # Scene radiance 복원
-        t = transmission[:, :, np.newaxis]
-        result_f = (arr_f - atm) / t + atm
-        result_bgr = np.clip(result_f, 0, 255).astype(np.uint8)
-    else:
-        # ── 음수: 안개 추가 (화이트 쪽으로 블렌딩) ──
-        lab = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-        haze_amount = abs(factor)
-        # L채널을 밝게 + 균일화 → 안개 효과
-        lab[:, :, 0] = lab[:, :, 0] * (1.0 - haze_amount * 0.4) + 200.0 * haze_amount * 0.4
-        # A/B 채널을 128(무채색)쪽으로 → 탈채도
-        lab[:, :, 1] = lab[:, :, 1] * (1.0 - haze_amount * 0.3) + 128.0 * haze_amount * 0.3
-        lab[:, :, 2] = lab[:, :, 2] * (1.0 - haze_amount * 0.3) + 128.0 * haze_amount * 0.3
-        lab[:, :, 0] = np.clip(lab[:, :, 0], 0, 255)
-        lab[:, :, 1] = np.clip(lab[:, :, 1], 0, 255)
-        lab[:, :, 2] = np.clip(lab[:, :, 2], 0, 255)
-        result_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-    result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(result_rgb)
 
 
@@ -1450,49 +1366,6 @@ def adjust_shadows(img: Image.Image, factor: float) -> Image.Image:
     return Image.fromarray(result_rgb)
 
 
-def apply_tone_curve(
-    img: Image.Image, preset: str = "linear", strength: float = 0.0
-) -> Image.Image:
-    """톤 커브 적용. preset: 프리셋 이름, strength: 0.0~1.0.
-
-    프리셋의 5개 제어점으로 256단계 LUT를 생성하고,
-    identity curve와 블렌딩하여 LAB L채널에 적용한다.
-    A/B(색상) 채널은 보존되므로 색상 왜곡이 없다.
-    """
-    if strength < 0.01:
-        return img
-
-    points = TONE_CURVE_PRESETS.get(preset)
-    if points is None or preset == "linear":
-        return img
-
-    # 제어점에서 256단계 LUT 생성 (선형 보간)
-    x_pts = np.array([p[0] for p in points], dtype=np.float64)
-    y_pts = np.array([p[1] for p in points], dtype=np.float64)
-
-    x_256 = np.linspace(0.0, 1.0, 256)
-    curve = np.interp(x_256, x_pts, y_pts)
-
-    # identity curve와 strength로 블렌딩
-    identity = x_256
-    blended = identity * (1.0 - strength) + curve * strength
-
-    # 0~255 정수 LUT
-    lut = np.clip(blended * 255.0, 0, 255).astype(np.uint8)
-
-    # LAB L채널에 LUT 적용
-    arr = np.array(img, dtype=np.uint8)
-    arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    lab = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2LAB)
-
-    lab[:, :, 0] = lut[lab[:, :, 0]]
-
-    result_bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-
-    return Image.fromarray(result_rgb)
-
-
 # 8비트 눈금(L 0~255, a/b 128 중심 / H 0~180, S·V 0~255)을 유지한 채 float로
 # 색공간을 왕복한다. 예전처럼 uint8로 절삭(astype)하면 단계마다 채널이 평균
 # 0.5씩 깎이고(어둡고 푸르게) 약한 보정이 단계 경계에서 한 칸씩 뒤집혔다 —
@@ -1538,8 +1411,12 @@ def apply_split_toning(
     LAB 색공간에서 L(밝기) 기준으로 쉐도우/하이라이트를 분리하고,
     각 영역의 A/B 채널을 hue 방향으로 시프트한다.
 
-    hue: 0~360 (색상환 각도). 0=빨강, 30=오렌지, 60=노랑, 120=녹색,
-         180=시안, 210=틸, 240=파랑, 270=보라, 300=마젠타, 330=핑크
+    hue: 0~360. HSV 색상환이 아니라 LAB a·b 평면의 각도다 (a=cos, b=sin).
+         밝은 회색 위에서 실제로 나오는 색(실측):
+           5~15 핑크 · 30 코랄 · 45 연어/복숭아 · 60 살구 · 75 베이지/호박
+           100 올리브 노랑 · 135 연두 · 185~195 민트/청록 · 210 하늘빛 청록
+           270 파랑 · 300 라벤더 · 335 로즈
+         HSV 기준(60=노랑, 240=파랑)으로 고르면 한 칸씩 붉은 쪽으로 밀린다.
     strength: 0.0~1.0 (색조 강도)
     """
     if shadow_strength < 0.01 and highlight_strength < 0.01:
@@ -1645,14 +1522,9 @@ def apply_hsl_adjust(
 
         # 색상 마스크 생성 (부드러운 경계)
         if lo > hi:
-            # wrap-around (red: 170~180 + 0~10)
-            dist = np.minimum(
-                np.minimum(np.abs(h_ch - lo), np.abs(h_ch - (lo - 180))),
-                np.minimum(np.abs(h_ch - hi), np.abs(h_ch - (hi + 180))),
-            )
+            # wrap-around (red: 170~180 + 0~10) — 고리 위 중심까지의 거리로 잰다
             half_range = ((180 - lo) + hi) / 2.0
             center = (lo + half_range) % 180
-            # 이 경우 직접 계산: wrap-around 거리
             d1 = np.abs(h_ch - center)
             d2 = 180.0 - d1
             dist = np.minimum(d1, d2)
@@ -1661,7 +1533,7 @@ def apply_hsl_adjust(
             center = (lo + hi) / 2.0
             half_range = (hi - lo) / 2.0
             dist = np.abs(h_ch - center)
-            # feather: 경계에서 5도 더 부드럽게
+            # feather: 경계 밖으로 OpenCV 색상 5단위(=10°) 더 부드럽게
             mask = np.clip(1.0 - dist / max(half_range + 5, 1), 0.0, 1.0)
 
         # 저채도 픽셀 제외 (무채색은 색상 조절 의미 없음)
@@ -1711,7 +1583,10 @@ def apply_vignette(img: Image.Image, intensity: float) -> Image.Image:
     y_coords, x_coords = np.ogrid[:h, :w]
     dist = np.sqrt(((x_coords - cx) / cx) ** 2 + ((y_coords - cy) / cy) ** 2)
 
-    # 중심 0 ~ 가장자리 1 → 부드러운 감쇠 커브
+    # 타원 반지름 0.4 안쪽은 0, 변 가운데(dist 1)에서 1, 모서리(dist √2)에서 약 1.69.
+    # 1.5제곱 뒤 모서리는 약 2.2라 모서리가 변보다 두 배 넘게 어두워진다(실제 렌즈
+    # 비네팅처럼 모서리 쪽이 더 떨어진다). 레시피 세기는 이 곡선 위에서 맞췄다 —
+    # 1에서 자르면 같은 값의 비네팅이 모서리에서 절반 이하로 약해진다.
     mask = np.clip(dist - 0.4, 0, 1.0) / 0.6
     mask = mask ** 1.5  # 감쇠 커브를 더 부드럽게
 
@@ -2592,8 +2467,8 @@ def apply_blemish_removal(
 
 # 크롭으로 남길 최소 비율. 프롬프트가 모델에게 약속한 값과 같다.
 #
-# 예전 하한은 0.05였고 그 외에는 절대 50px 가드뿐이었다. 프롬프트는 크롭을
-# "적극 추천", "과감하게 줌인"하라고 밀어붙이므로, 모델이 작은 박스를 주면
+# 예전 하한은 0.05였고 그 외에는 절대 50px 가드뿐이었다. 당시 프롬프트는 크롭을
+# "적극 추천", "과감하게 줌인"하라고 밀어붙였고(지금은 아니다), 모델이 작은 박스를 주면
 # 4000x3000 사진이 240x180으로 잘려 나왔다 (50px 가드는 썸네일만 지킨다).
 _CROP_MIN_SIDE = 0.3
 
@@ -2669,7 +2544,7 @@ def apply_instagram_ratio(
     """인스타그램 최적 비율로 중앙 크롭한다.
 
     ratio: "3:4" (2025년부터 프로필 그리드 비율, 1080x1440), "4:5" (피드 세로),
-           "1:1" (정사각형). 공백·"x" 구분자("3x4")도 받는다.
+           "1:1" (정사각형), "1.91:1" (가로 최대). 공백·"x" 구분자("3x4")도 받는다.
 
     allow_vertical_crop=False면 위아래를 자르지 않는다. 전신 인물 사진에서
     가운데를 기준으로 위아래를 자르면 머리와 발이 잘려 다리가 짧아 보인다.
@@ -2791,7 +2666,7 @@ def gate_auto_edits(
 ) -> dict:
     """분석 결과의 autoEdits에서 구도를 바꾸는 편집을 자동 적용/제안으로 나눈다.
 
-    모델은 크롭을 "적극" 권하도록 쓰인 프롬프트를 따라 거의 매번 crop과
+    예전 모델은 크롭을 "적극" 권하도록 쓰인 프롬프트를 따라 거의 매번 crop과
     instagram_ratio를 달았다 (실사진 7장 중 비율 6장, 크롭 5장). 사용자가 잡은
     구도를 말없이 바꾸는 것이라, 서버가 판단한다:
       - instagram_ratio: 인스타가 받지 않는 비율일 때만 자동 적용 (가장 덜 자르는
@@ -2813,6 +2688,10 @@ def gate_auto_edits(
     model_reason = _clean_reason(auto_edits.pop("crop_reason", None))
     auto_edits.pop("ratio_reason", None)
 
+    # 필요한 비율은 수평·원근 보정이 끝난 프레임으로 다시 잰다(apply_auto_edits).
+    # 회전 보정의 안쪽 크롭은 가로세로비를 더 극단으로 만들어, 여기서 1.91:1 안이던
+    # 사진도 회전 뒤에는 밖으로 나갈 수 있다. 아래 값은 이유 문구와 앱 표시용이다.
+    auto_edits["ratio_auto"] = True
     needed = required_instagram_ratio(size)
     if needed is not None:
         auto_edits["instagram_ratio"] = needed
@@ -3029,18 +2908,17 @@ def apply_object_removal(img: Image.Image, areas: list[dict]) -> Image.Image:
         return img
 
 
-def apply_straighten(img: Image.Image, angle: float) -> Image.Image:
-    """이미지 수평 보정. angle: 회전 각도 (도 단위, 시계방향 양수)."""
-    return _straighten_with_matrix(img, angle)[0]
-
-
 def _straighten_with_matrix(
     img: Image.Image, angle: float
 ) -> tuple[Image.Image, np.ndarray | None]:
-    """[apply_straighten]과 같지만 원본→결과 좌표 변환 행렬도 돌려준다.
+    """사진의 기울기를 바로잡고, 원본→결과 좌표 변환 행렬도 돌려준다.
 
-    회전 후 생기는 검은 여백을 자동으로 크롭하여 깔끔한 결과를 반환한다.
-    안전장치: ±15도 초과 시 의도적 기울기로 판단하여 무시.
+    angle은 사진에서 보이는 시계방향 기울기(오른쪽이 내려감 = 양수)다. 이미지를 그만큼
+    반시계방향으로 돌려 바로 세운다 (cv2의 양수 각도가 반시계 회전이다).
+    회전 후 생기는 여백은 안쪽 직사각형으로 잘라낸다 — 가로세로비가 원본보다 더
+    극단으로 바뀌므로 인스타 비율은 이 뒤에 다시 잰다([apply_auto_edits]).
+    안전장치: ±15도 초과는 의도적 기울기로 보고 무시한다. 자동 보정은 이미
+    ±8도(param_engine.MAX_TILT)에서 막히고, 이 한도는 앱이 되돌려 보낸 값에 대한 것이다.
     손대지 않았으면 행렬은 None이다.
     """
     if abs(angle) < 0.1:
@@ -3075,14 +2953,9 @@ def _straighten_with_matrix(
             borderMode=cv2.BORDER_REPLICATE,
         )
 
-        # 검은 여백 없이 원본 영역만 크롭 (내접 직사각형)
-        rad = abs(angle) * np.pi / 180.0
-        if w > h:
-            crop_w = int(w * cos_a - h * sin_a)
-            crop_h = int(h * cos_a - w * sin_a)
-        else:
-            crop_w = int(w * cos_a - h * sin_a)
-            crop_h = int(h * cos_a - w * sin_a)
+        # 여백 없이 원본 영역만 남도록 가운데 직사각형으로 자른다
+        crop_w = int(w * cos_a - h * sin_a)
+        crop_h = int(h * cos_a - w * sin_a)
 
         # 내접 직사각형이 유효하지 않으면 간단한 비율 축소
         if crop_w <= 0 or crop_h <= 0:
@@ -3169,6 +3042,7 @@ def apply_auto_edits(
     """AI autoEdits를 순서대로 적용한다.
 
     순서: 불필요 요소 제거 → 원근 보정 → 수평 보정 → 스마트 크롭 → 인스타 비율
+    (비율은 ratio_auto면 앞 단계가 끝난 프레임으로 다시 잰다)
 
     요소 제거가 맨 앞인 이유: 모델은 원본 사진을 보고 좌표를 짚는데, 기하 보정이
     프레임을 회전시키고 잘라내 그 좌표를 밀어 놓는다 (수평 3° + 키스톤 0.15에서
@@ -3217,6 +3091,9 @@ def apply_auto_edits(
     # 그 외에는 suggested_* 를 보지 않는다 — 제안은 자동 적용이 아니다.
     crop = auto_edits.get("crop")
     ig_ratio = auto_edits.get("instagram_ratio")
+    if auto_edits.get("ratio_auto") is True:
+        # 서버가 정한 '인스타가 받는 비율로 맞추기' — 기하 보정 뒤 프레임으로 다시 잰다
+        ig_ratio = _RECHECK_RATIO
     if auto_edits.get("apply_suggested_crop") is True:
         if isinstance(auto_edits.get("suggested_crop"), dict):
             crop = auto_edits["suggested_crop"]
@@ -3341,7 +3218,7 @@ _REGION_TONE_PARAMS = (
     "brightness", "contrast", "saturation", "temperature", "highlights", "shadows",
 )
 
-# 얼굴 톤 보정의 상한. 모델은 -1.0~1.0을 주지만 얼굴 마스크는 목·귀·머리카락을
+# 얼굴 톤 보정의 상한(프롬프트도 ±0.18을 요구한다). 얼굴 마스크는 목·귀·머리카락을
 # 포함하지 않으므로, 이 범위를 넘겨 밝히면 페더를 아무리 넓혀도 얼굴만
 # 오려 붙인 것처럼 겉돈다. 전체 보정으로 올릴 몫은 슬라이더 쪽에 있다.
 _FACE_TONE_LIMIT = 0.18
@@ -3352,8 +3229,6 @@ _FACE_TONE_LIMIT = 0.18
 # apply-transform 정도다 — 겹쳐도 과하지 않게 낮게 묶는다.
 _FACE_TEXTURE_LIMIT = 0.3
 
-# 국소 보정(local_*)의 파라미터별 상한. 얼굴과 달리 "날아간 창문을 살린다"처럼
-# 의도가 분명한 교정이라 더 크게 허용하되, 한 영역이 사진을 지배하지는 못하게 한다.
 # 하늘·배경의 상한. 얼굴만 묶여 있었고 이쪽은 프롬프트가 -1.0~1.0을 허용했다.
 # 실측: sky brightness -1.0 → 하늘 평균 167에서 98로, background -1.0 → 165에서
 # 105로. 손대지 않은 피사체만 남고 주변이 터널처럼 어두워진다.
@@ -3377,8 +3252,8 @@ _REGION_META_KEYS = frozenset({"area", "shape", "feather", "reason"})
 # 국소 보정 영역 이름의 접두사. 모델은 local_0, local_1... 로 준다.
 _LOCAL_PREFIX = "local"
 
-# 국소 보정 영역의 개수·크기 한도.
-_LOCAL_MAX_COUNT = 4
+# 국소 보정 영역의 개수·크기 한도. 프롬프트("최대 2개")와 param_engine이 이 값을 쓴다.
+_LOCAL_MAX_COUNT = 2
 _LOCAL_MIN_AREA = 0.003   # 프레임 대비 — 이보다 작으면 마스크를 풀면 사라진다
 _LOCAL_MAX_AREA = 0.50    # 이보다 크면 국소 보정이 아니라 전체 보정이다
 
@@ -3603,7 +3478,7 @@ def apply_regional_transforms(
 
     region_params 예시:
     {
-      "sky": {"brightness": 0.1, "saturation": -0.1, "temperature": 0.0},
+      "sky": {"brightness": -0.1, "saturation": 0.1, "temperature": 0.0},
       "face": {"brightness": 0.1, "blemish_removal": 0.3, "skin_smoothing": 0.2},
       "background": {"brightness": 0.0, "contrast": 0.1, "saturation": -0.05},
       "local_0": {"area": {...}, "shape": "rect", "highlights": -0.45}
@@ -3736,7 +3611,6 @@ _FACE_CONTOUR_RIGHT = [454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152]
 # 턱선 인덱스 (V라인)
 _JAW_LEFT = [172, 136, 150, 149, 176, 148]
 _JAW_RIGHT = [397, 365, 379, 378, 400, 377]
-_JAW_TIP = [152]
 
 # 코 고정점 — 움직이지 않는 제어점으로 넣는다.
 #
@@ -3766,9 +3640,12 @@ _NOSE_ANCHORS = [
 # MediaPipe 규약 (FaceLandmarksConnections로 확인):
 #   LEFT_EYE  = 362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398
 #   RIGHT_EYE = 33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246
-#   홍채는 468~472가 LEFT, 473~477이 RIGHT이며 각 첫 번째가 중심이다.
-_LEFT_EYE_CENTER = 468    # LEFT iris 중심
-_RIGHT_EYE_CENTER = 473   # RIGHT iris 중심
+#   LEFT_IRIS  = 474~477 고리, 중심 473
+#   RIGHT_IRIS = 469~472 고리, 중심 468
+#   (예전 주석은 반대로 적혀 있었고 코드도 그걸 따라 두 눈의 중심이 뒤바뀌어
+#    있었다. 고개를 돌린 사진에서 먼 눈에 가까운 눈 크기의 확대가 걸렸다.)
+_LEFT_EYE_CENTER = 473    # LEFT iris 중심
+_RIGHT_EYE_CENTER = 468   # RIGHT iris 중심
 _LEFT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
 _RIGHT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 
@@ -4240,12 +4117,16 @@ def apply_face_reshape(
 
 
 # ── 체형 보정 강도 (값 1.0에서) ──
-#   leg_stretch    1.0 → 엉덩이~발목 다리 길이 +10% (예전: 힙 아래 전체 +25%, 발이 잘림)
-#   waist_slim     1.0 → 허리 실루엣이 반폭의 8% 안쪽으로 (예전 11%, 관절점을 밀어 팔·배경이 휨)
-#   shoulder_width ±1.0 → 어깨선이 어깨 반폭의 ±6% (예전 ±10%, 목·턱까지 끌려감)
-_LEG_STRETCH_GAIN = 0.10
-_WAIST_SLIM_GAIN = 0.08
-_SHOULDER_GAIN = 0.06
+#   leg_stretch    1.0 → 엉덩이~발목 다리 길이 +20%
+#   waist_slim     1.0 → 허리 실루엣이 반폭의 16% 안쪽으로
+#   shoulder_width 1.0 → 어깨선이 어깨 반폭의 12% 바깥으로 (자동 보정은 넓히기만,
+#                  0~0.5. 수동 슬라이더 경로는 음수(좁히기)도 받는다)
+# 2026-10: 이전 값(10%·8%·6%)은 모델 값 0.15~0.35에서 변화가 1~4%라 전후 차이가
+# 보이지 않았다. 강도별 비교(x1~x2.5)에서 x2를 골랐다. 세기는 여전히
+# body_check의 측정(부족한 만큼만)과 자체 검사(배경 휨·다른 사람)가 먼저 깎는다.
+_LEG_STRETCH_GAIN = 0.20
+_WAIST_SLIM_GAIN = 0.16
+_SHOULDER_GAIN = 0.12
 _BODY_FIELD_COMP = 1.4
 # 다리를 늘린 만큼 발 아래 바닥을 최대 이 비율까지 눌러 발이 프레임 밖으로 밀리지 않게 한다
 _FLOOR_MAX_COMPRESS = 0.3
@@ -4566,7 +4447,6 @@ def apply_body_reshape(
     return Image.fromarray(result_arr)
 
 
-
 # ── LAB 일괄 보정 헬퍼 (색 공간 변환 1회) ──
 
 
@@ -4630,7 +4510,7 @@ def _skin_tone_weight(l_ch: np.ndarray, a_ch: np.ndarray, b_ch: np.ndarray) -> n
     """피부색일수록 1에 가까운 부드러운 가중치 (LAB 8비트 눈금, 0~1).
 
     피부는 밝기·인종과 무관하게 LAB 색상각 약 30~80°(주황)에 채도 C* 10~35 안에 모인다.
-    색상각 55°를 중심으로 ±35°까지 부드럽게 줄이고, 거의 무채색(C*<4)·원색에 가까운
+    색상각 55°를 중심으로 ±35°(20~90°)까지 부드럽게 줄이고, 거의 무채색(C*<4)·원색에 가까운
     강한 주황(C*>50)·아주 어두운 화소는 뺀다. 얼굴 검출 없이 화소 단위로 계산한다.
     """
     a = a_ch - 128.0
@@ -4971,12 +4851,15 @@ def apply_all_transforms(
 ) -> Image.Image:
     """모든 변형을 순서대로 적용.
 
-    순서: 얼굴 보정 → 체형 보정 → 하이라이트 → 쉐도우 → 톤 커브 → 밝기 → 대비
-          → 선명감(Clarity) → 디헤이즈 → 색온도 → 채도 → HSL 선택적 색상
-          → 스플릿 토닝 → 잡티 제거 → 피부보정 → 비네팅 → 선명도 → 그레인
+    순서: 자동 화이트밸런스 → 노이즈 제거 (촬영 결함 교정)
+          → 얼굴 보정 → 체형 보정
+          → LAB 한 번에: (양수 디헤이즈) → 하이라이트 → 쉐도우 → 톤 커브 → 밝기 → 대비
+            → 선명감(Clarity) → (음수 디헤이즈) → 색온도 → 채도
+          → HSL 선택적 색상 → 스플릿 토닝 → 잡티 제거 → 피부보정 → 비네팅 → 선명도
+          → 배경 흐림 → 그레인
 
     핵심 원칙:
-    - 기하학적 변형(reshape)이 모든 색감 보정보다 먼저 실행
+    - 기하학적 변형(reshape)은 촬영 결함 교정 다음, 나머지 색감 보정보다 먼저 실행
     - 하이라이트/쉐도우를 먼저 적용하여 다이나믹 레인지를 확보한 뒤 밝기 조절
     - 톤 커브를 밝기/대비 전에 적용하여 커브의 특성이 보존됨
     - Clarity는 대비 직후에 적용 (글로벌 대비 위에 로컬 대비 추가)
@@ -5014,8 +4897,11 @@ def apply_all_transforms(
         or skin_smoothing >= 0.01
     )
 
-    # 배경 흐림도 얼굴 감지가 필요하다
+    # 배경 흐림은 사람 분할(segmentation)이 필요하다
     needs_mp = needs_mp or background_blur >= 0.01
+    # 그레인은 맨 마지막이어야 한다. 배경 흐림이 있으면 흐림 뒤에 따로 얹는다 —
+    # 먼저 얹으면 배경의 그레인만 흐려져 사람만 오려 붙인 것처럼 보인다.
+    impl_grain = 0.0 if background_blur >= 0.01 else grain
 
     if needs_mp and cache is None:
         # 캐시가 없으면 자동 생성하여 함수 내에서 모델/결과 재사용
@@ -5023,22 +4909,23 @@ def apply_all_transforms(
             result = _apply_all_transforms_impl(
                 img, brightness, contrast, clarity, dehaze, highlights, shadows,
                 saturation, temperature, blemish_removal, skin_smoothing, vignette,
-                sharpness, grain, tone_curve_preset, tone_curve_strength,
+                sharpness, impl_grain, tone_curve_preset, tone_curve_strength,
                 split_shadow_hue, split_shadow_strength, split_highlight_hue,
                 split_highlight_strength, hsl_adjust, face_slim, jaw_sharpen,
                 eye_enlarge, leg_stretch, shoulder_width, waist_slim, preview,
                 auto_cache, tone_curve_points=tone_curve_points,
             )
             # 배경 흐림은 색 보정이 끝난 뒤 — 그래야 선명도 보정이
-            # 흐려 둔 배경을 다시 살려내지 않는다.
+            # 흐려 둔 배경을 다시 살려내지 않는다. 그레인은 흐림 뒤에 얹는다.
             if background_blur >= 0.01:
                 result = apply_background_blur(result, background_blur, auto_cache)
+                result = apply_grain(result, grain)
             return result
     else:
         result = _apply_all_transforms_impl(
             img, brightness, contrast, clarity, dehaze, highlights, shadows,
             saturation, temperature, blemish_removal, skin_smoothing, vignette,
-            sharpness, grain, tone_curve_preset, tone_curve_strength,
+            sharpness, impl_grain, tone_curve_preset, tone_curve_strength,
             split_shadow_hue, split_shadow_strength, split_highlight_hue,
             split_highlight_strength, hsl_adjust, face_slim, jaw_sharpen,
             eye_enlarge, leg_stretch, shoulder_width, waist_slim, preview,
@@ -5046,6 +4933,7 @@ def apply_all_transforms(
         )
         if background_blur >= 0.01:
             result = apply_background_blur(result, background_blur, cache)
+            result = apply_grain(result, grain)
         return result
 
 
@@ -5201,10 +5089,12 @@ def sanitize_hsl_adjust(raw: Any) -> dict[str, dict[str, float]] | None:
 
 
 def analysis_to_transform_params(analysis: dict[str, Any]) -> dict[str, float]:
-    """AI 분석 JSON의 recommendedParams를 슬라이더 초기값으로 사용한다.
+    """분석 JSON의 recommendedParams를 평평한 슬라이더 값으로 옮긴다.
 
-    AI가 사진을 직접 보고 추천한 값을 그대로 사용하고,
-    recommendedParams가 없으면 기본값(0.0)으로 폴백한다.
+    recommendedParams는 서버(param_engine)가 사진 측정과 스타일 프로필로 계산한
+    값이다(모델은 수치를 정하지 않는다). 없으면 기본값(0.0)으로 폴백한다.
+    여기서는 슬라이더 범위로만 자른다 — 자동 보정의 체형 상한(0.5)은 param_engine이
+    이미 적용했고, 수동 슬라이더는 그보다 넓게(±1.0) 허용한다.
     """
     default_params: dict[str, float] = {
         "brightness": 0.0,

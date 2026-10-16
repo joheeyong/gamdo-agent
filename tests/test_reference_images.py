@@ -135,10 +135,10 @@ def test_transform_photo_misses_cache_after_reference_change(ref_dir, tmp_path, 
         calls.append(1)
         raise RuntimeError("model called")
 
-    monkeypatch.setattr(cc, "_call_claude", fake_call)
+    monkeypatch.setattr(cc, "_transform_photo_inline", fake_call)
     cc._analysis_cache.clear()
     cc._save_reference_images("123", [0], [_src(tmp_path, "a.jpg", b"A")])
-    key = cc._analysis_cache_key("aW1n", {}, "123")
+    key = cc._analysis_cache_key("aW1n", {}, "123", (True, True))
     cc._analysis_cache_put(key, {"cached": True})
     assert cc.transform_photo({}, "aW1n", user_id="123") == {"cached": True}
     assert calls == []
@@ -147,4 +147,20 @@ def test_transform_photo_misses_cache_after_reference_change(ref_dir, tmp_path, 
     with pytest.raises(Exception):
         cc.transform_photo({}, "aW1n", user_id="123")
     assert calls  # 캐시를 건너뛰고 모델까지 갔다
+    cc._analysis_cache.clear()
+
+
+def test_cache_key_includes_model_and_prompt(ref_dir, monkeypatch):
+    before = cc._analysis_cache_key("img", {}, "")
+    monkeypatch.setattr(cc, "_PROMPT_FINGERPRINT", "other")
+    assert cc._analysis_cache_key("img", {}, "") != before
+
+
+def test_delete_user_data_drops_cached_analyses(ref_dir):
+    cc._analysis_cache.clear()
+    cc._analysis_cache_put("a", {"v": 1}, "123")
+    cc._analysis_cache_put("b", {"v": 2}, "456")
+    cc.delete_user_data("123")
+    assert cc._analysis_cache_get("a") is None
+    assert cc._analysis_cache_get("b") == {"v": 2}
     cc._analysis_cache.clear()

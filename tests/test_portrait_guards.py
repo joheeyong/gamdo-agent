@@ -49,14 +49,40 @@ def test_reshape_off_by_default(photo):
     assert "reshapeParams" not in params
 
 
-def test_reshape_applied_when_enabled(photo):
-    """사용자가 켜면 그대로 전달된다."""
+def _reshape_params(photo, reshape):
     params, _ = build_params_with_comment(
         photo, PORTRAIT_PROFILE,
-        {"subjectType": "인물", "reshapeParams": RESHAPE},
+        {"subjectType": "인물", "reshapeParams": reshape},
         reshape_enabled=True,
     )
-    assert params.get("reshapeParams") == RESHAPE
+    return params.get("reshapeParams")
+
+
+def test_reshape_applied_when_enabled(photo):
+    """사용자가 켜면 얼굴·다리 값은 그대로, 상체는 upper_body가 고른 쪽만 전달된다."""
+    out = _reshape_params(photo, {**RESHAPE, "upper_body": "waist"})
+    assert out == {k: v for k, v in RESHAPE.items() if k != "shoulder_width"}
+
+
+def test_upper_body_shoulder_keeps_only_shoulder(photo):
+    out = _reshape_params(photo, {**RESHAPE, "upper_body": "shoulder"})
+    assert out["shoulder_width"] == 0.2
+    assert "waist_slim" not in out
+    assert out["leg_stretch"] == 0.3
+
+
+def test_no_upper_body_choice_means_no_waist_or_shoulder(photo):
+    """모델이 상체를 고르지 않았으면(필요 없음·애매함) 허리·어깨는 손대지 않는다."""
+    out = _reshape_params(photo, RESHAPE)
+    assert "waist_slim" not in out and "shoulder_width" not in out
+    assert out["leg_stretch"] == 0.3 and out["face_slim"] == 0.3
+    out = _reshape_params(photo, {**RESHAPE, "upper_body": "hips"})
+    assert "waist_slim" not in out and "shoulder_width" not in out
+
+
+def test_shoulders_are_never_narrowed(photo):
+    out = _reshape_params(photo, {**RESHAPE, "upper_body": "shoulder", "shoulder_width": -0.3})
+    assert out["shoulder_width"] == 0.0
 
 
 def test_reshape_never_on_non_portrait(photo):
@@ -112,3 +138,35 @@ def test_vertical_crop_decision_travels_in_auto_edits():
     # 인자를 명시해도 딕셔너리에 기록된 판단이 이긴다
     assert apply_auto_edits(tall, blocked, allow_vertical_crop=True).size == (900, 1400)
 
+
+
+def test_out_of_range_local_region_does_not_take_a_slot():
+    """면적이 범위 밖인 local_0이 개수 한도를 차지해 쓸 만한 local_2가 버려지면 안 된다."""
+    from param_engine import _prune_region_params
+
+    def local(x, y, w, h):
+        return {"area": {"x": x, "y": y, "width": w, "height": h}, "brightness": -0.2, "reason": "창문"}
+
+    analysis = {"regionParams": {
+        "local_0": local(0.0, 0.0, 0.9, 0.9),    # 81% — 전체 보정이라 버려진다
+        "local_1": local(0.1, 0.1, 0.2, 0.2),
+        "local_2": local(0.6, 0.6, 0.2, 0.2),
+    }}
+    _prune_region_params(analysis, {"brightness": 0.0}, False, 1.0)
+    assert set(analysis["regionParams"]) == {"local_1", "local_2"}
+
+
+def test_grain_is_applied_after_background_blur(monkeypatch):
+    """그레인을 먼저 얹으면 배경의 그레인만 흐려져 사람만 오려 붙인 것처럼 보인다."""
+    from PIL import Image
+    import image_processor as ip
+
+    order = []
+    monkeypatch.setattr(ip, "apply_background_blur", lambda img, s, c: order.append("blur") or img)
+    real_grain = ip.apply_grain
+    monkeypatch.setattr(ip, "apply_grain",
+                        lambda img, g: (order.append(f"grain{g:.1f}"), real_grain(img, g))[1])
+    ip.apply_all_transforms(Image.new("RGB", (64, 64), (120, 120, 120)),
+                            grain=0.3, background_blur=0.5, cache=object())
+    assert order.index("blur") < order.index("grain0.3")
+    assert "grain0.3" not in order[:order.index("blur")]

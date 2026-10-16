@@ -28,19 +28,18 @@ from prompts import (
 
 log = logging.getLogger("gamdo-agent")
 
-MODEL = "sonnet"
+# 분석 모델. 별칭("sonnet"/"opus")은 새 버전이 나오면 말없이 바뀌어 판단 기준이
+# 흔들리므로 버전을 고정한다. 바꿀 때는 GAMDO_CLAUDE_MODEL로 (재시작 필요).
+MODEL = os.getenv("GAMDO_CLAUDE_MODEL", "claude-opus-5-5")
 
-# Vision 분석용 이미지 최대 크기 (px). 해상도를 낮춰 전송량과 처리 시간을 줄인다.
-_VISION_MAX_PX = 1024
-
-# 변형할 사진을 메시지에 직접 넣을 때의 긴 변 상한. 모델이 보는 해상도의 상한과
-# 같게 두어, Read로 원본 파일을 읽게 하던 때보다 화질을 잃지 않는다.
+# 사진을 메시지에 직접 넣을 때의 긴 변 상한. 모델이 보는 해상도의 상한과 같다.
 _INLINE_PHOTO_MAX_PX = 1568
 
-# 이미지 전달 방식. inline(기본) = stream-json 메시지에 이미지를 직접 담는다.
-# read = 임시 파일 경로를 주고 모델이 Read 도구로 읽게 한다 (예전 방식).
-# Read는 "도구 호출 → 결과 → 답변"으로 모델 왕복이 최소 한 번 더 생긴다.
-_VISION_INPUT_MODE = os.getenv("GAMDO_VISION_INPUT", "inline").strip().lower()
+# 모델 호출 시간 상한(초). 사진 분석은 실측 8~20초다. 예전에는 실패하면 Read 방식으로
+# 한 번 더, 스키마가 어긋나면 복구 호출을 또 해서 최악 900초까지 늘어났다
+# (앱의 작업 마감은 10분). 이제 Read 재시도는 없고, 복구 호출은 짧게 묶는다.
+_CALL_TIMEOUT = 240
+_REPAIR_TIMEOUT = 90
 
 # 이미지 임시 저장 디렉토리
 _TEMP_DIR = os.path.join(tempfile.gettempdir(), "gamdo-images")
@@ -143,12 +142,24 @@ _ANALYSIS_FALLBACKS: dict[str, Any] = {
     "colorAnalysis": {"colorHarmony": "분석 불가", "paletteDescription": ""},
     "compositionAnalysis": {"primaryTechnique": "분석 불가", "balanceScore": 0.5},
     "toneReport": {"overallMood": "", "styleCategory": "", "narrative": ""},
+    # 모르면 레시피를 고르지 않는 쪽("혼합")이 안전하다
+    "subjectType": "혼합",
 }
 
 
+# subjectType은 param_engine이 레시피를 고르는 키다. 어휘를 벗어나면("인물 사진")
+# 레시피·체형·피부 보정이 꺼지고, 인물에 원근 보정·위아래 크롭이 걸린다.
+_SUBJECT_TYPES = ("인물", "풍경", "음식", "카페/일상", "사물", "동물", "혼합")
+
+
 def _validate_analysis(parsed: dict) -> list[str]:
-    """앱이 요구하는 필드가 갖춰졌는지 검사하고, 어긋난 경로 목록을 반환한다."""
+    """앱·서버가 요구하는 필드가 갖춰졌는지 검사하고, 어긋난 경로 목록을 반환한다."""
     problems: list[str] = []
+    subject = parsed.get("subjectType")
+    if isinstance(subject, str) and subject.strip() in _SUBJECT_TYPES:
+        parsed["subjectType"] = subject.strip()
+    else:
+        problems.append("subjectType")
     for key, spec in _REQUIRED_SHAPE.items():
         value = parsed.get(key)
         if isinstance(spec, dict):
@@ -175,8 +186,12 @@ def _apply_analysis_fallbacks(parsed: dict, problems: list[str]) -> None:
             if not isinstance(target, dict):
                 parsed[key] = dict(fallback)
             else:
+                # 키가 있어도 null·잘못된 타입이면 바꾼다. 앱이 `as String`으로
+                # 읽다가 던지고 "이전 형식의 분석 데이터"를 띄운다.
+                spec = _REQUIRED_SHAPE.get(key, {})
                 for sub, default in fallback.items():
-                    if sub not in target:
+                    types = spec.get(sub) if isinstance(spec, dict) else None
+                    if sub not in target or (types and not isinstance(target[sub], types)):
                         target[sub] = default
         else:
             parsed[key] = fallback
@@ -284,8 +299,9 @@ def _format_items(items: list[dict]) -> str:
         line = f"[{i}]"
         if item.get("text"):
             line += f" {item['text']}"
-        if item.get("image_url"):
-            line += f" (이미지: {item['image_url']})"
+        # 사진은 그리드로 따로 첨부한다. 주소는 모델이 열 수 없고(도구 없음),
+        # 서명 붙은 CDN 주소가 프롬프트만 늘린다. "(사진)" 같은 표시도 달지 않는다 —
+        # 다운로드 실패·10장 상한으로 그리드에 빠진 항목이 있어 번호가 어긋난다.
         if item.get("timestamp"):
             line += f" — {item['timestamp']}"
         parts.append(line)
@@ -410,7 +426,7 @@ def _save_temp_image(b64_data: str, media_type: str = "image/jpeg") -> str:
     return path
 
 
-def _resize_for_vision(img: Image.Image, max_px: int = _VISION_MAX_PX) -> Image.Image:
+def _resize_for_vision(img: Image.Image, max_px: int) -> Image.Image:
     """Vision 분석용으로 이미지를 리사이즈한다. 긴 변이 max_px 이하면 원본 반환."""
     w, h = img.size
     if max(w, h) <= max_px:
@@ -491,7 +507,7 @@ def _call_claude_inline(
     prompt: str,
     system_prompt: str,
     images_b64: list[str],
-    timeout: int = 300,
+    timeout: int = _CALL_TIMEOUT,
 ) -> str:
     """이미지를 stream-json 사용자 메시지에 직접 담아 claude -p를 호출한다.
 
@@ -554,73 +570,6 @@ def _call_claude_inline(
     return final["result"]
 
 
-def _call_claude(
-    prompt: str,
-    system_prompt: str,
-    image_paths: list[str] | None = None,
-    timeout: int = 300,
-    tools: str | None = None,
-) -> str:
-    """claude -p 를 subprocess로 호출한다. 이미지 파일은 --add-dir로 접근 허용."""
-    cmd = [
-        "claude", "-p",
-        "--output-format", "text",
-        "--model", MODEL,
-        "--dangerously-skip-permissions",
-        # 사용자 설정의 MCP 서버를 불러오지 않는다 — 분석에 필요 없고,
-        # 권한 확인을 건너뛰는 상태라 그대로 쓸 수 있게 된다.
-        "--strict-mcp-config",
-    ]
-
-    if system_prompt:
-        cmd.extend(["--system-prompt", system_prompt])
-
-    # 도구 제한. --allowedTools는 "묻지 않고 허용"일 뿐 나머지 도구를 없애지
-    # 않는다. --dangerously-skip-permissions와 함께면 Bash·Write·WebFetch까지
-    # 전부 쓸 수 있어, 게시글 텍스트나 이미지에 심은 지시(프롬프트 인젝션)가
-    # 명령 실행으로 이어질 수 있었다. --tools가 실제로 쓸 수 있는 도구 목록을
-    # 정한다 ("" = 도구 없음).
-    if tools is not None:
-        cmd.extend(["--tools", tools])
-        cmd.extend(["--allowedTools", tools])
-
-    # 이미지 파일이 있으면 해당 디렉토리에 접근 허용
-    if image_paths:
-        cmd.extend(["--add-dir", _TEMP_DIR])
-        # 대표 사진 디렉토리도 추가
-        if os.path.isdir(_REF_DIR):
-            cmd.extend(["--add-dir", _REF_DIR])
-
-    log.info("Calling claude CLI (model=%s, prompt length=%d, images=%d, tools=%s)",
-             MODEL, len(prompt), len(image_paths or []), tools or "all")
-
-    env = child_env(os.environ)
-
-    result = subprocess.run(
-        cmd,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-    )
-
-    if result.returncode != 0:
-        log.error("claude CLI returncode: %d", result.returncode)
-        log.error("claude CLI stderr: %s", result.stderr[:500] if result.stderr else "(empty)")
-        log.error("claude CLI stdout: %s", result.stdout[:500] if result.stdout else "(empty)")
-        raise RuntimeError(
-            f"claude CLI failed (code={result.returncode}): "
-            f"{result.stderr[:200] or result.stdout[:200]}"
-        )
-
-    log.info("claude CLI response length: %d", len(result.stdout))
-    if not result.stdout or not result.stdout.strip():
-        log.error("claude CLI returned empty response. stderr: %s", result.stderr)
-        raise RuntimeError("claude CLI returned empty response")
-    return result.stdout
-
-
 # 자식 CLI에 넘길 환경변수. 중첩 세션 흔적은 지우되 인증 수단은 남긴다.
 #
 # CLAUDE_CODE_OAUTH_TOKEN이 곧 로그인 자격증명이다. "CLAUDE_CODE_ 접두어를
@@ -658,7 +607,7 @@ def _create_grid_image(
 ) -> tuple[str, str, list[int]]:
     """여러 이미지를 하나의 그리드로 합성한다.
 
-    반환: (합성 이미지 경로, 레이아웃 설명, 그리드 위치 → image_paths 인덱스)
+    반환: (합성 이미지 JPEG base64, 레이아웃 설명, 그리드 위치 → image_paths 인덱스)
 
     세 번째 값이 중요하다. 열리지 않는 파일을 건너뛰면 그리드 위치와
     원본 배열의 인덱스가 어긋나는데, 모델은 그리드 위치로 답한다.
@@ -705,16 +654,14 @@ def _create_grid_image(
         y = row * cell_h + (cell_h - nh) // 2
         canvas.paste(resized, (x, y))
 
-    fd, path = tempfile.mkstemp(suffix=".jpg", dir=_TEMP_DIR)
-    os.close(fd)
-    canvas.save(path, "JPEG", quality=85)
+    grid_b64 = _encode_image_for_vision(canvas, _INLINE_PHOTO_MAX_PX)
 
     layout_desc = (
         f"{cols}열 x {rows}행 그리드, 총 {n}장. "
         f"왼쪽 위부터 오른쪽으로 인덱스 0~{n-1} 순서."
     )
-    log.info("Created grid image: %s (%dx%d, %d images)", path, canvas_w, canvas_h, n)
-    return path, layout_desc, valid_indices
+    log.info("Created grid image: %dx%d, %d images", canvas_w, canvas_h, n)
+    return grid_b64, layout_desc, valid_indices
 
 
 def analyze_user(
@@ -726,7 +673,9 @@ def analyze_user(
 ) -> dict:
     """사용자의 게시글/피드/스토리를 분석하여 스타일 프로필을 반환한다.
 
-    이미지를 하나의 그리드로 합성하여 Read 1회로 분석한다.
+    이미지를 하나의 그리드로 합성해 메시지에 직접 담는다(도구 없음, 모델 응답 한 번).
+    예전에는 Read 도구로 파일을 읽게 했는데, 권한 확인을 건너뛰는 상태라 게시글
+    텍스트에 심은 지시가 다른 사용자의 대표 사진 경로까지 읽게 할 수 있었다.
     대표 사진 3장을 서버에 영구 저장하여 이후 변형 시 레퍼런스로 사용한다.
     """
     temp_files: list[str] = []
@@ -761,29 +710,25 @@ def analyze_user(
         )
 
         grid_to_source: list[int] = []
+        images: list[str] = []
         if downloaded_paths:
             # 모든 이미지를 하나의 그리드로 합성
-            grid_path, grid_desc, grid_to_source = _create_grid_image(downloaded_paths)
-            temp_files.append(grid_path)
-
+            grid_b64, grid_desc, grid_to_source = _create_grid_image(downloaded_paths)
+            images.append(grid_b64)
             prompt_text += (
                 "\n\n=== 첨부 이미지 (그리드) ===\n"
-                f"아래 이미지를 읽고(Read) 실제 색감, 밝기, 채도, 톤을 관찰하여 분석에 반영하세요.\n"
+                "첨부한 이미지는 이 사용자의 사진들을 한 장에 모은 그리드입니다. "
+                "실제 색감, 밝기, 채도, 톤을 관찰하여 분석에 반영하세요.\n"
                 f"그리드 레이아웃: {grid_desc}\n"
-                f"그리고 referenceImageIndices에 스타일을 가장 잘 대표하는 사진 3장의 인덱스를 선택하세요.\n"
-                f"이미지 경로: {grid_path}\n"
-            )
-
-            result = _call_claude(
-                prompt_text, ANALYZE_USER_SYSTEM,
-                image_paths=[grid_path],
-                tools="Read",
+                "referenceImageIndices는 이 그리드의 인덱스로 답하세요 "
+                "(위 게시글 목록의 [번호]와는 다릅니다).\n"
             )
         else:
             prompt_text += (
-                "\n\n[참고: 이미지를 확인할 수 없습니다. 텍스트 정보만으로 분석하세요.]"
+                "\n\n[참고: 이미지를 확인할 수 없습니다. 텍스트 정보만으로 분석하고, "
+                "referenceImageIndices는 빈 배열로 두세요.]"
             )
-            result = _call_claude(prompt_text, ANALYZE_USER_SYSTEM, tools="Read")
+        result = _call_claude_inline(prompt_text, ANALYZE_USER_SYSTEM, images)
 
         parsed = _parse_json_response(result)
 
@@ -915,11 +860,13 @@ def _save_reference_images(
 def delete_user_data(user_id: str) -> bool:
     """사용자의 서버 저장 데이터(대표 사진)를 지운다. 지울 것이 있었으면 True.
 
-    서버가 사용자별로 영구 저장하는 것은 대표 사진 폴더뿐이다. 분석 캐시·작업 기록은
-    메모리에만 있고 30분 안에 사라진다. 안전하지 않은 user_id는 아무것도 지우지 않는다.
+    서버가 사용자별로 영구 저장하는 것은 대표 사진 폴더뿐이다. 메모리의 분석 캐시도
+    여기서 함께 지운다 (작업 기록은 jobs 쪽에서 지운다). 안전하지 않은 user_id는
+    아무것도 지우지 않는다.
     """
     import shutil
 
+    _analysis_cache_drop_user(user_id)
     user_dir = _user_ref_dir(user_id)
     if user_dir is None or not os.path.isdir(user_dir):
         return False
@@ -943,13 +890,13 @@ def get_reference_image_paths(user_id: str) -> list[str]:
 
 # ── 분석 결과 캐시 ──
 #
-# 분석 한 번이 30~70초, $0.07이다. 그런데 앱이 백그라운드로 가면 소켓이
+# 분석 한 번은 모델 호출 수십 초와 구독 사용량이다. 그런데 앱이 백그라운드로 가면 소켓이
 # 끊기고, 사용자는 같은 사진으로 다시 시도한다. 캐시가 없으면 서버는 이미
 # 끝낸 일을 처음부터 다시 하고 요금도 두 번 낸다 (FastAPI 동기 엔드포인트는
 # 클라이언트가 끊겨도 끝까지 실행되므로, 첫 요청의 결과는 이미 나와 있다).
 _ANALYSIS_CACHE_MAX = 32
 _ANALYSIS_CACHE_TTL = 60 * 30  # 30분
-_analysis_cache: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+_analysis_cache: "OrderedDict[str, tuple[float, dict, str]]" = OrderedDict()
 # FastAPI 동기 엔드포인트는 스레드풀에서 동시에 돈다. 잠금 없이 get/put이
 # 겹치면 pop 직후 move_to_end가 KeyError를 내거나 순서가 깨진다.
 _analysis_cache_lock = threading.Lock()
@@ -973,17 +920,40 @@ def _reference_fingerprint(user_id: str) -> list:
     return fp
 
 
-def _analysis_cache_key(image_base64: str, style_profile: dict, user_id: str) -> str:
+_PROMPT_FINGERPRINT = hashlib.sha256(
+    "\0".join((MODEL, TRANSFORM_PHOTO_SYSTEM, TRANSFORM_PHOTO_PROMPT)).encode()
+).hexdigest()
+
+
+def _toggle_note(reshape_enabled: bool, skin_retouch_enabled: bool) -> str:
+    """사용자가 끈 보정은 모델에게도 알린다. 꺼진 보정의 값은 서버가 버리므로
+    만들어 봐야 응답 시간만 늘어난다."""
+    off = []
+    if not reshape_enabled:
+        off.append("얼굴·체형 보정이 꺼져 있습니다. reshapeParams를 생략하세요.")
+    if not skin_retouch_enabled:
+        off.append("피부 보정이 꺼져 있습니다. regionParams.face의 "
+                   "blemish_removal·skin_smoothing을 생략하세요.")
+    return ("\n\n=== 사용자 설정 ===\n" + "\n".join(off) + "\n") if off else ""
+
+
+def _analysis_cache_key(
+    image_base64: str, style_profile: dict, user_id: str, toggles: tuple = (),
+) -> str:
     """같은 사진 + 같은 프로필 + 같은 사용자 + 같은 대표 사진이면 같은 결과가 나온다.
 
     대표 사진은 분석 프롬프트에 함께 들어간다. 키에서 빼면 재분석으로 대표
     사진이 바뀐 뒤에도 30분 동안 옛 사진 기준 결과가 나간다.
     """
     h = hashlib.sha256()
+    # 모델·프롬프트가 바뀌면 같은 사진도 다른 답이 나온다. 지금은 재시작이 캐시를
+    # 비우지만, 캐시를 오래 두거나 프로세스 밖으로 옮겨도 틀리지 않게 넣어 둔다.
+    h.update(_PROMPT_FINGERPRINT.encode())
     h.update(image_base64.encode())
     h.update(json.dumps(style_profile, sort_keys=True, ensure_ascii=False).encode())
     h.update(user_id.encode())
     h.update(json.dumps(_reference_fingerprint(user_id)).encode())
+    h.update(json.dumps(list(toggles)).encode())
     return h.hexdigest()
 
 
@@ -992,7 +962,7 @@ def _analysis_cache_get(key: str) -> dict | None:
         entry = _analysis_cache.get(key)
         if entry is None:
             return None
-        stored_at, value = entry
+        stored_at, value, _owner = entry
         if time.time() - stored_at > _ANALYSIS_CACHE_TTL:
             _analysis_cache.pop(key, None)
             return None
@@ -1001,13 +971,24 @@ def _analysis_cache_get(key: str) -> dict | None:
     return copy.deepcopy(value)
 
 
-def _analysis_cache_put(key: str, value: dict) -> None:
+def _analysis_cache_put(key: str, value: dict, user_id: str = "") -> None:
     stored = copy.deepcopy(value)
     with _analysis_cache_lock:
-        _analysis_cache[key] = (time.time(), stored)
+        _analysis_cache[key] = (time.time(), stored, user_id)
         _analysis_cache.move_to_end(key)
         while len(_analysis_cache) > _ANALYSIS_CACHE_MAX:
             _analysis_cache.popitem(last=False)
+
+
+def _analysis_cache_drop_user(user_id: str) -> int:
+    """그 사용자의 분석 캐시를 지운다. 지운 개수를 돌려준다."""
+    if not user_id:
+        return 0
+    with _analysis_cache_lock:
+        keys = [k for k, (_, _, owner) in _analysis_cache.items() if owner == user_id]
+        for k in keys:
+            del _analysis_cache[k]
+    return len(keys)
 
 
 _PHOTO_COORD_RULE = (
@@ -1034,49 +1015,23 @@ def _transform_photo_inline(prompt_text: str, image_base64: str, ref_strip: str 
     return _call_claude_inline(full_prompt, TRANSFORM_PHOTO_SYSTEM, images)
 
 
-def _transform_photo_read(
-    prompt_text: str,
-    image_base64: str,
-    media_type: str,
-    ref_strip: str | None,
-    temp_files: list[str],
-) -> str:
-    """예전 방식: 임시 파일 경로를 주고 모델이 Read 도구로 읽게 한다."""
-    image_path = _save_temp_image(image_base64, media_type)
-    temp_files.append(image_path)
-    full_prompt = prompt_text + "\n\n" + (
-        "=== 분석할 이미지 ===\n"
-        f"변형할 사진: {image_path}\n"
-        "이 사진을 Read로 읽고 분석하세요.\n"
-    ) + _PHOTO_COORD_RULE
-    image_paths = [image_path]
-    if ref_strip:
-        image_paths.append(ref_strip)
-        full_prompt += (
-            f"\n대표 사진 모음(참고용): {ref_strip}\n"
-            "Read로 읽으세요. "
-        ) + _REF_STRIP_NOTE
-    # Read 도구만 허용하여 불필요한 도구 사용 방지
-    return _call_claude(
-        full_prompt, TRANSFORM_PHOTO_SYSTEM,
-        image_paths=image_paths,
-        tools="Read",
-    )
-
-
 def transform_photo(
     style_profile: dict,
     image_base64: str,
     media_type: str = "image/jpeg",
     user_id: str = "",
+    reshape_enabled: bool = True,
+    skin_retouch_enabled: bool = True,
     **_kwargs,
 ) -> dict:
     """사용자 스타일 프로필에 맞춰 사진 보정 가이드를 반환한다.
 
     사진(과 대표 사진 모음)을 메시지에 직접 담아 모델 응답 한 번으로 분석한다.
-    실패하면 예전 방식(Read 도구)으로 한 번 더 시도한다.
+    예전에는 실패하면 Read 도구 방식으로 한 번 더 시도했지만, 실측 106회 중 한 번도
+    쓰이지 않았고 시간 초과까지 다시 시도해 최악 대기만 두 배로 만들었다.
     """
-    cache_key = _analysis_cache_key(image_base64, style_profile or {}, user_id)
+    toggles = (reshape_enabled, skin_retouch_enabled)
+    cache_key = _analysis_cache_key(image_base64, style_profile or {}, user_id, toggles)
     cached = _analysis_cache_get(cache_key)
     if cached is not None:
         log.info("transform_photo: 캐시 적중 — 모델 호출 건너뜀 (%s)", cache_key[:12])
@@ -1095,20 +1050,10 @@ def transform_photo(
             temp_files.append(ref_strip)
 
         prompt_text = TRANSFORM_PHOTO_PROMPT.format(
-            style_profile=json.dumps(style_profile, ensure_ascii=False, indent=2),
-        )
+            style_profile=json.dumps(style_profile, ensure_ascii=False, separators=(",", ":")),
+        ) + _toggle_note(reshape_enabled, skin_retouch_enabled)
 
-        result: str | None = None
-        if _VISION_INPUT_MODE != "read":
-            try:
-                result = _transform_photo_inline(prompt_text, image_base64, ref_strip)
-            except Exception as exc:
-                # 새 경로가 실패해도 분석은 계속돼야 한다 — 예전 방식으로 한 번 더
-                log.warning("transform_photo inline failed, falling back to Read: %s", exc)
-        if result is None:
-            result = _transform_photo_read(
-                prompt_text, image_base64, media_type, ref_strip, temp_files,
-            )
+        result = _transform_photo_inline(prompt_text, image_base64, ref_strip)
         parsed = _parse_json_response(result)
 
         # 스키마 검증 — 어긋나면 부족한 필드만 짚어 한 번 다시 받는다.
@@ -1126,11 +1071,16 @@ def transform_photo(
             )
             try:
                 repaired = _parse_json_response(
-                    _call_claude(repair_prompt, TRANSFORM_PHOTO_SYSTEM, tools="")
+                    _call_claude_inline(repair_prompt, TRANSFORM_PHOTO_SYSTEM, [],
+                                        timeout=_REPAIR_TIMEOUT)
                 )
-                remaining = _validate_analysis(repaired)
-                if len(remaining) < len(problems):
-                    parsed, problems = repaired, remaining
+                # 문제가 된 최상위 키만 옮긴다. 응답 전체를 바꿔 끼우면 검사하지 않는
+                # 키(autoEdits·regionParams·reshapeParams·hslAdjust)가 복구 응답에서
+                # 빠졌을 때 조용히 사라진다.
+                for key in {p.split(" ")[0].split(".")[0] for p in problems}:
+                    if key in repaired:
+                        parsed[key] = repaired[key]
+                problems = _validate_analysis(parsed)
             except Exception as exc:
                 log.warning("analysis repair call failed: %s", exc)
 
@@ -1140,8 +1090,10 @@ def transform_photo(
             log.error("analysis still invalid after repair: %s", problems)
             _apply_analysis_fallbacks(parsed, problems)
             parsed["warnings"] = [f"분석 필드 누락: {', '.join(problems)}"]
-
-        _analysis_cache_put(cache_key, parsed)
+        else:
+            # 기본값으로 메운 결과는 캐시하지 않는다 — 다시 시도하면 제대로 된 분석을
+            # 받을 수 있는데, 캐시에 남기면 30분 동안 같은 빈 화면이 나간다.
+            _analysis_cache_put(cache_key, parsed, user_id)
         return parsed
     finally:
         _cleanup_files(temp_files)

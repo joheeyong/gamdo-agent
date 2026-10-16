@@ -30,8 +30,6 @@ from models import (
     AnalyzeUserResponse,
     ApplyTransformRequest,
     ApplyTransformResponse,
-    AutoTransformRequest,
-    AutoTransformResponse,
     FirebaseTokenResponse,
     InstagramExchangeTokenRequest,
     InstagramExchangeTokenResponse,
@@ -44,11 +42,11 @@ from models import (
     ReferenceImagesResponse,
     SessionRequest,
     SessionResponse,
-    TransformPhotoRequest,
-    TransformPhotoResponse,
 )
 from claude_client import analyze_user, delete_user_data, get_reference_image_paths, transform_photo
 from param_engine import (
+    MAX_TILT,
+    MIN_TILT,
     build_params_with_comment,
     detect_tilt_angle,
     feed_compatibility,
@@ -58,6 +56,8 @@ from param_engine import (
     prefix_tilt_comment,
 )
 from image_processor import (
+    ImageRejected,
+    check_base64_image,
     MediaPipeCache,
     estimate_keystone,
     analysis_to_transform_params,
@@ -327,39 +327,25 @@ def api_analyze_user(
 
     except Exception as e:
         log.exception("analyze-user failed")
-        return AnalyzeUserResponse(success=False, error=str(e))
-
-
-@app.post("/api/transform-photo", response_model=TransformPhotoResponse)
-def api_transform_photo(
-    req: TransformPhotoRequest,
-    ctx: AuthContext = Depends(require_auth),
-):
-    """사용자 스타일 프로필에 맞춰 사진 보정 가이드를 반환합니다."""
-    try:
-        log.info("transform-photo: style=%s", req.style_profile.get("primaryStyle", "unknown"))
-
-        result = transform_photo(
-            style_profile=req.style_profile,
-            image_base64=req.image_base64,
-            media_type=req.media_type,
-        )
-
-        log.info("transform-photo: success")
-        return TransformPhotoResponse(success=True, data=result)
-
-    except Exception as e:
-        log.exception("transform-photo failed")
-        return TransformPhotoResponse(success=False, error=str(e))
+        return AnalyzeUserResponse(
+            success=False, error=_public_error(e, "스타일 분석에 실패했습니다. 잠시 후 다시 시도해 주세요."))
 
 
 # ── 분석 + 변형 통합 API ──
 
 
-# 자동 수평 보정의 하한(도). 기울기 감지기(param_engine._MIN_TILT)와 같은 값이다.
+# 자동 수평 보정의 하한(도). 기울기 감지기와 같은 값을 쓴다(param_engine.MIN_TILT).
 # 한때 1.0°로 올렸다가, 지평선·건물 모서리가 있는 사진의 0.5~0.9° 기울기를
 # 더는 잡지 못한다는 사용자 보고로 되돌렸다 — 직선이 있으면 이 정도도 눈에 띈다.
-_MIN_AUTO_STRAIGHTEN = 0.4
+_MIN_AUTO_STRAIGHTEN = MIN_TILT
+
+
+def _public_error(exc: Exception, default: str) -> str:
+    """앱에 보낼 실패 메시지. 예외 문자열에는 CLI 출력·내부 경로가 섞일 수 있어
+    그대로 내보내지 않는다. 사용자 탓인 이미지 거부 사유만 그대로 보여 준다."""
+    if isinstance(exc, ImageRejected):
+        return str(exc)
+    return default
 
 
 def _calibrate_body(params: dict, img, cache, analysis: dict, tag: str) -> None:
@@ -368,7 +354,7 @@ def _calibrate_body(params: dict, img, cache, analysis: dict, tag: str) -> None:
     자동 보정 경로에서만 부른다. 사용자가 슬라이더로 고른 값(apply-transform)은
     그대로 둔다. 다듬은 값은 응답 params로 앱에 가므로 슬라이더도 실제 적용값을
     가리킨다. 분석 JSON의 recommendedParams에도 같은 값을 남겨, 기록을 다시
-    열거나 auto-transform으로 다시 그릴 때 같은 결과가 나오게 한다.
+    열어 apply-transform으로 다시 그릴 때 같은 결과가 나오게 한다.
     """
     leg = float(params.get("leg_stretch", 0.0) or 0.0)
     shoulder = float(params.get("shoulder_width", 0.0) or 0.0)
@@ -415,7 +401,8 @@ def _run_analyze_and_transform(
             log.warning("analyze-and-transform: stage callback failed (%s)", name)
 
     try:
-        # 1. Claude가 사진 분석 (Vision)
+        # 1. Claude가 사진 분석 (Vision). 깨진·과대 이미지는 유료 호출 전에 거른다.
+        check_base64_image(req.image_base64)
         log.info("analyze-and-transform: analyzing photo")
         stage("analyzing")
         analysis = transform_photo(
@@ -423,6 +410,8 @@ def _run_analyze_and_transform(
             image_base64=req.image_base64,
             media_type=req.media_type,
             user_id=req.user_id,
+            reshape_enabled=req.reshape_enabled,
+            skin_retouch_enabled=req.skin_retouch_enabled,
         )
         log.info("analyze-and-transform: analysis complete")
         stage("rendering")
@@ -430,7 +419,8 @@ def _run_analyze_and_transform(
         # 메모리 폭증 방지 — 픽셀 처리만 제한한다. Claude 호출(수십 초)까지
         # 함께 묶으면 슬롯이 LLM 대기로 차서, 슬라이더를 움직이는 다른 사용자의
         # 미리보기가 그만큼 밀린다. 대기 중에는 메모리를 쓰지 않는다.
-        with _heavy_semaphore:
+        # MediaPipe 캐시는 얼굴 확인·영역 감지·체형 측정·변형이 함께 쓴다.
+        with _heavy_semaphore, MediaPipeCache() as mp_cache:
             # 2. 이미지 디코딩
             img = decode_base64_image(req.image_base64)
 
@@ -458,12 +448,11 @@ def _run_analyze_and_transform(
             face_detected = None
             if req.skin_retouch_enabled and str(analysis.get("subjectType") or "").strip() == "인물":
                 try:
-                    with MediaPipeCache() as face_cache:
-                        face_detected = has_retouchable_face(img, cache=face_cache)
+                    face_detected = has_retouchable_face(img, cache=mp_cache)
                 except Exception as exc:
                     log.warning("analyze-and-transform: face check failed: %s", exc)
 
-            # 보정 파라미터: 히스토그램 측정 + 목표값으로 산출.
+            # 5. 보정 파라미터: 히스토그램 측정 + 목표값으로 산출.
             # 왜 그 값이 나왔는지 설명도 함께 만든다 (모델 호출 없음).
             analysis["recommendedParams"], params_comment = build_params_with_comment(
                 img, req.style_profile, analysis,
@@ -475,7 +464,7 @@ def _run_analyze_and_transform(
             log.info("analyze-and-transform: params=%s", params)
             log.info("analyze-and-transform: comment=%s", params_comment)
 
-            # 5. 수평 보정 각도는 Hough 직선 검출로 잰다.
+            # 6. 수평 보정 각도는 Hough 직선 검출로 잰다.
             #    지평선·건물 모서리가 기준이 있으면 눈대중보다 정확하고,
             #    기준선이 없거나 선들이 제각각이면 None을 돌려 손대지 않는다.
             auto_edits = analysis.get("autoEdits")
@@ -510,7 +499,7 @@ def _run_analyze_and_transform(
                     if not math.isfinite(llm_tilt):
                         # min/max는 NaN을 만나면 다른 쪽 인자를 돌려준다 — 8°가 된다
                         raise ValueError("non-finite tilt")
-                    llm_tilt = max(-8.0, min(8.0, llm_tilt))
+                    llm_tilt = max(-MAX_TILT, min(MAX_TILT, llm_tilt))
                     if abs(llm_tilt) < _MIN_AUTO_STRAIGHTEN:
                         raise ValueError("imperceptible tilt")
                     auto_edits["straighten"] = llm_tilt
@@ -525,50 +514,48 @@ def _run_analyze_and_transform(
             analysis["autoEdits"] = auto_edits
             params_comment = prefix_tilt_comment(params_comment, measured_tilt)
 
-            # MediaPipe 캐시를 요청 스코프로 공유 — detect_regions / apply_regional_transforms / apply_all_transforms 간 중복 호출 제거
-            with MediaPipeCache() as mp_cache:
-                # 7. 영역별 스마트 보정 (regionParams가 있으면)
-                region_params_raw = analysis.get("regionParams")
-                if region_params_raw and isinstance(region_params_raw, dict):
-                    # null이 아닌 영역만 필터링
-                    valid_region_params = {
-                        k: v for k, v in region_params_raw.items()
-                        if v is not None and isinstance(v, dict)
-                    }
-                    if valid_region_params:
-                        try:
-                            regions = detect_regions(img, cache=mp_cache)
-                            # 모델이 좌표로 짚은 국소 보정 영역(local_*)은 감지가 아니라
-                            # 기하 정보로 만든다. detect_regions의 하늘/얼굴/배경 위에 얹힌다.
-                            regions.update(build_local_regions(img.size, valid_region_params))
-                            img = apply_regional_transforms(img, regions, valid_region_params, cache=mp_cache)
-                            log.info("analyze-and-transform: applied regional transforms for regions=%s",
-                                     list(valid_region_params.keys()))
-                        except Exception as e:
-                            log.warning("analyze-and-transform: regional transforms failed, falling back: %s", e)
+            # 7. 영역별 스마트 보정 (regionParams가 있으면)
+            region_params_raw = analysis.get("regionParams")
+            if region_params_raw and isinstance(region_params_raw, dict):
+                # null이 아닌 영역만 필터링
+                valid_region_params = {
+                    k: v for k, v in region_params_raw.items()
+                    if v is not None and isinstance(v, dict)
+                }
+                if valid_region_params:
+                    try:
+                        regions = detect_regions(img, cache=mp_cache)
+                        # 모델이 좌표로 짚은 국소 보정 영역(local_*)은 감지가 아니라
+                        # 기하 정보로 만든다. detect_regions의 하늘/얼굴/배경 위에 얹힌다.
+                        regions.update(build_local_regions(img.size, valid_region_params))
+                        img = apply_regional_transforms(img, regions, valid_region_params, cache=mp_cache)
+                        log.info("analyze-and-transform: applied regional transforms for regions=%s",
+                                 list(valid_region_params.keys()))
+                    except Exception as e:
+                        log.warning("analyze-and-transform: regional transforms failed, falling back: %s", e)
 
-                # 7. AI autoEdits 적용 (요소 제거 → 수평·원근 보정 → 크롭 → 비율)
-                #
-                # 영역 보정 다음에 온다. local_* 좌표는 모델이 원본 프레임을 보고
-                # 짚은 것인데, 기하 보정이 먼저 돌면 프레임이 회전·크롭되어 그
-                # 좌표가 엉뚱한 곳을 가리킨다 (실측: 날아간 창문 대신 평평한 벽에
-                # 어두운 사각형이 찍혔다). 픽셀 편집을 원본 프레임에서 끝내고
-                # 그 다음에 프레임을 다시 잡는다.
-                if auto_edits:
-                    # 인물은 위아래를 자르지 않는다 (머리·발이 잘려 다리가 짧아 보인다).
-                    # 판단을 autoEdits에 적어 둔다 — 앱이 저장·미리보기에서 이
-                    # 딕셔너리를 되돌려 보내므로 그 경로에도 같은 결정이 적용된다.
-                    auto_edits["allow_vertical_crop"] = subject != "인물"
-                    analysis["autoEdits"] = auto_edits
-                    log.info("analyze-and-transform: applying autoEdits=%s", auto_edits)
-                    img = apply_auto_edits(img, auto_edits)
+            # 8. AI autoEdits 적용 (요소 제거 → 수평·원근 보정 → 크롭 → 비율)
+            #
+            # 영역 보정 다음에 온다. local_* 좌표는 모델이 원본 프레임을 보고
+            # 짚은 것인데, 기하 보정이 먼저 돌면 프레임이 회전·크롭되어 그
+            # 좌표가 엉뚱한 곳을 가리킨다 (실측: 날아간 창문 대신 평평한 벽에
+            # 어두운 사각형이 찍혔다). 픽셀 편집을 원본 프레임에서 끝내고
+            # 그 다음에 프레임을 다시 잡는다.
+            if auto_edits:
+                # 인물은 위아래를 자르지 않는다 (머리·발이 잘려 다리가 짧아 보인다).
+                # 판단을 autoEdits에 적어 둔다 — 앱이 저장·미리보기에서 이
+                # 딕셔너리를 되돌려 보내므로 그 경로에도 같은 결정이 적용된다.
+                auto_edits["allow_vertical_crop"] = subject != "인물"
+                analysis["autoEdits"] = auto_edits
+                log.info("analyze-and-transform: applying autoEdits=%s", auto_edits)
+                img = apply_auto_edits(img, auto_edits)
 
-                # 8. 체형: 모델 제안을 실제 비율 측정과 배경 휨 검사로 다듬는다.
-                #    기하 보정(회전·크롭)이 끝난, 실제로 그릴 이미지 위에서 잰다.
-                _calibrate_body(params, img, mp_cache, analysis, "analyze-and-transform")
+            # 9. 체형: 모델 제안을 실제 비율 측정과 배경 휨 검사로 다듬는다.
+            #    기하 보정(회전·크롭)이 끝난, 실제로 그릴 이미지 위에서 잰다.
+            _calibrate_body(params, img, mp_cache, analysis, "analyze-and-transform")
 
-                # 9. 슬라이더 변형 적용
-                transformed = apply_all_transforms(img, cache=mp_cache, **params)
+            # 10. 슬라이더 변형 적용
+            transformed = apply_all_transforms(img, cache=mp_cache, **params)
             result_b64 = encode_image_base64(transformed)
 
             # 피드 적합도: 모델의 추측이 아니라 대표 사진과의 실제 거리
@@ -590,7 +577,7 @@ def _run_analyze_and_transform(
 
     except Exception as e:
         log.exception("analyze-and-transform failed")
-        return AnalyzeAndTransformResponse(success=False, error=str(e))
+        return AnalyzeAndTransformResponse(success=False, error=_public_error(e, jobs.DEFAULT_ERROR_MESSAGE))
 
 
 @app.post("/api/analyze-and-transform", response_model=AnalyzeAndTransformResponse)
@@ -603,7 +590,7 @@ def api_analyze_and_transform(
     return _run_analyze_and_transform(req)
 
 
-# ── 비동기 분석 작업 API (scratchpad/jobs_contract.md) ──
+# ── 비동기 분석 작업 API (jobs.py) ──
 #
 # 30~70초짜리 분석을 긴 연결 하나에 묶지 않는다. 앱이 백그라운드로 가서
 # 소켓이 끊겨도 작업은 계속 돌고, 앱은 돌아와 job_id로 결과를 받는다.
@@ -616,6 +603,13 @@ def _job_not_found() -> AuthError:
     return AuthError(404, "job_not_found", "작업이 없거나 만료되었습니다")
 
 
+def _delete_user(uid: str) -> bool:
+    """사용자의 서버 데이터를 모두 지운다: 대표 사진·분석 캐시와 끝난 작업의 결과 사진."""
+    deleted = delete_user_data(uid)
+    dropped = _job_store.drop_owner(uid)
+    return deleted or dropped > 0
+
+
 def _ctx_uid(ctx) -> str | None:
     return ctx.uid if isinstance(ctx, AuthContext) else None
 
@@ -624,9 +618,8 @@ def _analyze_job_fn(req: AnalyzeAndTransformRequest):
     def run(on_stage) -> dict:
         resp = _run_analyze_and_transform(req, on_stage=on_stage)
         if not resp.success:
-            # 동기 엔드포인트의 error는 str(e) 그대로라 내부 정보가 섞일 수 있다.
-            # 작업 조회에는 사람용 메시지만 싣는다 (원인은 위에서 이미 로그에 남았다).
-            raise jobs.JobFailed()
+            # resp.error는 이미 사람용 메시지다(_public_error). 원인은 로그에 남았다.
+            raise jobs.JobFailed(resp.error or jobs.DEFAULT_ERROR_MESSAGE)
         return resp.model_dump()
 
     return run
@@ -683,59 +676,6 @@ def api_get_job(
 
 
 # ── 이미지 자동 변형 API ──
-
-
-@app.post("/api/auto-transform", response_model=AutoTransformResponse)
-def api_auto_transform(
-    req: AutoTransformRequest,
-    ctx: AuthContext = Depends(require_auth),
-):
-    """AI 분석 기반 자동 변형. 분석 결과와 스타일 프로필로 파라미터를 계산하여 변형."""
-    try:
-        log.info("auto-transform: computing params from analysis")
-
-        # 이 엔드포인트도 같은 파이프라인을 같은 해상도로 돌린다 —
-        # 제한 밖에 두면 여기로 들어온 요청이 메모리 상한을 넘길 수 있다.
-        with _heavy_semaphore:
-            # 1. 이미지 디코딩
-            img = decode_base64_image(req.image_base64)
-
-            # 2. 분석 → 파라미터. 분석 JSON에 recommendedParams가 있으면(옛 형식)
-            #    그대로 쓰고, 없으면 측정 + 프로필로 계산한다.
-            analysis = dict(req.analysis)
-            params_comment = None
-            if not isinstance(analysis.get("recommendedParams"), dict):
-                analysis["recommendedParams"], params_comment = build_params_with_comment(
-                    img, req.style_profile, analysis
-                )
-            params = analysis_to_transform_params(analysis)
-            log.info("auto-transform: params=%s", params)
-
-            # 3. AI autoEdits 적용 (크롭, 요소 제거, 인스타 비율)
-            auto_edits = analysis.get("autoEdits", {})
-            if auto_edits and isinstance(auto_edits, dict):
-                log.info("auto-transform: applying autoEdits=%s", auto_edits)
-                img = apply_auto_edits(img, auto_edits)
-
-            # 4. 체형 값이 있으면(옛 분석 JSON) 분석 직후와 같은 측정·검사를 거친다
-            with MediaPipeCache() as mp_cache:
-                _calibrate_body(params, img, mp_cache, analysis, "auto-transform")
-
-                # 5. 슬라이더 변형 적용
-                transformed = apply_all_transforms(img, cache=mp_cache, **params)
-            result_b64 = encode_image_base64(transformed)
-
-        log.info("auto-transform: success")
-        return AutoTransformResponse(
-            success=True,
-            image_base64=result_b64,
-            params=params,
-            params_comment=params_comment,
-        )
-
-    except Exception as e:
-        log.exception("auto-transform failed")
-        return AutoTransformResponse(success=False, error=str(e))
 
 
 @app.post("/api/apply-transform", response_model=ApplyTransformResponse)
@@ -823,7 +763,8 @@ def api_apply_transform(
 
     except Exception as e:
         log.exception("apply-transform failed")
-        return ApplyTransformResponse(success=False, error=str(e))
+        return ApplyTransformResponse(
+            success=False, error=_public_error(e, "보정을 적용하지 못했습니다. 잠시 후 다시 시도해 주세요."))
 
 
 # ── 대표 사진 조회 API ──
@@ -852,7 +793,8 @@ def api_reference_images(
 
     except Exception as e:
         log.exception("reference-images failed")
-        return ReferenceImagesResponse(success=False, error=str(e))
+        return ReferenceImagesResponse(
+            success=False, error=_public_error(e, "대표 사진을 불러오지 못했습니다."))
 
 
 # ── Instagram API ──
@@ -895,7 +837,7 @@ async def _signed_request_user(request: Request) -> str | None:
 @app.delete("/api/me/data")
 def api_delete_my_data(ctx: AuthContext = Depends(require_session)):
     """앱의 '연결 해제·데이터 삭제'. 세션의 사용자 데이터만 지운다."""
-    deleted = delete_user_data(ctx.uid)
+    deleted = _delete_user(ctx.uid)
     log.info("me/data: delete requested (deleted=%s)", deleted)
     return {"success": True, "deleted": deleted, "error": None}
 
@@ -906,7 +848,7 @@ async def api_instagram_deauthorize(request: Request):
     uid = await _signed_request_user(request)
     if uid is None:
         return JSONResponse(status_code=400, content={"success": False, "error": "invalid signed_request"})
-    delete_user_data(uid)
+    _delete_user(uid)
     log.info("instagram/deauthorize: user data deleted")
     return {"success": True}
 
@@ -917,7 +859,7 @@ async def api_instagram_data_deletion(request: Request):
     uid = await _signed_request_user(request)
     if uid is None:
         return JSONResponse(status_code=400, content={"error": "invalid signed_request"})
-    delete_user_data(uid)
+    _delete_user(uid)
     code = secrets.token_hex(8)
     log.info("instagram/data-deletion: user data deleted (confirmation=%s)", code)
     return {"url": f"{DELETION_STATUS_URL}?code={code}", "confirmation_code": code}

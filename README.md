@@ -45,14 +45,16 @@ deploy/macos/uninstall.sh                               # 셋 다 끄고 등록 
 | `com.gamdo.server` | `uvicorn server:app` (8000번, 자동 리로드 없음) | `server.log` |
 | `com.gamdo.ngrok` | 앱의 기본 서버 주소(고정 ngrok 도메인) → 8000번 | `~/Library/Logs/gamdo/ngrok.log` |
 | `com.gamdo.caffeinate` | `caffeinate -ims` — 서버가 다시 켜지는 사이에도 잠들지 않게 | - |
-| `com.gamdo.claudecheck` | `ops/claude_check.py` — 로그인할 때와 매일 09:00에 Claude CLI 인증 점검 | `~/Library/Logs/gamdo/claude_check.log` |
+| `com.gamdo.claudecheck` | `ops/claude_check.py` — 로그인할 때와 매일 09:00에 Claude CLI 인증·사진 전달 점검 | `~/Library/Logs/gamdo/claude_check.log` |
 
 - 템플릿은 `deploy/macos/*.plist.template`이고, `install.sh`가 이 저장소 경로·ngrok·claude 위치로 채운다.
   launchd는 로그인 셸의 PATH를 모르므로 claude CLI가 있는 폴더를 PATH로 넘긴다.
 - 노트북 덮개를 닫으면 잠자기 방지와 상관없이 잠든다. 재부팅 뒤에는 로그인해야 켜진다.
 - `/health`는 서버만 본다. Claude 로그인·토큰 상태는 정기 점검이 본다:
   - 서버와 같은 환경으로 `claude -p`에 짧은 요청(haiku)을 보내 응답을 확인한다.
-  - 인증 실패(401·로그인 안 됨)·응답 없음·토큰 만료 30일 전이면 macOS 알림을 띄운다.
+  - 인증이 통과하면 분석과 같은 경로·모델로 단색 이미지 한 장을 보내 색을 맞히는지 본다
+    (CLI 업데이트로 이미지 전달이 깨지면 `kind: "vision"`).
+  - 인증 실패(401·로그인 안 됨)·사진 전달 실패·응답 없음·토큰 만료 30일 전이면 macOS 알림을 띄운다.
   - 결과는 `~/Library/Logs/gamdo/claude_check.json`, 밖에서는 `GET /health/claude`
     (`ok`·`kind`·`checked_at`·`token_days_left`만, 오류 원문은 싣지 않음).
   - 수동 실행: `.venv/bin/python ops/claude_check.py` (`--no-notify`로 알림 없이).
@@ -70,8 +72,8 @@ deploy/macos/uninstall.sh                               # 셋 다 끄고 등록 
 | `FIREBASE_SERVICE_ACCOUNT` | (없음) | Firebase 서비스 계정 JSON 파일 경로. `firebase` extra 설치 필요. 없으면 `/api/firebase-token`은 503 `firebase_not_configured`. |
 | `INSTAGRAM_CLIENT_ID` / `INSTAGRAM_CLIENT_SECRET` | (없음) | Instagram 로그인 OAuth 앱 자격증명 (code → token 교환). |
 | `GAMDO_MAX_BODY_MB` | `50` | 요청 본문 상한(MB). 넘으면 413. |
+| `GAMDO_CLAUDE_MODEL` | `claude-opus-5-5` | 사진 분석에 쓰는 Claude 모델 ID. 별칭 대신 버전을 고정한다. |
 | `GAMDO_MAX_CONCURRENT` | `3` | 이미지 처리 동시 실행 수 (메모리 보호). |
-| `GAMDO_VISION_INPUT` | `inline` | 사진을 모델에 넘기는 방식. `inline`은 stream-json 메시지에 이미지를 직접 담아 도구 없이 한 번에 응답받고(실측 평균 9.9s→8.0s), 실패하면 `read`로 자동 전환한다. `read`는 임시 파일을 Read 도구로 읽게 하는 예전 방식. |
 | `GAMDO_MAX_JOBS` | `4` | 비동기 분석 작업(`/api/jobs/...`) 워커 스레드 수. 픽셀 처리는 여전히 `GAMDO_MAX_CONCURRENT`로 묶인다. |
 | `GAMDO_MAX_QUEUED_JOBS` | `20` | 대기 중인 작업 상한. 넘으면 새 작업은 503 `busy`. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | (선택) | 헤드리스 서버에서 `claude` CLI 로그인 대신 쓰는 토큰. |
@@ -121,11 +123,9 @@ HTTP 200 + `success: false`로, 인증 오류는 위의 HTTP 상태 코드로 �
 | GET | `/health` | 면제 | 상태 확인 |
 | GET | `/health/claude` | 면제 | 마지막 Claude CLI 점검 결과 (`ok`·`kind`·`checked_at`·`token_days_left`) |
 | POST | `/api/analyze-user` | 필요 | 게시글/피드/스토리 → 스타일 프로필. `user_id`가 있으면 대표 사진 3장을 저장 |
-| POST | `/api/transform-photo` | 필요 | 스타일 프로필 기준 사진 보정 가이드 (분석만) |
 | POST | `/api/analyze-and-transform` | 필요 | 사진 분석 + 보정 이미지 생성. `user_id`의 대표 사진을 목표값으로 사용 (동기, 구버전 앱용) |
 | POST | `/api/jobs/analyze-and-transform` | 필요 | 위와 같은 작업을 백그라운드로 시작 → `job_id` (202) |
 | GET | `/api/jobs/{job_id}` | 필요 | 작업 상태·결과 조회 (폴링) |
-| POST | `/api/auto-transform` | 필요 | 분석 결과 JSON으로 보정 이미지 생성 |
 | POST | `/api/apply-transform` | 필요 | 슬라이더 값으로 보정 (미리보기/저장) |
 | GET | `/api/reference-images/{user_id}` | 필요 | 대표 사진 base64 목록 |
 | GET | `/api/instagram/callback` | 면제 | OAuth 콜백 → `gamdo://oauth/instagram` 리디렉션 |

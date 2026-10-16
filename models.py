@@ -27,21 +27,7 @@ class AnalyzeUserResponse(BaseModel):
     error: str | None = None
 
 
-# ── 사진 변형 API ──
-
-class TransformPhotoRequest(BaseModel):
-    style_profile: dict = Field(..., description="analyze-user에서 받은 styleProfile")
-    image_base64: str = Field(..., description="변형할 사진 (base64)")
-    media_type: str = "image/jpeg"
-
-
-class TransformPhotoResponse(BaseModel):
-    success: bool
-    data: dict | None = None
-    error: str | None = None
-
-
-# ── Instagram API ──
+# ── 인스타그램 API ──
 
 class InstagramExchangeTokenRequest(BaseModel):
     """OAuth authorization code → access_token 교환 요청."""
@@ -102,7 +88,7 @@ class AnalyzeAndTransformResponse(BaseModel):
     error: str | None = None
 
 
-# ── 비동기 분석 작업 API (scratchpad/jobs_contract.md) ──
+# ── 비동기 분석 작업 API (jobs.py) ──
 # 시작 요청 본문은 AnalyzeAndTransformRequest를 그대로 쓴다.
 
 class JobStartResponse(BaseModel):
@@ -123,22 +109,7 @@ class JobStatusResponse(BaseModel):
     error: str | None = None
 
 
-# ── 자동 변형 API ──
-
-class AutoTransformRequest(BaseModel):
-    """AI 분석 기반 자동 변형 요청."""
-    image_base64: str = Field(..., description="원본 이미지 (base64)")
-    analysis: dict = Field(..., description="AI 분석 결과 JSON")
-    style_profile: dict | None = Field(None, description="사용자 스타일 프로필")
-
-
-class AutoTransformResponse(BaseModel):
-    success: bool
-    image_base64: str | None = None
-    params: dict | None = None
-    params_comment: str | None = Field(None, description="적용된 변형 요약 한 문장")
-    error: str | None = None
-
+# ── 수동 변형(슬라이더) API ──
 
 class ApplyTransformRequest(BaseModel):
     """슬라이더 값으로 수동 변형 요청."""
@@ -150,7 +121,7 @@ class ApplyTransformRequest(BaseModel):
         None,
         description="영역별 보정. 하늘/얼굴/배경 + 모델이 좌표로 짚은 국소 보정(local_*)",
     )
-    preview: bool = Field(False, description="True이면 미리보기 모드 (색감 보정만, reshape/blemish 스킵)")
+    preview: bool = Field(False, description="True이면 미리보기 모드 (잡티 제거만 건너뛰고 나머지는 저장본과 같게 적용)")
     brightness: float = Field(0.0, ge=-1.0, le=1.0)
     contrast: float = Field(0.0, ge=-1.0, le=1.0)
     clarity: float = Field(0.0, ge=-1.0, le=1.0, description="선명감 (미드톤 로컬 대비)")

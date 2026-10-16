@@ -26,7 +26,8 @@ import numpy as np
 from PIL import Image
 
 from image_processor import (
-    _HSL_CHANNELS, _INPAINT_MAX_AREA, cast_pixel_weight, estimate_illuminant,
+    _HSL_CHANNELS, _INPAINT_MAX_AREA, _LOCAL_MAX_AREA, _LOCAL_MAX_COUNT, _LOCAL_MIN_AREA,
+    cast_pixel_weight, estimate_illuminant,
     estimate_noise_sigma, vivid_blue_weight,
 )
 
@@ -50,7 +51,7 @@ def _center_crop(img: Image.Image, size: int) -> Image.Image:
 
 
 def measure_image_stats(img: Image.Image) -> dict[str, float]:
-    """사진의 실제 상태를 측정한다. 모든 값은 0~1 (warmth만 -1~1).
+    """사진의 실제 상태를 측정한다. 대부분 0~1 (warmth는 -1~1, noise는 0~255 σ).
 
     - brightness: Rec.709 휘도 평균
     - contrast: 휘도의 5~95 백분위 폭 (표준편차보다 극단값에 덜 흔들린다)
@@ -246,7 +247,7 @@ def _level_index(value: str | None, default: int = 2) -> int:
 #                    크게 세우지 않는다. (±밴드)
 #   contrast / brightness — 측정과 무관하게 더하는 방향성
 #   brightness_target — 프로필에 밝기 성향이 없거나 수동 선택일 때 쓰는 평균 밝기 목표
-#                  (medium 0.50). 인물이면 얼굴 밝기 목표도 이만큼 옮긴다.
+#                  (medium 0.50). 인물이면 얼굴 밝기 목표도 그 차이의 절반만큼 옮긴다.
 #   face_lift — 인물 얼굴(피부 L)을 원본보다 밝게 올려도 되는 폭 (0.04 ≈ L +4).
 #                  플래시처럼 밝게 튀어나온 얼굴이 스타일인 트렌드만 넓힌다.
 #   clarity / sharpness — 피사체 레시피 값에 더해진다
@@ -266,7 +267,8 @@ _TREND_RECIPES: dict[str, dict[str, Any]] = {
         "crush_blacks": "hazy", "contrast_target": 0.62, "contrast_range": (-0.20, 0.08),
         "clarity_cap": 0.05, "sharpness_cap": 0.08,
         "tone_curve": ("film", 0.60), "grain": 0.20,
-        # 필름 인화의 색 분리: 호박색 하이라이트 + 청록 그림자. 예전 (255 0.12 / 35 0.15)은
+        # 필름 인화의 색 분리: 따뜻한 하이라이트 + 청록 그림자. hue는 LAB 각도라 45는
+        # 호박색이 아니라 연어/복숭아빛으로 나온다([apply_split_toning] 참고). 예전 (255 0.12 / 35 0.15)은
         # 게인 뒤 a·b 2~3 시프트라 기본 레시피와 거의 같았다 (평균 ΔE 3.2).
         # 전역 웜톤은 골든아워(채도·온도)와 겹치므로, 따뜻함을 하이라이트 쪽에 싣는다.
         "split": {"shadow": (195, 0.34), "highlight": (45, 0.38)},
@@ -282,7 +284,7 @@ _TREND_RECIPES: dict[str, dict[str, Any]] = {
         "crush_blacks": "hazy", "contrast_target": 0.60, "contrast_range": (-0.08, 0.05),
         "clarity": -0.08, "clarity_cap": 0.0, "sharpness_cap": 0.06,
         "tone_curve": ("gamsung", 0.75), "grain": 0.10,
-        # 뽀얀 톤: 민트빛 그림자 + 복숭아빛 하이라이트를 옅게
+        # 뽀얀 톤: 민트빛 그림자 + 분홍빛 하이라이트를 옅게 (LAB 15는 핑크 쪽)
         "split": {"shadow": (185, 0.26), "highlight": (15, 0.20)},
     },
     "cinematic_moody": {
@@ -368,9 +370,6 @@ _DEFAULT_RECIPE: dict[str, Any] = {
     "tone_curve": ("soft_film", 0.65), "grain": 0.16,
 }
 
-# 흑백 트렌드 이름 (describe_params·테스트가 참조)
-_MONO_TRENDS = frozenset(k for k, v in _TREND_RECIPES.items() if v.get("monochrome"))
-
 # 비네팅은 피사체 레시피에 두지 않는다 — 스타일(트렌드)이나 사용자 취향
 # (vignettePreference)이 원할 때만 건다. 예전에는 피사체마다 0.03~0.18을 넣어
 # 모든 사진의 모서리가 어두워졌다 (실측 7장 전부 0.09~0.14, ΔE 2~3).
@@ -425,10 +424,11 @@ _CAST_UNIFORM_LO, _CAST_UNIFORM_HI = 0.10, 0.40
 _STACK_T_LO, _STACK_T_HI = 0.05, 0.20
 _STACK_ORANGE_DAMP = 0.6
 
-# 흰 화소(휘도 250 초과)가 이 비율이면 색온도를 바닥까지 줄인다.
-_WHITE_TEMPERATURE_TOLERANCE = 0.25
+# 흰 화소(휘도 250 초과)가 이 비율이면 색온도·대비·비네팅을 바닥까지 줄인다.
+# (흰 배경에서는 셋 다 흰색을 물들이거나 회색으로 죽인다.)
+_WHITE_CLIP_TOLERANCE = 0.25
 # 그래도 남기는 최소 비율 — 취향을 완전히 버리지는 않는다.
-_WHITE_TEMPERATURE_FLOOR = 0.35
+_WHITE_CLIP_FLOOR = 0.35
 
 # 쉐도우 바닥 / 하이라이트 천장 차이(0~1)를 슬라이더 값으로 옮기는 배율.
 #
@@ -551,7 +551,8 @@ _DARK_SCENE_FLOOR = (0.03, 0.08)    # p5가 이 구간 아래면 원래 검정�
 _DARK_FLOOR_RELIEF = 0.7            # 쉐도우 목표 바닥을 덜어내는 비율
 _DARK_CURVE_RELIEF = 0.5            # 바닥을 띄우는 커브의 세기를 덜어내는 비율
 _DARK_CONTRAST_RELIEF = 0.6         # 음수 대비(바닥을 들어 올림)를 덜어내는 비율
-# 검정을 띄우는 톤 커브 프리셋 (x=0의 출력이 0보다 큰 것)
+# 어두운 장면에서 띄움을 덜어낼 톤 커브 프리셋 (검정을 0.04 이상 띄우는 것).
+# bw(0.035)는 넣지 않는다 — 흑백 레시피는 어두운 장면에서도 바닥을 그대로 둔다.
 _LIFTED_CURVES = frozenset({"film", "fade", "bright", "soft_film", "pastel", "gamsung"})
 
 
@@ -683,22 +684,6 @@ def _cap_face_tone(params: dict[str, Any], face: _FaceTone, lo: float, hi: float
              f, lo, hi, {k: round(cur[k], 3) for k in _FACE_TONE_KEYS})
     for k in _FACE_TONE_KEYS:
         params[k] = _clamp(cur[k])
-
-
-def build_recommended_params(
-    img: Image.Image,
-    style_profile: dict[str, Any] | None,
-    analysis: dict[str, Any] | None = None,
-    reference: dict[str, Any] | None = None,
-    reshape_enabled: bool = False,
-    skin_retouch_enabled: bool = True,
-) -> dict[str, Any]:
-    """[build_params_with_comment]에서 파라미터만 꺼내는 단축 함수."""
-    params, _ = build_params_with_comment(
-        img, style_profile, analysis, reference, reshape_enabled,
-        skin_retouch_enabled=skin_retouch_enabled,
-    )
-    return params
 
 
 def build_params_with_comment(
@@ -894,7 +879,7 @@ def build_params_with_comment(
     # 장면의 원래 빛을 존중한다 — 스타일이 웜톤을 요구하지 않을 때만(목표 warmth <
     # _WARM_STYLE_TARGET: 기본 레시피·뉴트럴 계열) 적용한다.
     #  - 이미 따뜻한 사진은 더 덥히지 않는다. 실측: 라테(warmth 0.35)에 음식 레시피
-    #    0.25가 그대로 얹혀 temperature +0.18.
+    #    (당시 0.25, 지금 0.15)가 그대로 얹혀 temperature +0.18.
     #  - 차가운 쪽으로 기울었는데 캐스트가 고르지 않으면(cast_uniformity < 0.4) 조명
     #    탓이 아니라 장면의 색이다 — 새벽 호수·파란 수트·흐린 날. 덥히지 않는다.
     #    실측: 라벤더빛 새벽 호수(warmth −0.14, 고름 0.09)·파란 수트 인물 2장이
@@ -921,8 +906,8 @@ def build_params_with_comment(
     # 실측: 흰 배경 인물 사진에서 contrast -0.41이 걸려 배경이 회베이지가 됐다.
     if contrast < 0 and stats["highlight_clip"] > 0:
         contrast = round(contrast * max(
-            _WHITE_TEMPERATURE_FLOOR,
-            1.0 - stats["highlight_clip"] / _WHITE_TEMPERATURE_TOLERANCE), 3)
+            _WHITE_CLIP_FLOOR,
+            1.0 - stats["highlight_clip"] / _WHITE_CLIP_TOLERANCE), 3)
     # 날아가지 않은 흰 배경(휘도 0.90~0.98)도 p95를 끌어올려 같은 오판을 만든다
     if contrast < 0:
         contrast = round(contrast * (1.0 - white_bg), 3)
@@ -935,8 +920,8 @@ def build_params_with_comment(
     # +0.47이 걸려 배경이 베이지가 됐다. 색이 있는 사진에서는 같은 값이
     # 자연스럽게 묻힌다 — 그래서 흰 화소 비율에 따라서만 줄인다.
     if stats["highlight_clip"] > 0:
-        keep = max(_WHITE_TEMPERATURE_FLOOR,
-                   1.0 - stats["highlight_clip"] / _WHITE_TEMPERATURE_TOLERANCE)
+        keep = max(_WHITE_CLIP_FLOOR,
+                   1.0 - stats["highlight_clip"] / _WHITE_CLIP_TOLERANCE)
         temperature = round(temperature * keep, 3)
 
     # 쉐도우는 "무조건 들어올린다"가 아니라 "바닥이 목표보다 낮으면 올린다"다.
@@ -1001,7 +986,7 @@ def build_params_with_comment(
     if highlights < 0:
         highlights = round(highlights * (1.0 - white_bg), 3)
 
-    # 날아간 하이라이트·뭉갠 쉐도우가 많으면 그만큼 더 되살린다
+    # (예전에는 날아간 하이라이트·뭉갠 쉐도우가 많으면 더 되살리는 보너스가 있었다.)
     # 클리핑 보너스는 제거했다. 천장 목표가 이미 "너무 밝다"를 다루는데
     # 밴드(±0.35) 밖에서 또 빼면 총 -0.43까지 가서 하이라이트가 회색으로
     # 뭉개졌다. 완전히 날아간(=255) 화소는 눌러도 디테일이 돌아오지 않는다.
@@ -1019,7 +1004,7 @@ def build_params_with_comment(
         float(recipe.get("sharpness", 0.0)) + float(subject_recipe.get("sharpness", 0.0)),
         float(recipe.get("sharpness_cap", 0.25)) + texture_bonus,
     )
-    # 비네팅은 스타일의 일부인 트렌드(플래시·시네마틱)가 피사체 값보다 약해지지 않게
+    # 비네팅은 트렌드가 정한다 (피사체 레시피에는 없다). 트렌드 값이 양수면 그 이상을 지킨다.
     vignette = pick("vignette")
     if "vignette" in recipe:
         vignette = max(float(recipe["vignette"]), vignette) if recipe["vignette"] > 0 else float(recipe["vignette"])
@@ -1028,8 +1013,8 @@ def build_params_with_comment(
     # 스튜디오 흰 배경·흰 벽에서는 스타일이 아니라 렌즈 결함처럼 보인다.
     if stats["highlight_clip"] > 0:
         vignette = round(vignette * max(
-            _WHITE_TEMPERATURE_FLOOR,
-            1.0 - stats["highlight_clip"] / _WHITE_TEMPERATURE_TOLERANCE), 3)
+            _WHITE_CLIP_FLOOR,
+            1.0 - stats["highlight_clip"] / _WHITE_CLIP_TOLERANCE), 3)
 
     # 이미 흐린 사진이면 선명도를 올리고, 충분히 선명하면 건드리지 않는다
     if stats["sharpness"] < 0.25:
@@ -1184,7 +1169,8 @@ def build_params_with_comment(
 
     # 흑백: 채도를 끝까지 빼서(−1.0) 완전한 무채색으로 만든다. 게인을 곱하면
     # −0.8이 되어 색이 20% 남는다. 색온도·화이트밸런스·스플릿은 흑백에서 의미가 없고,
-    # 남겨 두면 흑백 위에 색을 다시 칠한다 (HSL은 회색 화소를 빨강으로 본다).
+    # 남겨 두면 흑백 위에 색을 다시 칠한다. HSL은 채도 −1.0 이후 회색이 된 화소에는
+    # 걸리지 않으므로(채도 게이트) 의미가 없어 뺀다.
     if mono and gain > 0.0:
         params["saturation"] = -1.0
         params["temperature"] = 0.0
@@ -1388,7 +1374,8 @@ def _prune_hsl(
 # 밝기를 당기기도 했다 (store: 아치 −0.1 / 상반신 +0.15).
 _REGION_MIN_EFFECT = 0.05
 _REGION_GLOBAL_DAMP = 0.5
-_REGION_LOCAL_MAX = 2
+# 국소 보정 개수·면적 한도는 영역을 실제로 그리는 image_processor와 같은 값을 쓴다.
+_REGION_LOCAL_MAX = _LOCAL_MAX_COUNT
 _REGION_OVERLAP = 0.5
 _REGION_META = frozenset({"area", "shape", "feather", "reason"})
 _REGION_TONE_KEYS = ("brightness", "contrast", "saturation", "temperature",
@@ -1519,6 +1506,13 @@ def _prune_region_params(
             box = _local_box(vals)
             if box is None:
                 continue
+            # 면적 검사를 개수 세기 전에 한다. 뒤(build_local_regions)에서 버려질
+            # 영역이 자리를 차지하면 그 다음의 쓸 만한 영역이 대신 버려진다.
+            cx0, cy0 = min(max(box[0], 0.0), 1.0), min(max(box[1], 0.0), 1.0)
+            frac = max(0.0, min(box[2], 1.0) - cx0) * max(0.0, min(box[3], 1.0) - cy0)
+            if not _LOCAL_MIN_AREA <= frac <= _LOCAL_MAX_AREA:
+                log.info("param_engine: region %s 버림 — 면적 %.1f%%", name, frac * 100)
+                continue
             if len(local_boxes) >= _REGION_LOCAL_MAX:
                 log.info("param_engine: region %s 버림 — 국소 보정 %d개 한도", name, _REGION_LOCAL_MAX)
                 continue
@@ -1647,6 +1641,8 @@ def _guard_skin_cooling(params: dict[str, Any], img: Image.Image) -> None:
 # 워프 계수가 커진 만큼 모델이 범위를 벗어난 값을 주면 얼굴이 뭉개진다.
 # 프롬프트 권장 상한(0.5)에서 한 번 더 자른다.
 _RESHAPE_MAX = 0.5
+# 눈 키우기는 측정 없이 준 만큼 들어가고(선형, 0.5면 약 1.11배), 조금만 커도 티가 난다.
+_EYE_ENLARGE_MAX = 0.3
 _RESHAPE_KEYS = (
     "face_slim", "jaw_sharpen", "eye_enlarge",
     "leg_stretch", "shoulder_width", "waist_slim",
@@ -1654,14 +1650,24 @@ _RESHAPE_KEYS = (
 
 
 def _clamp_reshape(reshape: dict[str, Any]) -> dict[str, float]:
-    """얼굴/체형 값을 안전 범위로 자른다. shoulder_width만 음수를 허용한다."""
+    """얼굴/체형 값을 안전 범위로 자르고 상체 보정을 upper_body 하나로 제한한다.
+
+    모델은 상체에서 둘 중 하나만 고른다: "waist"(허리 줄이기) 또는
+    "shoulder"(어깨 넓히기). 고르지 않았으면 허리·어깨는 손대지 않는다.
+    어깨를 좁히는 보정은 하지 않는다. 다리는 상체 선택과 무관하다.
+    """
     out: dict[str, float] = {}
     for key in _RESHAPE_KEYS:
         raw = reshape.get(key)
         if not isinstance(raw, (int, float)):
             continue
-        lo = -_RESHAPE_MAX if key == "shoulder_width" else 0.0
-        out[key] = _clamp(float(raw), lo, _RESHAPE_MAX)
+        out[key] = _clamp(float(raw), 0.0,
+                          _EYE_ENLARGE_MAX if key == "eye_enlarge" else _RESHAPE_MAX)
+    focus = reshape.get("upper_body")
+    if focus != "waist":
+        out.pop("waist_slim", None)
+    if focus != "shoulder":
+        out.pop("shoulder_width", None)
     return out
 
 
@@ -1868,13 +1874,15 @@ def describe_params(
 # ── 기울기 측정 ──
 
 # 이 각도를 넘어서면 의도한 구도(네덜란드 앵글 등)로 보고 건드리지 않는다.
-_MAX_TILT = 8.0
+MAX_TILT = 8.0
 # 이보다 작으면 회전으로 잃는 해상도가 이득보다 크다.
-_MIN_TILT = 0.4
+MIN_TILT = 0.4
 
 
-def detect_tilt_angle(img: Image.Image, max_angle: float = _MAX_TILT) -> float | None:
-    """사진의 기울기를 재서 교정 각도(도)를 반환한다. 확신이 없으면 None.
+def detect_tilt_angle(img: Image.Image, max_angle: float = MAX_TILT) -> float | None:
+    """사진의 기울기를 재서 교정 각도(도)를 반환한다. 기준선이 없거나 확신이 없으면 None.
+
+    확신이 있으면 MIN_TILT보다 작은 값(거의 수평)도 그대로 돌려준다.
 
     수평선(지평선·수면·테이블 모서리)과 수직선(건물·기둥·문틀)은
     실제로 수평·수직이라는 전제로, 검출된 직선들이 그 축에서 얼마나
@@ -1939,9 +1947,6 @@ def detect_tilt_angle(img: Image.Image, max_angle: float = _MAX_TILT) -> float |
     cumulative = np.cumsum(wgt)
     median = float(dev[int(np.searchsorted(cumulative, cumulative[-1] / 2.0))])
 
-    if abs(median) < _MIN_TILT:
-        return None
-
     # 확신 판정: 추정치 근처(±1도)에 모인 선이 전체 길이의 절반은 되어야 한다.
     # 그렇지 않으면 선들이 제각각이라는 뜻이고, 그때 회전하면 오히려 망친다.
     agreeing = wgt[np.abs(dev - median) <= 1.0].sum()
@@ -1949,14 +1954,19 @@ def detect_tilt_angle(img: Image.Image, max_angle: float = _MAX_TILT) -> float |
         log.info("tilt: 선들이 일관되지 않아 보정하지 않음 (median=%.2f°)", median)
         return None
 
-    # apply_straighten(θ)를 적용하면 측정 편차가 θ만큼 줄어든다.
+    # MIN_TILT보다 작아도 None이 아니라 잰 값을 그대로 돌려준다. None은 "기준선이
+    # 없다"는 뜻이라, 받는 쪽(server)이 모델의 눈대중 기울기로 넘어간다. 직선이
+    # 확신 있게 '거의 수평'이라고 말한 사진을 모델 추측으로 돌리면 안 된다.
+    # 회전할지 말지(MIN_TILT 미만은 건너뜀)는 받는 쪽이 정한다.
+
+    # _straighten_with_matrix(θ)를 적용하면 측정 편차가 θ만큼 줄어든다.
     # 따라서 편차를 0으로 만들려면 편차값을 그대로 넘기면 된다. (실측으로 확인)
     return round(median, 2)
 
 
 def prefix_tilt_comment(comment: str, tilt: float | None) -> str:
     """보정 코멘트 앞에 수평 보정 사실을 덧붙인다."""
-    if tilt is None or abs(tilt) < _MIN_TILT:
+    if tilt is None or abs(tilt) < MIN_TILT:
         return comment
     return f"{abs(tilt):.1f}° 기울어 있어 수평을 맞추고, {comment}"
 
@@ -2134,7 +2144,6 @@ def detect_scene(stats: dict[str, float], img: Image.Image) -> dict[str, bool]:
 # Firebase에 이미 저장된 프로필은 옛 어휘로 남아 있다. 여기서 흡수한다.
 
 _LEGACY_FILTER = {"heavy": "strong"}          # 생성 쪽에만 있던 값
-_LEGACY_TONE = {"warm": "warm", "cool": "cool", "neutral": "neutral", "mixed": "mixed"}
 
 
 def normalize_style_profile(profile: dict[str, Any] | None) -> dict[str, Any]:
@@ -2163,9 +2172,7 @@ def normalize_style_profile(profile: dict[str, Any] | None) -> dict[str, Any]:
     if tone and tone not in _TONE_TARGETS:
         # colorTemperature(옛 필드)라도 있으면 그쪽을 쓴다
         fallback = color.get("colorTemperature")
-        color["preferredTones"] = _LEGACY_TONE.get(tone) or (
-            fallback if fallback in _TONE_TARGETS else "neutral"
-        )
+        color["preferredTones"] = fallback if fallback in _TONE_TARGETS else "neutral"
 
     out["colorPreference"] = color
     out["editingStyle"] = editing

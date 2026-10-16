@@ -61,9 +61,10 @@ def test_bad_areas_are_dropped(spec, why):
     assert build_local_regions(SIZE, {"local_0": spec}) == {}, why
 
 
-def test_at_most_four_areas():
+def test_at_most_two_areas():
+    """프롬프트·param_engine과 같은 한도(2개)."""
     specs = {f"local_{i}": {"area": AREA} for i in range(7)}
-    assert len(build_local_regions(SIZE, specs)) == 4
+    assert len(build_local_regions(SIZE, specs)) == 2
 
 
 def test_local_params_are_clamped():

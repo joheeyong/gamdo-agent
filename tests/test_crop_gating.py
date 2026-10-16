@@ -283,3 +283,31 @@ def test_no_ratio_reason_when_portrait_keeps_frame(client, monkeypatch):
 def test_stale_reasons_from_model_are_replaced():
     edits = gate_auto_edits({"ratio_reason": "지어낸 이유"}, (400, 300), allow_vertical_crop=True)
     assert "ratio_reason" not in edits
+
+
+def test_ratio_is_rechecked_after_straighten():
+    """회전 보정의 안쪽 크롭으로 1.91:1을 넘게 된 사진도 인스타 범위로 맞춘다."""
+    from PIL import Image
+    from image_processor import apply_auto_edits, gate_auto_edits
+
+    size = (1900, 1000)   # 1.9:1 — 원본은 범위 안
+    edits = gate_auto_edits({"straighten": 6.0}, size, allow_vertical_crop=True)
+    assert edits.get("ratio_auto") is True
+    out = apply_auto_edits(Image.new("RGB", size, (128, 128, 128)), edits)
+    assert out.width / out.height <= 1.91 + 0.01
+
+
+def test_tilt_detector_reports_small_confident_tilt():
+    """거의 수평인 사진은 None(기준선 없음)이 아니라 작은 값을 돌려줘야, 서버가
+    모델의 눈대중 기울기로 넘어가지 않는다."""
+    import numpy as np
+    import cv2
+    from PIL import Image
+    from param_engine import MIN_TILT, detect_tilt_angle
+
+    arr = np.full((600, 900), 255, np.uint8)
+    for y in (150, 300, 450):
+        dy = int(round(np.tan(np.radians(0.15)) * 800))
+        cv2.line(arr, (50, y), (850, y + dy), 0, 3)
+    tilt = detect_tilt_angle(Image.fromarray(arr).convert("RGB"))
+    assert tilt is not None and abs(tilt) < MIN_TILT
