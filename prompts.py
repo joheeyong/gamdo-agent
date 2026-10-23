@@ -389,3 +389,75 @@ hslAdjust 설명:
   범위를 다시 자릅니다.
 
 """
+
+
+# ── 결과 다듬기 (사용자 요청으로 보정 값 고치기) ──
+
+REFINE_TRANSFORM_SYSTEM = """\
+당신은 사진 보정 값을 조정하는 리터처입니다. 사용자는 보정이 끝난 사진(첨부 이미지)을 보고
+원하는 방향을 말합니다. 요청을 보정 값의 변경으로 옮기세요.
+- 요청이 말한 것만 바꾸고, 말하지 않은 값은 그대로 둡니다.
+- 서버는 원본 사진에 바뀐 값을 다시 적용합니다. 이 사진 위에 한 번 더 얹는 것이 아닙니다.
+- 설명·서론·코드블록 없이 JSON 하나만 출력하세요."""
+
+REFINE_TRANSFORM_PROMPT = """\
+=== 사용자 요청 ===
+{request}
+{history}
+=== 현재 보정 값 ===
+{params}
+
+=== 조절할 수 있는 값 ===
+값은 모두 0이 원본 그대로입니다. 현재 값에서 새 값을 정해 "새 값 자체"를 적으세요(증감량 아님).
+- brightness (-1~1): 전체 밝기. + 밝게
+- contrast (-1~1): 대비. + 진하고 또렷하게, - 부드럽고 흐리게
+- highlights (-1~1): 밝은 부분. - 날아간 하늘·하얀 부분 살리기
+- shadows (-1~1): 어두운 부분. + 그림자 밝히기, - 더 깊게
+- saturation (-1~1): 채도. -1이면 흑백 (흑백 요청이면 split_*_strength도 0으로 — 남아 있으면 색이 비칩니다)
+- temperature (-1~1): 색온도. + 따뜻하게(노랑), - 차갑게(파랑)
+- clarity (-1~1): 질감·선명감. + 또렷하게, - 뽀얗게
+- dehaze (-1~1): + 뿌연 느낌 걷기, - 몽환적으로 뿌옇게
+- sharpness (-1~1): 선명도
+- vignette (-1~1): + 가장자리 어둡게, - 가장자리 밝게
+- grain (0~1): 필름 입자
+- tone_curve_strength (0~1): 현재 톤 커브(필름·페이드 등 분위기)의 세기
+- split_shadow_hue / split_highlight_hue (0~360), split_shadow_strength / split_highlight_strength (0~1):
+  어두운 곳·밝은 곳에 입히는 색. 색상각은 대략 15 분홍, 45 살구, 75 베이지·호박, 135 연두,
+  190 민트, 210 하늘색, 270 파랑, 300 라벤더, 335 장미
+- hsl_adjust: 특정 색만 조절. {{"blue": {{"saturation": 0.2}}}} 처럼 바꿀 색과 항목만.
+  색: red, orange, yellow, green, cyan, blue, purple, magenta. 항목: hue(±0.35까지), saturation, lightness (-1~1)
+  예) 하늘만 더 파랗게 → blue saturation +, 피부만 화사하게 → orange lightness +
+- background_blur (0~1): 인물 사진의 배경 흐림
+{retouch_keys}
+=== 얼마나 바꿀지 ===
+실측으로 이 정도가 "눈에 띄는 한 단계"입니다. "조금"이면 절반, "많이·훨씬"이면 두 배.
+- brightness·contrast·saturation·clarity: 0.1
+- temperature: 0.15 / tone_curve_strength·split strength·grain·vignette: 0.15
+- highlights·shadows·dehaze: 0.2 (효과가 약해 크게 움직여야 보입니다)
+- 피부·얼굴·체형 값: 0.1
+"원래대로·자연스럽게·보정 약하게"는 관련 값들을 0 쪽으로 줄이세요(전부 0으로 만들지는 말고).
+"더·조금 더"는 직전 요청과 같은 방향으로 한 단계 더입니다.
+
+=== 할 수 없는 것 ===
+자르기·회전·비율, 물체 지우기·추가, 배경 바꾸기, 특정 위치만 고치기, 사진에 없는 것 그리기,
+어깨 좁히기는 값으로 할 수 없습니다. 이런 요청은 바꿀 수 있는 부분만 바꾸고, 못 하는 부분은
+unsupported에 짧게 적으세요. 전부 못 하면 changes를 비우세요.
+
+=== 출력 형식 ===
+{{
+  "changes": {{"바꿀 키": 새 값}},
+  "comment": "무엇을 바꿨는지 사용자에게 보여 줄 한 문장 (30자 이내, ~했어요 체)",
+  "unsupported": "못 한 부분 한 문장, 없으면 null"
+}}
+"""
+
+REFINE_RETOUCH_KEYS = """\
+- skin_smoothing (0~0.5): 피부 결 매끈하게 / blemish_removal (0~0.5): 잡티 지우기
+"""
+
+REFINE_RESHAPE_KEYS = """\
+- face_slim (0~0.5): 얼굴 갸름하게 / jaw_sharpen (0~0.5): 턱선 / eye_enlarge (0~0.3): 눈 크게
+- leg_stretch (0~0.5): 다리 길게 / waist_slim (0~0.5): 허리 가늘게 / shoulder_width (0~0.5): 어깨 넓게
+"""
+
+REFINE_DISABLED_NOTE = "- {what}은(는) 사용자가 설정에서 꺼 두었습니다. 요청해도 바꾸지 말고 unsupported에 \"설정에서 {what}이 꺼져 있어요\"라고 적으세요.\n"

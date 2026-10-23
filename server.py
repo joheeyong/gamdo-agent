@@ -40,13 +40,22 @@ from models import (
     JobStartResponse,
     JobStatusResponse,
     ReferenceImagesResponse,
+    RefineTransformRequest,
+    RefineTransformResponse,
     SessionRequest,
     SessionResponse,
 )
-from claude_client import analyze_user, delete_user_data, get_reference_image_paths, transform_photo
+from claude_client import (
+    analyze_user,
+    delete_user_data,
+    get_reference_image_paths,
+    refine_transform,
+    transform_photo,
+)
 from param_engine import (
     MAX_TILT,
     MIN_TILT,
+    apply_refine_changes,
     build_params_with_comment,
     detect_tilt_angle,
     feed_compatibility,
@@ -766,6 +775,61 @@ def api_apply_transform(
         return ApplyTransformResponse(
             success=False, error=_public_error(e, "보정을 적용하지 못했습니다. 잠시 후 다시 시도해 주세요."))
 
+
+
+# ── 결과 다듬기 API ──
+
+# 다듬기는 Claude를 부르는 동기 요청이다(10초 안팎). 분석 작업 대기열과 따로 묶어,
+# 연달아 누르는 요청이 Claude 호출을 쌓지 않게 한다. 자리가 없으면 바로 거절한다.
+_REFINE_SLOTS = 2
+_refine_semaphore = threading.BoundedSemaphore(_REFINE_SLOTS)
+
+
+@app.post("/api/refine-transform", response_model=RefineTransformResponse)
+def api_refine_transform(
+    req: RefineTransformRequest,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """보정 결과를 보고 사용자가 말한 방향으로 보정 값을 고친다.
+
+    사진은 그리지 않는다. 앱이 돌려받은 값으로 apply-transform을 불러 원본에서
+    다시 그린다 — 결과 위에 덧칠하지 않으므로 여러 번 고쳐도 화질이 떨어지지 않고,
+    미리보기·저장·기록 복원이 모두 같은 값으로 같은 사진을 만든다.
+    """
+    _check_user(ctx, req.user_id)
+    request = req.request.strip()
+    if not request:
+        return RefineTransformResponse(success=False, error="원하는 방향을 적어 주세요.")
+    if not _refine_semaphore.acquire(timeout=1):
+        raise AuthError(503, "busy", "요청이 많아 잠시 후 다시 시도해 주세요")
+    try:
+        check_base64_image(req.image_base64)
+        history = [h.strip()[:200] for h in req.history if isinstance(h, str) and h.strip()][-5:]
+        result = refine_transform(
+            req.image_base64, req.params, request, history,
+            reshape_enabled=req.reshape_enabled,
+            skin_retouch_enabled=req.skin_retouch_enabled,
+        )
+        params, changed = apply_refine_changes(
+            req.params, result["changes"],
+            reshape_enabled=req.reshape_enabled,
+            skin_retouch_enabled=req.skin_retouch_enabled,
+        )
+        log.info("refine-transform: %r → changed=%s", request[:60], changed)
+        return RefineTransformResponse(
+            success=True,
+            params=params,
+            changed=changed,
+            # 바뀐 것이 없으면 모델의 "~했어요"는 거짓말이 된다
+            comment=result["comment"] if changed else None,
+            unsupported=result["unsupported"],
+        )
+    except Exception as e:
+        log.exception("refine-transform failed")
+        return RefineTransformResponse(
+            success=False, error=_public_error(e, "요청을 반영하지 못했습니다. 잠시 후 다시 시도해 주세요."))
+    finally:
+        _refine_semaphore.release()
 
 # ── 대표 사진 조회 API ──
 

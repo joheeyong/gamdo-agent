@@ -1671,6 +1671,88 @@ def _clamp_reshape(reshape: dict[str, Any]) -> dict[str, float]:
     return out
 
 
+
+# ── 결과 다듬기: 모델이 사용자 요청으로 고친 값 정리 ──
+#
+# 모델이 낸 새 값을 현재 값에 합친다. 사용자가 직접 요청한 것이라 자동 보정보다
+# 범위가 넓지만(흑백 = 채도 -1), 피부·체형은 자동 보정과 같은 상한을 지킨다 —
+# "많이"를 반복하면 끝없이 커지는 것을 막는다.
+_REFINE_RANGES: dict[str, tuple[float, float]] = {
+    **{k: (-1.0, 1.0) for k in (
+        "brightness", "contrast", "clarity", "dehaze", "highlights", "shadows",
+        "saturation", "temperature", "vignette", "sharpness",
+    )},
+    **{k: (0.0, 1.0) for k in (
+        "grain", "tone_curve_strength", "split_shadow_strength",
+        "split_highlight_strength", "background_blur",
+    )},
+}
+_REFINE_HUE_KEYS = ("split_shadow_hue", "split_highlight_hue")
+_REFINE_SKIN_KEYS = ("skin_smoothing", "blemish_removal")
+_REFINE_SKIN_MAX = 0.5
+_HSL_HUE_MAX = 0.35
+
+
+def apply_refine_changes(
+    current: dict[str, Any],
+    changes: Any,
+    *,
+    reshape_enabled: bool = True,
+    skin_retouch_enabled: bool = True,
+) -> tuple[dict[str, Any], list[str]]:
+    """현재 값에 모델이 고친 값을 합친다. (새 값 전체, 실제로 바뀐 키).
+
+    모르는 키·숫자가 아닌 값은 버리고 범위로 자른다. 설정에서 끈 보정은 바꾸지 않는다.
+    hsl_adjust는 색·항목 단위로 합친다 — 모델은 바꿀 색만 보낸다.
+    """
+    from image_processor import sanitize_hsl_adjust
+
+    out = dict(current)
+    if not isinstance(changes, dict):
+        return out, []
+
+    allowed: dict[str, tuple[float, float]] = dict(_REFINE_RANGES)
+    if skin_retouch_enabled:
+        allowed.update({k: (0.0, _REFINE_SKIN_MAX) for k in _REFINE_SKIN_KEYS})
+    if reshape_enabled:
+        allowed.update({k: (0.0, _EYE_ENLARGE_MAX if k == "eye_enlarge" else _RESHAPE_MAX)
+                        for k in _RESHAPE_KEYS})
+
+    changed: list[str] = []
+
+    def put(key: str, value: float) -> None:
+        old = out.get(key, 0.0)  # 없는 키는 0(보정 없음)이다
+        if not isinstance(old, (int, float)) or abs(float(old) - value) >= 0.005:
+            changed.append(key)
+        out[key] = value
+
+    for key, raw in changes.items():
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            continue
+        if key in allowed:
+            lo, hi = allowed[key]
+            put(key, round(_clamp(float(raw), lo, hi), 3))
+        elif key in _REFINE_HUE_KEYS and math.isfinite(raw):
+            put(key, round(float(raw) % 360.0, 1))
+
+    hsl_changes = changes.get("hsl_adjust")
+    if isinstance(hsl_changes, dict):
+        merged = {ch: dict(v) for ch, v in (sanitize_hsl_adjust(current.get("hsl_adjust")) or {}).items()}
+        for ch, adj in hsl_changes.items():
+            if not isinstance(adj, dict):
+                continue
+            slot = merged.setdefault(ch, {"hue": 0.0, "saturation": 0.0, "lightness": 0.0})
+            for k in ("hue", "saturation", "lightness"):
+                v = adj.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    lim = _HSL_HUE_MAX if k == "hue" else 1.0
+                    slot[k] = _clamp(float(v), -lim, lim)
+        cleaned = sanitize_hsl_adjust(merged)
+        if cleaned != sanitize_hsl_adjust(current.get("hsl_adjust")):
+            changed.append("hsl_adjust")
+        out["hsl_adjust"] = cleaned
+    return out, changed
+
 # 얼굴 영역 보정(regionParams.face)의 잡티·스무딩을 전역 값에 합칠 때의 상한.
 # 두 패스는 같은 피부 마스크에 차례로 걸린다 — 따로 두면 모델이 준 face 값이
 # 기본 레시피 위에 한 번 더 얹혀 효과가 두 배가 됐다.

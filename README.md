@@ -127,6 +127,7 @@ HTTP 200 + `success: false`로, 인증 오류는 위의 HTTP 상태 코드로 �
 | POST | `/api/jobs/analyze-and-transform` | 필요 | 위와 같은 작업을 백그라운드로 시작 → `job_id` (202) |
 | GET | `/api/jobs/{job_id}` | 필요 | 작업 상태·결과 조회 (폴링) |
 | POST | `/api/apply-transform` | 필요 | 슬라이더 값으로 보정 (미리보기/저장) |
+| POST | `/api/refine-transform` | 필요 | 결과 사진과 사용자 요청(말)으로 보정 값 고치기 — 값만 돌려주고 그리기는 apply-transform |
 | GET | `/api/reference-images/{user_id}` | 필요 | 대표 사진 base64 목록 |
 | GET | `/api/instagram/callback` | 면제 | OAuth 콜백 → `gamdo://oauth/instagram` 리디렉션 |
 | POST | `/api/instagram/exchange-token` | 면제 | code → long-lived 토큰 교환. 세션도 함께 발급 |

@@ -22,6 +22,11 @@ from PIL import Image
 from prompts import (
     ANALYZE_USER_SYSTEM,
     ANALYZE_USER_PROMPT,
+    REFINE_DISABLED_NOTE,
+    REFINE_RESHAPE_KEYS,
+    REFINE_RETOUCH_KEYS,
+    REFINE_TRANSFORM_PROMPT,
+    REFINE_TRANSFORM_SYSTEM,
     TRANSFORM_PHOTO_SYSTEM,
     TRANSFORM_PHOTO_PROMPT,
 )
@@ -1097,3 +1102,66 @@ def transform_photo(
         return parsed
     finally:
         _cleanup_files(temp_files)
+
+
+# ── 결과 다듬기 ──
+
+_REFINE_TIMEOUT = 120
+# 모델에 보여 줄 현재 값. 촬영 결함 교정(자동 화이트밸런스·노이즈)과 톤 커브 종류는
+# 사용자가 말로 고칠 대상이 아니라 빼서, 모델이 엉뚱하게 건드리지 않게 한다.
+_REFINE_HIDDEN_KEYS = frozenset({"auto_wb", "denoise", "tone_curve_preset", "tone_curve_points"})
+
+
+def _refine_prompt(
+    request: str,
+    history: list[str],
+    params: dict,
+    reshape_enabled: bool,
+    skin_retouch_enabled: bool,
+) -> str:
+    shown = {
+        k: v for k, v in params.items()
+        if k not in _REFINE_HIDDEN_KEYS and v not in (None, 0, 0.0, {})
+    }
+    keys = ""
+    keys += REFINE_RETOUCH_KEYS if skin_retouch_enabled else REFINE_DISABLED_NOTE.format(what="피부 보정")
+    keys += REFINE_RESHAPE_KEYS if reshape_enabled else REFINE_DISABLED_NOTE.format(what="얼굴/체형 보정")
+    hist = ""
+    if history:
+        hist = "\n(이전 요청, 오래된 순 — 이미 현재 값에 반영됨)\n" + "\n".join(f"- {h}" for h in history) + "\n"
+    return REFINE_TRANSFORM_PROMPT.format(
+        request=request,
+        history=hist,
+        params=json.dumps(shown, ensure_ascii=False, separators=(",", ":")) if shown else "(모두 0)",
+        retouch_keys=keys,
+    )
+
+
+def refine_transform(
+    image_base64: str,
+    params: dict,
+    request: str,
+    history: list[str] | None = None,
+    reshape_enabled: bool = True,
+    skin_retouch_enabled: bool = True,
+) -> dict:
+    """보정 결과 사진과 사용자 요청으로 고칠 값을 받는다.
+
+    돌려주는 것: {"changes": dict, "comment": str, "unsupported": str | None}.
+    값의 범위 정리는 호출부(param_engine.apply_refine_changes)가 한다.
+    캐시하지 않는다 — 같은 요청이라도 현재 값이 다르면 답이 달라야 한다.
+    """
+    prompt = _refine_prompt(request, history or [], params, reshape_enabled, skin_retouch_enabled)
+    with Image.open(io.BytesIO(base64.b64decode(image_base64))) as src:
+        images = [_encode_image_for_vision(src, _INLINE_PHOTO_MAX_PX)]
+    parsed = _parse_json_response(
+        _call_claude_inline(prompt, REFINE_TRANSFORM_SYSTEM, images, timeout=_REFINE_TIMEOUT)
+    )
+    changes = parsed.get("changes")
+    comment = parsed.get("comment")
+    unsupported = parsed.get("unsupported")
+    return {
+        "changes": changes if isinstance(changes, dict) else {},
+        "comment": comment.strip()[:80] if isinstance(comment, str) else "",
+        "unsupported": unsupported.strip()[:120] if isinstance(unsupported, str) and unsupported.strip() else None,
+    }

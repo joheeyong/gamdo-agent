@@ -164,6 +164,29 @@ class ApplyTransformResponse(BaseModel):
     error: str | None = None
 
 
+
+# ── 결과 다듬기 API ──
+
+class RefineTransformRequest(BaseModel):
+    """보정 결과를 사용자 요청(말)으로 다듬는 요청. 고친 값만 돌려주고 그리지는 않는다."""
+    user_id: str = Field("", description="세션 사용자 확인용")
+    image_base64: str = Field(..., description="지금 화면의 보정 결과 사진 (base64)")
+    params: dict = Field(..., description="현재 보정 값 (apply-transform과 같은 평평한 키)")
+    request: str = Field(..., min_length=1, max_length=200, description="사용자가 원하는 방향")
+    history: list[str] = Field(default_factory=list, max_length=5,
+                               description="이 사진에서 앞서 한 요청 (오래된 순)")
+    reshape_enabled: bool = Field(True, description="얼굴/체형 보정 설정")
+    skin_retouch_enabled: bool = Field(True, description="피부 보정 설정")
+
+
+class RefineTransformResponse(BaseModel):
+    success: bool
+    params: dict | None = Field(None, description="고친 값을 합친 전체 보정 값")
+    changed: list[str] = Field(default_factory=list, description="실제로 바뀐 키")
+    comment: str | None = Field(None, description="무엇을 바꿨는지 한 문장")
+    unsupported: str | None = Field(None, description="값으로 할 수 없어 못 한 부분")
+    error: str | None = None
+
 # ── 대표 사진 조회 API ──
 
 class ReferenceImagesResponse(BaseModel):
